@@ -550,21 +550,22 @@ class BrowserCaptchaService:
             self._fingerprint_cache_ttl_seconds = 3600.0
 
     def _check_available(self):
-        """检查服务是否可用"""
+        """Check if the captcha service is available"""
         if DOCKER_HEADED_BLOCKED:
             raise RuntimeError(
-                "检测到 Docker 环境，默认禁用内置浏览器打码。"
-                "如需启用请设置环境变量 ALLOW_DOCKER_HEADED_CAPTCHA=true，并提供 DISPLAY/Xvfb。"
+                "Docker environment detected, built-in browser captcha disabled by default. "
+                "Set ALLOW_DOCKER_HEADED_CAPTCHA=true to enable."
             )
-        if IS_DOCKER and not os.environ.get("DISPLAY"):
+        # Skip DISPLAY check when running in headless mode (nodriver doesn't need Xvfb)
+        if not self.headless and IS_DOCKER and not os.environ.get("DISPLAY"):
             raise RuntimeError(
-                "Docker 内置浏览器打码已启用，但 DISPLAY 未设置。"
-                "请设置 DISPLAY（例如 :99）并启动 Xvfb。"
+                "Docker headed browser captcha enabled but DISPLAY not set. "
+                "Set DISPLAY (e.g. :99) and start Xvfb, or use headless mode."
             )
         if not NODRIVER_AVAILABLE or uc is None:
             raise RuntimeError(
-                "nodriver 未安装或不可用。"
-                "请手动安装: pip install nodriver"
+                "nodriver not installed or unavailable. "
+                "Install manually: pip install nodriver"
             )
 
     async def _run_with_timeout(self, awaitable, timeout_seconds: float, label: str):
@@ -576,7 +577,9 @@ class BrowserCaptchaService:
             raise TimeoutError(f"{label} 超时 ({effective_timeout:.1f}s)") from e
 
     async def _wait_for_display_ready(self, display_value: str, timeout_seconds: float = 5.0):
-        """Docker 有头模式下等待 Xvfb socket 就绪，避免容器重启后立刻拉起浏览器失败。"""
+        """Wait for Xvfb socket in Docker headed mode. Skipped in headless mode."""
+        if self.headless:
+            return
         if not (IS_DOCKER and display_value and display_value.startswith(":") and os.name == "posix"):
             return
 
