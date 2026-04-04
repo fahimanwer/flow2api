@@ -4,23 +4,24 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    ALLOW_DOCKER_HEADED_CAPTCHA=true
+    PLAYWRIGHT_BROWSERS_PATH=0 \
+    ALLOW_DOCKER_HEADED_CAPTCHA=true \
+    DISPLAY=:99 \
+    XVFB_WHD=1920x1080x24
 
 COPY requirements.txt ./
 
-# Install Chrome stable + runtime dependencies for headless nodriver
+# Headed mode: Xvfb virtual display + Fluxbox window manager + Playwright Chromium
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        wget \
-        gnupg2 \
-    && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y --no-install-recommends /tmp/chrome.deb || apt-get install -y -f \
-    && rm -f /tmp/chrome.deb \
+        xvfb \
+        fluxbox \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
+RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt \
+    && python -m playwright install --with-deps chromium
 
 COPY . .
 COPY docker/entrypoint.headed.sh /usr/local/bin/entrypoint.headed.sh
