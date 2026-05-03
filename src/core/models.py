@@ -210,6 +210,20 @@ class PluginConfig(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class LogCleanupConfig(BaseModel):
+    """Scheduled request_logs retention configuration"""
+
+    id: int = 1
+    enabled: bool = True
+    retention_hours: int = 24
+    interval_minutes: int = 60
+    vacuum_after_cleanup: bool = False
+    last_run_at: Optional[datetime] = None
+    last_deleted_count: int = 0
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
 # OpenAI Compatible Request Models
 class ChatMessage(BaseModel):
     """Chat message"""

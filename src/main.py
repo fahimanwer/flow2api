@@ -121,6 +121,47 @@ async def lifespan(app: FastAPI):
 
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
 
+    # Scheduled request_logs retention cleanup
+    async def log_cleanup_task():
+        """Periodically prune request_logs older than configured retention.
+
+        Reads config from DB on every iteration so changes take effect on the
+        next tick without a restart. Sleeps in short slices so cancellation
+        propagates promptly on shutdown.
+        """
+        # First-tick delay so startup is not blocked by a large initial purge.
+        await asyncio.sleep(60)
+        while True:
+            try:
+                cfg = await db.get_log_cleanup_config()
+                interval_seconds = max(60, cfg.interval_minutes * 60)
+
+                if cfg.enabled:
+                    deleted = await db.delete_old_logs(cfg.retention_hours)
+                    if deleted:
+                        print(
+                            f"✓ Log cleanup: pruned {deleted} request_logs older than "
+                            f"{cfg.retention_hours}h"
+                        )
+                    if cfg.vacuum_after_cleanup and deleted:
+                        if await db.vacuum_database():
+                            print("✓ Log cleanup: VACUUM completed")
+                    await db.record_log_cleanup_run(deleted)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"❌ Log cleanup task error: {type(e).__name__}: {e}")
+                interval_seconds = 3600
+
+            # Sleep in 30s slices so shutdown is responsive even on long intervals.
+            remaining = interval_seconds
+            while remaining > 0:
+                slice_seconds = min(30, remaining)
+                await asyncio.sleep(slice_seconds)
+                remaining -= slice_seconds
+
+    log_cleanup_task_handle = asyncio.create_task(log_cleanup_task())
+
     print(f"✓ Database initialized")
     print(f"✓ Total tokens: {len(tokens)}")
     print(f"✓ Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
@@ -129,6 +170,16 @@ async def lifespan(app: FastAPI):
     else:
         print("✓ File cache cleanup task disabled (timeout <= 0)")
     print(f"✓ 429 auto-unban task started (runs every hour)")
+    log_cleanup_cfg = await db.get_log_cleanup_config()
+    if log_cleanup_cfg.enabled:
+        print(
+            f"✓ Log cleanup task started "
+            f"(retention={log_cleanup_cfg.retention_hours}h, "
+            f"interval={log_cleanup_cfg.interval_minutes}m, "
+            f"vacuum_after_cleanup={log_cleanup_cfg.vacuum_after_cleanup})"
+        )
+    else:
+        print("✓ Log cleanup task started (currently disabled in config)")
     print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
@@ -144,12 +195,19 @@ async def lifespan(app: FastAPI):
         await auto_unban_task_handle
     except asyncio.CancelledError:
         pass
+    # Stop log cleanup task
+    log_cleanup_task_handle.cancel()
+    try:
+        await log_cleanup_task_handle
+    except asyncio.CancelledError:
+        pass
     # Close browser if initialized
     if browser_service:
         await browser_service.close()
         print("✓ Browser captcha service closed")
     print("✓ File cache cleanup task stopped")
     print("✓ 429 auto-unban task stopped")
+    print("✓ Log cleanup task stopped")
 
 
 # Initialize components

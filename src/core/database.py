@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig
+from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, LogCleanupConfig
 
 
 class Database:
@@ -282,6 +282,34 @@ class Database:
                 VALUES (1, '', 1)
             """)
 
+        # Ensure log_cleanup_config has a row
+        cursor = await db.execute("SELECT COUNT(*) FROM log_cleanup_config")
+        count = await cursor.fetchone()
+        if count[0] == 0:
+            cleanup_enabled = True
+            retention_hours = 24
+            interval_minutes = 60
+            vacuum_after_cleanup = False
+
+            if config_dict:
+                lc = config_dict.get("log_cleanup", {})
+                cleanup_enabled = bool(lc.get("enabled", True))
+                try:
+                    retention_hours = max(1, int(lc.get("retention_hours", 24)))
+                except Exception:
+                    retention_hours = 24
+                try:
+                    interval_minutes = max(1, int(lc.get("interval_minutes", 60)))
+                except Exception:
+                    interval_minutes = 60
+                vacuum_after_cleanup = bool(lc.get("vacuum_after_cleanup", False))
+
+            await db.execute("""
+                INSERT INTO log_cleanup_config (
+                    id, enabled, retention_hours, interval_minutes, vacuum_after_cleanup
+                ) VALUES (1, ?, ?, ?, ?)
+            """, (cleanup_enabled, retention_hours, interval_minutes, vacuum_after_cleanup))
+
     async def check_and_migrate_db(self, config_dict: dict = None):
         """Check database integrity and perform migrations if needed
 
@@ -376,6 +404,23 @@ class Database:
                         id INTEGER PRIMARY KEY DEFAULT 1,
                         connection_token TEXT DEFAULT '',
                         auto_enable_on_update BOOLEAN DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+            # Check and create log_cleanup_config table if missing
+            if not await self._table_exists(db, "log_cleanup_config"):
+                print("  ✓ Creating missing table: log_cleanup_config")
+                await db.execute("""
+                    CREATE TABLE log_cleanup_config (
+                        id INTEGER PRIMARY KEY DEFAULT 1,
+                        enabled BOOLEAN DEFAULT 1,
+                        retention_hours INTEGER DEFAULT 24,
+                        interval_minutes INTEGER DEFAULT 60,
+                        vacuum_after_cleanup BOOLEAN DEFAULT 0,
+                        last_run_at TIMESTAMP,
+                        last_deleted_count INTEGER DEFAULT 0,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
@@ -722,6 +767,21 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     connection_token TEXT DEFAULT '',
                     auto_enable_on_update BOOLEAN DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Log cleanup config table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS log_cleanup_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    enabled BOOLEAN DEFAULT 1,
+                    retention_hours INTEGER DEFAULT 24,
+                    interval_minutes INTEGER DEFAULT 60,
+                    vacuum_after_cleanup BOOLEAN DEFAULT 0,
+                    last_run_at TIMESTAMP,
+                    last_deleted_count INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -1478,6 +1538,109 @@ class Database:
         """Clear all request logs"""
         async with self._connect(write=True) as db:
             await db.execute("DELETE FROM request_logs")
+            await db.commit()
+
+    # Log cleanup config + scheduled retention operations
+    async def get_log_cleanup_config(self) -> LogCleanupConfig:
+        """Get scheduled log cleanup configuration."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM log_cleanup_config WHERE id = 1")
+            row = await cursor.fetchone()
+            if row:
+                return LogCleanupConfig(**dict(row))
+            return LogCleanupConfig()
+
+    async def update_log_cleanup_config(
+        self,
+        enabled: Optional[bool] = None,
+        retention_hours: Optional[int] = None,
+        interval_minutes: Optional[int] = None,
+        vacuum_after_cleanup: Optional[bool] = None,
+    ):
+        """Update scheduled log cleanup configuration."""
+        async with self._connect(write=True) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM log_cleanup_config WHERE id = 1")
+            row = await cursor.fetchone()
+            current = dict(row) if row else {}
+
+            new_enabled = enabled if enabled is not None else bool(current.get("enabled", True))
+            new_retention = retention_hours if retention_hours is not None else int(current.get("retention_hours", 24) or 24)
+            new_interval = interval_minutes if interval_minutes is not None else int(current.get("interval_minutes", 60) or 60)
+            new_vacuum = vacuum_after_cleanup if vacuum_after_cleanup is not None else bool(current.get("vacuum_after_cleanup", False))
+
+            new_retention = max(1, int(new_retention))
+            new_interval = max(1, int(new_interval))
+
+            if row:
+                await db.execute("""
+                    UPDATE log_cleanup_config
+                    SET enabled = ?, retention_hours = ?, interval_minutes = ?, vacuum_after_cleanup = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (new_enabled, new_retention, new_interval, new_vacuum))
+            else:
+                await db.execute("""
+                    INSERT INTO log_cleanup_config (id, enabled, retention_hours, interval_minutes, vacuum_after_cleanup)
+                    VALUES (1, ?, ?, ?, ?)
+                """, (new_enabled, new_retention, new_interval, new_vacuum))
+            await db.commit()
+
+    async def delete_old_logs(self, retention_hours: int, batch_size: int = 1000) -> int:
+        """Delete request_logs older than retention_hours, in batches to avoid long write locks.
+
+        Returns total rows deleted.
+        """
+        retention_hours = max(1, int(retention_hours))
+        batch_size = max(100, int(batch_size))
+        total = 0
+        while True:
+            async with self._connect(write=True) as db:
+                cursor = await db.execute(
+                    """
+                    DELETE FROM request_logs
+                    WHERE id IN (
+                        SELECT id FROM request_logs
+                        WHERE created_at < datetime('now', ?)
+                        LIMIT ?
+                    )
+                    """,
+                    (f"-{retention_hours} hours", batch_size),
+                )
+                await db.commit()
+                deleted = cursor.rowcount or 0
+            total += deleted
+            if deleted < batch_size:
+                break
+            await asyncio.sleep(0)  # yield between batches
+        return total
+
+    async def vacuum_database(self) -> bool:
+        """Best-effort VACUUM. Returns True on success, False on failure (e.g. low disk).
+
+        VACUUM rewrites the database into a temp file and needs roughly the
+        current DB size in free disk; under disk pressure this will fail and
+        callers should treat that as a soft warning, not a fatal error.
+        """
+        async with self._connect(write=True) as db:
+            try:
+                await db.execute("VACUUM")
+                return True
+            except Exception as e:
+                print(f"⚠ VACUUM failed: {type(e).__name__}: {e}")
+                return False
+
+    async def record_log_cleanup_run(self, deleted_count: int):
+        """Record the timestamp and row count of the most recent cleanup run."""
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                UPDATE log_cleanup_config
+                SET last_run_at = CURRENT_TIMESTAMP, last_deleted_count = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+                """,
+                (int(deleted_count),),
+            )
             await db.commit()
 
     async def init_config_from_toml(self, config_dict: dict, is_first_startup: bool = True):
