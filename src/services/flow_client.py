@@ -2510,6 +2510,17 @@ class FlowClient:
         except Exception:
             proxy_url = None
 
+        # Debug: 记录请求
+        if config.debug_enabled:
+            debug_logger.log_request(
+                method="GET",
+                url=url,
+                headers=headers,
+                proxy=proxy_url
+            )
+
+        start_time = time.time()
+
         try:
             async with AsyncSession(trust_env=False) as session:
                 response = await session.get(
@@ -2521,12 +2532,24 @@ class FlowClient:
                     impersonate="chrome124",
                 )
         except Exception as e:
+            debug_logger.log_error(f"[MEDIA REDIRECT] 请求失败: media={media_name}, error={e}")
             raise RuntimeError(
                 f"getMediaUrlRedirect 请求失败 (media={media_name}): {e}"
             ) from e
 
+        duration_ms = (time.time() - start_time) * 1000
         status_code = getattr(response, "status_code", 0)
         resp_headers = getattr(response, "headers", {}) or {}
+
+        # Debug: 记录响应
+        if config.debug_enabled:
+            debug_logger.log_response(
+                status_code=status_code,
+                headers=dict(resp_headers) if resp_headers else {},
+                body=f"Location: {resp_headers.get('Location') or resp_headers.get('location', 'N/A')}",
+                duration_ms=duration_ms
+            )
+
         location = None
         try:
             location = resp_headers.get("Location") or resp_headers.get("location")
@@ -2537,10 +2560,16 @@ class FlowClient:
                 location = None
 
         if status_code not in (301, 302, 303, 307, 308) or not location:
+            debug_logger.log_error(
+                f"[MEDIA REDIRECT] 未返回重定向: status={status_code}, "
+                f"media={media_name}, location={location}"
+            )
             raise RuntimeError(
                 f"getMediaUrlRedirect 未返回重定向 "
                 f"(status={status_code}, media={media_name})"
             )
+
+        debug_logger.log_info(f"[MEDIA REDIRECT] 成功: media={media_name}, location={str(location)[:200]}")
         return str(location)
 
     # ========== 媒体删除 (使用ST) ==========
