@@ -39,9 +39,9 @@ class FlowClient:
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
 
-        # Default "real browser" headers (macOS Chrome Desktop) to reduce upstream 4xx/5xx instability.
+# Default "real browser" headers (macOS Chrome Desktop) to reduce upstream 4xx/5xx instability.
         # These will be applied as defaults (won't override caller-provided headers).
-        # NOTE: Platform headers are auto-synced from real browser UA in _generate_real_browser_user_agent.
+        # NOTE: Platform headers are auto-synced from real browser fingerprint in _make_request.
         self._default_client_headers = {
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": "\"macOS\"",
@@ -52,48 +52,9 @@ class FlowClient:
             "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
             "x-browser-year": "2026",
         }
-        # 发车策略改为“请求到就发”：
+        # 发车策略改为"请求到就发"：
         # 不在 flow2api 本地对提交做批次整形或排队，避免把同批请求打成阶梯。
 
-
-    async def _generate_real_browser_user_agent(self) -> Optional[str]:
-        if self._user_agent_cache.get("_real_ua"):
-            return self._user_agent_cache["_real_ua"]
-
-        try:
-            from .browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(self.db)
-            if service and service.browser:
-                # 优先从已缓存的浏览器指纹获取
-                fingerprint = service.get_last_fingerprint()
-                if isinstance(fingerprint, dict) and fingerprint.get("user_agent"):
-                    user_agent = fingerprint["user_agent"]
-                else:
-                    # 回退：通过 CDP 直接从运行态浏览器获取
-                    user_agent, _ = await service._get_live_browser_runtime_identity()
-
-                if user_agent:
-                    # 同步更新 _default_client_headers 中的平台标识
-                    ua_lower = user_agent.lower()
-                    if "android" in ua_lower:
-                        self._default_client_headers["sec-ch-ua-platform"] = '"Android"'
-                        self._default_client_headers["sec-ch-ua-mobile"] = "?1"
-                    elif "mac" in ua_lower:
-                        self._default_client_headers["sec-ch-ua-platform"] = '"macOS"'
-                        self._default_client_headers["sec-ch-ua-mobile"] = "?0"
-                    elif "linux" in ua_lower or "x11" in ua_lower:
-                        self._default_client_headers["sec-ch-ua-platform"] = '"Linux"'
-                        self._default_client_headers["sec-ch-ua-mobile"] = "?0"
-                    else:
-                        self._default_client_headers["sec-ch-ua-platform"] = '"Windows"'
-                        self._default_client_headers["sec-ch-ua-mobile"] = "?0"
-                    self._user_agent_cache["_real_ua"] = user_agent
-                    debug_logger.log_info(f"[FlowClient] 从内置浏览器打码实例获取 User-Agent: {user_agent}")
-                    return user_agent
-        except Exception as e:
-            debug_logger.log_warning(f"[FlowClient] 从内置浏览器获取 User-Agent 失败: {e}")
-
-        return None
 
     def _generate_user_agent(self, account_id: str = None) -> str:
         """基于账号ID生成固定的 User-Agent
@@ -218,12 +179,22 @@ class FlowClient:
             debug_logger.log_info(f"[FINGERPRINT] 当前请求链路绑定的浏览器指纹: {fingerprint}")
             fingerprint_user_agent = fingerprint.get("user_agent")
         elif getattr(config, "captcha_method", "") == "personal":
-            debug_logger.log_info("[FINGERPRINT] captcha_method=personal，尝试从内置浏览器获取真实 User-Agent 作为请求头")
-            fingerprint_user_agent = await self._generate_real_browser_user_agent()
+            debug_logger.log_info("[FINGERPRINT] captcha_method=personal，尝试从内置浏览器获取真实浏览器指纹作为请求头")
+            try:
+                from .browser_captcha_personal import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(self.db)
+                if service:
+                    browser_fingerprint = service.get_last_fingerprint()
+                    if isinstance(browser_fingerprint, dict) and browser_fingerprint.get("user_agent"):
+                        fingerprint = browser_fingerprint
+                        fingerprint_user_agent = fingerprint["user_agent"]
+                    else:
+                        fingerprint_user_agent = await service.get_current_user_agent()
+            except Exception as e:
+                debug_logger.log_warning(f"[FINGERPRINT] 从内置浏览器获取指纹失败: {e}")
         else:
             debug_logger.log_info("[FINGERPRINT] 未检测到浏览器指纹上下文，使用基于账号ID生成的固定 User-Agent 作为请求头")
             fingerprint_user_agent = self._generate_user_agent(account_id)
-
         headers.update({
             "Content-Type": "application/json",
             "User-Agent": fingerprint_user_agent

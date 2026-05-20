@@ -11036,6 +11036,33 @@ class BrowserCaptchaService:
             return None
         return dict(self._last_fingerprint)
 
+    async def get_current_user_agent(self) -> Optional[str]:
+        """获取当前浏览器实例的真实 User-Agent。
+
+        按优先级依次尝试：
+        1) 最近一次打码指纹中的 user_agent
+        2) 初始化时构建的 runtime_surface_profile 中的 userAgent
+        3) 通过 CDP 从运行态浏览器实时获取
+        """
+        # 1) 从已缓存的浏览器指纹获取
+        fingerprint = self.get_last_fingerprint()
+        if isinstance(fingerprint, dict) and fingerprint.get("user_agent"):
+            return fingerprint["user_agent"]
+
+        # 2) 从初始化时已构建的 runtime_surface_profile 获取（无需 CDP 调用）
+        runtime_profile = self._get_runtime_surface_profile()
+        if isinstance(runtime_profile, dict):
+            user_agent = runtime_profile.get("userAgent")
+            if user_agent:
+                return user_agent
+
+        # 3) 通过 CDP 直接从运行态浏览器获取
+        live_ua, _ = await self._get_live_browser_runtime_identity()
+        if live_ua:
+            return live_ua
+
+        return None
+
     async def _clear_browser_cache(self):
         """清理浏览器全部缓存"""
         if not self.browser:
@@ -13244,6 +13271,36 @@ class _PersonalBrowserPoolService:
             fingerprint = worker.get_last_fingerprint()
             if fingerprint:
                 return fingerprint
+        return None
+
+    async def get_current_user_agent(self) -> Optional[str]:
+        """获取当前浏览器实例的真实 User-Agent。
+
+        按优先级依次从 worker 中尝试：
+        1) 最近一次打码指纹中的 user_agent
+        2) 初始化时构建的 runtime_surface_profile 中的 userAgent
+        3) 通过 CDP 从运行态浏览器实时获取
+        """
+        # 1) 从已缓存的浏览器指纹获取
+        fingerprint = self.get_last_fingerprint()
+        if isinstance(fingerprint, dict) and fingerprint.get("user_agent"):
+            return fingerprint["user_agent"]
+
+        # 2) 从已初始化的 worker 的 runtime_surface_profile 获取
+        for worker in self._workers:
+            runtime_profile = worker._get_runtime_surface_profile()
+            if isinstance(runtime_profile, dict):
+                user_agent = runtime_profile.get("userAgent")
+                if user_agent:
+                    return user_agent
+
+        # 3) 通过 CDP 从有活跃浏览器的 worker 实时获取
+        for worker in self._workers:
+            if worker.browser:
+                live_ua, _ = await worker._get_live_browser_runtime_identity()
+                if live_ua:
+                    return live_ua
+
         return None
 
     async def get_custom_token(
