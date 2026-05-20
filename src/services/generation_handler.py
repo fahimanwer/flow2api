@@ -2022,8 +2022,30 @@ class GenerationHandler:
                     # NOT the CAUS base64 mediaGenerationId from video_info
                     import re as _re
                     _uuid_match = _re.search(r'/video/([0-9a-f-]{36})', video_url or '')
-                    video_media_id = _uuid_match.group(1) if _uuid_match else video_info.get("mediaGenerationId", "")
+                    media_name = (
+                        operation.get("mediaName")
+                        or operation["operation"].get("name")
+                        or ""
+                    )
+                    video_media_id = (
+                        _uuid_match.group(1) if _uuid_match
+                        else video_info.get("mediaGenerationId") or media_name
+                    )
                     aspect_ratio = video_info.get("aspectRatio", "VIDEO_ASPECT_RATIO_LANDSCAPE")
+
+                    # New schema: fifeUrl absent → fetch CDN URL via labs.google
+                    # /trpc/media.getMediaUrlRedirect (returns 3xx with Location).
+                    if not video_url and media_name:
+                        try:
+                            video_url = await self.flow_client.get_media_url_redirect(
+                                token.st, media_name
+                            )
+                        except Exception as e:
+                            error_msg = f"视频生成失败: 获取视频 URL 失败: {e}"
+                            await self._fail_video_task(checked_operations, error_msg)
+                            self._mark_generation_failed(generation_result, error_msg)
+                            yield self._create_error_response(error_msg, status_code=502)
+                            return
 
                     if not video_url:
                         error_msg = "视频生成失败: 视频URL为空"

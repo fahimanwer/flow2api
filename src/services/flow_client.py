@@ -2475,6 +2475,103 @@ class FlowClient:
             raise last_error
         raise RuntimeError("视频状态查询失败")
 
+    async def get_media_url_redirect(
+        self,
+        st: str,
+        media_name: str,
+    ) -> str:
+        """通过 labs.google trpc 端点拿到真实视频 CDN URL（2026-05 新增）。
+
+        新版 schema 下，batchCheckAsyncVideoGenerationStatus 即使 SUCCESSFUL
+        也不再直接返回 fifeUrl，必须通过 labs.google 上的
+        /fx/api/trpc/media.getMediaUrlRedirect 端点（用 ST cookie 鉴权）拿到
+        302 重定向 Location。
+
+        Args:
+            st: Session Token (__Secure-next-auth.session-token cookie 值)
+            media_name: 媒体 ID，即 batchCheckAsync... 返回的 media[].name
+
+        Returns:
+            真实的视频 CDN URL（3xx Location 头里的值）。
+
+        Raises:
+            ValueError: media_name 或 st 为空。
+            RuntimeError: 网络错误、未返回 3xx，或缺少 Location 头。
+        """
+        if not media_name:
+            raise ValueError("get_media_url_redirect: media_name 为空")
+        if not st:
+            raise ValueError("get_media_url_redirect: 缺少 ST token")
+
+        url = (
+            f"{self.labs_base_url}/trpc/media.getMediaUrlRedirect"
+            f"?name={media_name}"
+        )
+
+        # 真实浏览器抓包（FINDINGS/T2V_04_FINDING_the_redirect_result.md）的
+        # Accept / Range 头复刻；不能用通用 _make_request 因为它会自动跟随 302。
+        headers = {
+            "accept": (
+                "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,"
+                "audio/*;q=0.6,*/*;q=0.5"
+            ),
+            "accept-language": "en-US,en;q=0.9",
+            "accept-encoding": "identity",
+            "Range": "bytes=0-",
+            "referer": f"{self.labs_base_url}/fx/tools/flow",
+            "Sec-Fetch-Dest": "video",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Priority": "u=0",
+            "pragma": "no-cache",
+            "cache-control": "no-cache",
+            "cookie": f"__Secure-next-auth.session-token={st}",
+        }
+
+        # 通过代理（如有）发请求，复用 _make_request 的代理解析逻辑。
+        proxy_url = None
+        try:
+            if self.proxy_manager:
+                if hasattr(self.proxy_manager, "get_request_proxy_url"):
+                    proxy_url = await self.proxy_manager.get_request_proxy_url()
+                else:
+                    proxy_url = await self.proxy_manager.get_proxy_url()
+        except Exception:
+            proxy_url = None
+
+        try:
+            async with AsyncSession(trust_env=False) as session:
+                response = await session.get(
+                    url,
+                    headers=headers,
+                    allow_redirects=False,
+                    timeout=30,
+                    proxy=proxy_url,
+                    impersonate="chrome124",
+                )
+        except Exception as e:
+            raise RuntimeError(
+                f"getMediaUrlRedirect 请求失败 (media={media_name}): {e}"
+            ) from e
+
+        status_code = getattr(response, "status_code", 0)
+        resp_headers = getattr(response, "headers", {}) or {}
+        location = None
+        try:
+            location = resp_headers.get("Location") or resp_headers.get("location")
+        except Exception:
+            try:
+                location = dict(resp_headers).get("Location")
+            except Exception:
+                location = None
+
+        if status_code not in (301, 302, 303, 307, 308) or not location:
+            raise RuntimeError(
+                f"getMediaUrlRedirect 未返回重定向 "
+                f"(status={status_code}, media={media_name})"
+            )
+        return str(location)
+
     # ========== 媒体删除 (使用ST) ==========
 
     async def delete_media(self, st: str, media_names: List[str]):
