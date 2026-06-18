@@ -5,7 +5,8 @@ const DEFAULTS = {
   routeKey: "",
   clientLabel: "",
   refreshIntervalMinutes: 60,
-  tabMode: "persistent"
+  tabMode: "persistent",
+  mintIntervalMs: 2000
 };
 
 const $ = (id) => document.getElementById(id);
@@ -25,6 +26,7 @@ function load() {
     $("clientLabel").value = s.clientLabel;
     $("refreshIntervalMinutes").value = s.refreshIntervalMinutes;
     $("tabMode").value = s.tabMode;
+    $("mintIntervalMs").value = s.mintIntervalMs;
   });
   renderLogs();
 }
@@ -37,7 +39,8 @@ function save() {
     routeKey: $("routeKey").value.trim(),
     clientLabel: $("clientLabel").value.trim(),
     refreshIntervalMinutes: Math.max(5, parseInt($("refreshIntervalMinutes").value, 10) || 60),
-    tabMode: $("tabMode").value === "ephemeral" ? "ephemeral" : "persistent"
+    tabMode: $("tabMode").value === "ephemeral" ? "ephemeral" : "persistent",
+    mintIntervalMs: Math.max(0, parseInt($("mintIntervalMs").value, 10) || 2000)
   };
   try { new URL(settings.serverBase); } catch (e) { setStatus("Server URL is invalid.", false); return; }
   if (!settings.apiKey) { setStatus("API Key is required.", false); return; }

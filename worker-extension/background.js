@@ -29,10 +29,12 @@ const DEFAULT_SETTINGS = {
   routeKey: "",           // empty = shared captcha pool (any browser serves any account)
   clientLabel: "",        // optional friendly name shown in the backend logs
   refreshIntervalMinutes: 60,
-  tabMode: "persistent"   // "persistent" (reuse one hidden tab) | "ephemeral" (open/close per token)
+  tabMode: "persistent",  // "persistent" (reuse one hidden tab) | "ephemeral" (open/close per token)
+  mintIntervalMs: 2000    // min spacing between reCAPTCHA mints; paces one browser under Google's rate limit
 };
 
 let ws = null;
+let lastMintAt = 0;       // timestamp of the last reCAPTCHA mint (for pacing)
 let heartbeatInterval = null;
 let reconnectTimer = null;
 let persistentTabId = null;
@@ -51,7 +53,8 @@ function getSettings() {
         routeKey: (stored.routeKey || "").trim(),
         clientLabel: (stored.clientLabel || "").trim(),
         refreshIntervalMinutes: Math.max(5, parseInt(stored.refreshIntervalMinutes, 10) || 60),
-        tabMode: stored.tabMode === "ephemeral" ? "ephemeral" : "persistent"
+        tabMode: stored.tabMode === "ephemeral" ? "ephemeral" : "persistent",
+        mintIntervalMs: Math.max(0, parseInt(stored.mintIntervalMs, 10) || 2000)
       });
     });
   });
@@ -79,6 +82,15 @@ async function log(level, message, details) {
 /* --------------------------- persistent tab -------------------------- */
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Space out reCAPTCHA mints so a single browser stays under Google's rate limit
+// (avoids PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC under burst load).
+async function paceMint(intervalMs) {
+  if (!intervalMs) return;
+  const wait = lastMintAt + intervalMs - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastMintAt = Date.now();
+}
 
 function waitForTabComplete(tabId, timeoutMs = 15000) {
   return new Promise((resolve) => {
@@ -178,6 +190,7 @@ async function handleGetToken(data, settings) {
         tabId = await ensurePersistentTab();
       }
 
+      await paceMint(settings.mintIntervalMs);
       const token = await mintTokenInTab(tabId, action, timeoutMs);
       sendWS({ req_id: data.req_id, status: "success", token });
       return;

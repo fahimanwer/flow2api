@@ -67,6 +67,10 @@
     <option value="ephemeral">Per generation — open &amp; close a tab each time</option>
   </select>
 
+  <label for="mintIntervalMs">Captcha pacing (ms between mints)</label>
+  <input type="number" id="mintIntervalMs" min="0" max="10000" value="2000" />
+  <p class="hint">Higher = slower minting but fewer <b>TOO_MUCH_TRAFFIC</b> rate flags under heavy load. 0 = none. ~2000 ≈ ≤30/min.</p>
+
   <div class="btns">
     <button class="primary" id="saveBtn">Save</button>
     <button class="ghost" id="testBtn">Reconnect</button>
