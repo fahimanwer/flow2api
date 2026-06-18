@@ -11,6 +11,26 @@ from .flow_client import FlowClient
 from .proxy_manager import ProxyManager
 
 
+# Error fragments that indicate an *environmental* failure (reCAPTCHA / captcha /
+# upstream anti-abuse), NOT a problem with the token itself. These must never
+# count toward auto-disable: an otherwise-valid (often paid) token would be
+# killed by a burst of transient IP/fingerprint reCAPTCHA rejections.
+_ENVIRONMENTAL_ERROR_MARKERS = (
+    "unusual_activity",
+    "recaptcha",
+    "captcha",
+    "evaluation failed",
+)
+
+
+def _is_environmental_token_error(error_message: Optional[str]) -> bool:
+    """Return True if the error reflects environment/anti-bot, not token health."""
+    if not error_message:
+        return False
+    lowered = error_message.lower()
+    return any(marker in lowered for marker in _ENVIRONMENTAL_ERROR_MARKERS)
+
+
 class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
@@ -648,8 +668,21 @@ class TokenManager:
         else:
             await self.db.increment_token_stats(token_id, "image")
 
-    async def record_error(self, token_id: int):
-        """Record token error and auto-disable if threshold reached"""
+    async def record_error(self, token_id: int, error_message: Optional[str] = None):
+        """Record token error and auto-disable if threshold reached.
+
+        Environmental failures (reCAPTCHA / captcha / upstream anti-abuse) are
+        NOT counted toward auto-disable: they reflect IP/fingerprint reputation,
+        not token validity. Counting them would auto-disable an otherwise-valid
+        (often paid) token after a burst of transient reCAPTCHA rejections.
+        """
+        if _is_environmental_token_error(error_message):
+            debug_logger.log_info(
+                f"[TOKEN] Token {token_id} hit an environmental/captcha error; "
+                f"not counting toward auto-disable: {str(error_message)[:120]}"
+            )
+            return
+
         await self.db.increment_token_stats(token_id, "error")
 
         # Check if should auto-disable token (based on consecutive errors)

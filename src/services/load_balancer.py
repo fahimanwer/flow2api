@@ -183,7 +183,9 @@ class LoadBalancer:
 
         for token in active_tokens:
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
-            if model and not supports_model_for_tier(model, normalized_tier):
+            # Image generation is exempt from paygate-tier gating (free accounts
+            # can generate images on Flow); only video enforces account tier.
+            if model and not for_image_generation and not supports_model_for_tier(model, normalized_tier):
                 filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)
                 continue
             if for_image_generation:
@@ -330,7 +332,7 @@ class LoadBalancer:
         supported_tokens = []
         for token in active_tokens:
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
-            if model and not supports_model_for_tier(model, normalized_tier):
+            if model and not for_image_generation and not supports_model_for_tier(model, normalized_tier):
                 continue
             supported_tokens.append(token)
 
