@@ -195,9 +195,12 @@ class FlowClient:
         else:
             debug_logger.log_info("[FINGERPRINT] 未检测到浏览器指纹上下文，使用基于账号ID生成的固定 User-Agent 作为请求头")
             fingerprint_user_agent = self._generate_user_agent(account_id)
+        # Fall back to a generated UA so the header is never None — otherwise the
+        # personal/cold-start path (no browser fingerprint yet) would set
+        # User-Agent=None and crash at headers.get("User-Agent", "").lower() below.
         headers.update({
             "Content-Type": "application/json",
-            "User-Agent": fingerprint_user_agent
+            "User-Agent": fingerprint_user_agent or self._generate_user_agent(account_id)
         })
 
         # 若存在打码浏览器指纹，覆盖关键客户端提示头，保证提交请求与打码时一致。
