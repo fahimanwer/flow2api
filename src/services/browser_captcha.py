@@ -262,6 +262,37 @@ def normalize_browser_proxy_url(proxy_url: str) -> tuple[Optional[str], Optional
 
     return proxy_url, None
 
+
+# Round-robin selection across multiple proxy URLs (comma / newline / semicolon
+# separated). With browser_count > 1, each captcha browser is assigned a distinct
+# egress IP so concurrent reCAPTCHA solves spread across several IPs instead of
+# bursting one, avoiding PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC.
+_browser_proxy_rr_index = 0
+
+
+def split_browser_proxy_candidates(value: Optional[str]) -> list:
+    if not value:
+        return []
+    return [p.strip() for p in re.split(r'[,\n;]+', value) if p.strip()]
+
+
+def select_round_robin_proxy(value: Optional[str]) -> Optional[str]:
+    """Pick the next proxy URL from a separated list, rotating on each call.
+
+    A single URL (no separators) is returned unchanged, so existing single-proxy
+    configs behave exactly as before.
+    """
+    global _browser_proxy_rr_index
+    candidates = split_browser_proxy_candidates(value)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    chosen = candidates[_browser_proxy_rr_index % len(candidates)]
+    _browser_proxy_rr_index = (_browser_proxy_rr_index + 1) % len(candidates)
+    return chosen
+
+
 def validate_browser_proxy_url(proxy_url: str) -> tuple[bool, str]:
     if not proxy_url: return True, None
     normalized_proxy_url, _ = normalize_browser_proxy_url(proxy_url.strip())
@@ -568,12 +599,14 @@ class TokenBrowser:
         try:
             candidate_proxy_url = None
             if token_proxy_url and token_proxy_url.strip():
-                candidate_proxy_url = token_proxy_url.strip()
+                candidate_proxy_url = select_round_robin_proxy(token_proxy_url)
                 proxy_source = "token"
             elif self.db:
                 captcha_config = await self.db.get_captcha_config()
                 if captcha_config.browser_proxy_enabled and captcha_config.browser_proxy_url:
-                    candidate_proxy_url = captcha_config.browser_proxy_url.strip()
+                    # browser_proxy_url may hold several comma-separated URLs; rotate
+                    # across them so each concurrent browser uses a distinct egress IP.
+                    candidate_proxy_url = select_round_robin_proxy(captcha_config.browser_proxy_url)
                     proxy_source = "global"
 
             if candidate_proxy_url:
