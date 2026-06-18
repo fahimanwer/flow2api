@@ -118,16 +118,17 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠ Remote browser pool prefill failed: {e}")
 
-    # Start 429 auto-unban task
+    # Start token auto-recovery task: re-enable auto-disabled tokens (error bursts,
+    # usage quota, 429 rate limits) after their cooldown so they recover on their own.
     import asyncio
     async def auto_unban_task():
-        """定时任务：每小时检查并解禁429被禁用的token"""
+        """Periodically re-enable auto-disabled tokens after their cooldown."""
         while True:
             try:
-                await asyncio.sleep(3600)  # 每小时执行一次
-                await token_manager.auto_unban_429_tokens()
+                await asyncio.sleep(300)  # every 5 minutes
+                await token_manager.auto_recover_tokens()
             except Exception as e:
-                print(f"❌ Auto-unban task error: {e}")
+                print(f"❌ Auto-recover task error: {e}")
 
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
 
@@ -179,7 +180,7 @@ async def lifespan(app: FastAPI):
         print("✓ File cache cleanup task started")
     else:
         print("✓ File cache cleanup task disabled (timeout <= 0)")
-    print(f"✓ 429 auto-unban task started (runs every hour)")
+    print(f"✓ Token auto-recovery task started (runs every 5 min)")
     log_cleanup_cfg = await db.get_log_cleanup_config()
     if log_cleanup_cfg.enabled:
         print(
@@ -216,7 +217,7 @@ async def lifespan(app: FastAPI):
         await browser_service.close()
         print("✓ Browser captcha service closed")
     print("✓ File cache cleanup task stopped")
-    print("✓ 429 auto-unban task stopped")
+    print("✓ Token auto-recovery task stopped")
     print("✓ Log cleanup task stopped")
 
 

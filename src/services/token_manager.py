@@ -31,6 +31,27 @@ def _is_environmental_token_error(error_message: Optional[str]) -> bool:
     return any(marker in lowered for marker in _ENVIRONMENTAL_ERROR_MARKERS)
 
 
+# Error fragments that mean the account hit a usage quota (daily/per-model). Not a
+# token-health problem — the token is simply out of allowance for now, so it is
+# cooled down (skipped by the load balancer) and auto-recovered later, NOT counted
+# toward the auto-disable threshold.
+_QUOTA_ERROR_MARKERS = (
+    "per_model_daily_quota",
+    "daily_quota_reached",
+    "quota_reached",
+    "resource has been exhausted",
+    "resource_exhausted",
+)
+
+
+def _is_quota_error(error_message: Optional[str]) -> bool:
+    """Return True if the error is a usage-quota exhaustion (not token health)."""
+    if not error_message:
+        return False
+    lowered = error_message.lower()
+    return any(marker in lowered for marker in _QUOTA_ERROR_MARKERS)
+
+
 class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
@@ -683,6 +704,20 @@ class TokenManager:
             )
             return
 
+        if _is_quota_error(error_message):
+            # Out of daily/model quota — not the token's fault. Cool it down so the
+            # load balancer skips it; auto_recover_tokens re-enables it after a wait.
+            debug_logger.log_warning(
+                f"[QUOTA] Token {token_id} hit a usage quota; cooling down (will auto-recover)"
+            )
+            await self.db.update_token(
+                token_id,
+                is_active=False,
+                ban_reason="daily_quota",
+                banned_at=datetime.now(timezone.utc),
+            )
+            return
+
         await self.db.increment_token_stats(token_id, "error")
 
         # Check if should auto-disable token (based on consecutive errors)
@@ -692,9 +727,16 @@ class TokenManager:
         if stats and stats.consecutive_error_count >= admin_config.error_ban_threshold:
             debug_logger.log_warning(
                 f"[TOKEN_BAN] Token {token_id} consecutive error count ({stats.consecutive_error_count}) "
-                f"reached threshold ({admin_config.error_ban_threshold}), auto-disabling"
+                f"reached threshold ({admin_config.error_ban_threshold}), auto-disabling (will auto-recover)"
             )
-            await self.disable_token(token_id)
+            # Mark it recoverable (ban_reason + timestamp) so auto_recover_tokens
+            # re-enables it after a cooldown, instead of disabling it forever.
+            await self.db.update_token(
+                token_id,
+                is_active=False,
+                ban_reason="auto_error",
+                banned_at=datetime.now(timezone.utc),
+            )
 
     async def record_success(self, token_id: int):
         """Record successful request (reset consecutive error count)
@@ -775,6 +817,56 @@ class TokenManager:
                     banned_at=None
                 )
                 # 重置错误计数
+                await self.db.reset_error_count(token.id)
+
+    # Per-reason cooldown (minutes) before an auto-disabled token is retried.
+    RECOVERABLE_COOLDOWNS_MINUTES = {
+        "auto_error": 10,      # repeated generic errors -> short retry
+        "daily_quota": 30,     # usage quota -> retry occasionally (resets daily)
+        "429_rate_limit": 720, # rate limit -> 12h, matches legacy behaviour
+    }
+
+    async def auto_recover_tokens(self):
+        """Re-enable auto-disabled tokens after a per-reason cooldown.
+
+        Lets transient failures (error bursts, usage quota, 429 rate limits)
+        recover on their own without manual re-enabling. Only tokens disabled by
+        the system (those carrying a recoverable ban_reason + banned_at) are
+        touched — a manual admin disable (no ban_reason) is left alone. Tokens
+        whose credentials are already expired are skipped (the refresh/extension
+        path handles those).
+        """
+        all_tokens = await self.db.get_all_tokens()
+        now = datetime.now(timezone.utc)
+
+        for token in all_tokens:
+            if token.is_active:
+                continue
+            cooldown = self.RECOVERABLE_COOLDOWNS_MINUTES.get(token.ban_reason)
+            if cooldown is None:        # manual disable / unknown reason -> leave it
+                continue
+            if not token.banned_at:
+                continue
+
+            # Skip tokens whose access token is already expired.
+            if token.at_expires:
+                at_exp = token.at_expires if token.at_expires.tzinfo else token.at_expires.replace(tzinfo=timezone.utc)
+                if at_exp <= now:
+                    continue
+
+            banned_at = token.banned_at if token.banned_at.tzinfo else token.banned_at.replace(tzinfo=timezone.utc)
+            elapsed_min = (now - banned_at).total_seconds() / 60.0
+            if elapsed_min >= cooldown:
+                debug_logger.log_info(
+                    f"[AUTO_RECOVER] Re-enabling Token {token.id} "
+                    f"(reason={token.ban_reason}, cooled {elapsed_min:.0f}m >= {cooldown}m)"
+                )
+                await self.db.update_token(
+                    token.id,
+                    is_active=True,
+                    ban_reason=None,
+                    banned_at=None,
+                )
                 await self.db.reset_error_count(token.id)
 
     # ========== 余额刷新 ==========
