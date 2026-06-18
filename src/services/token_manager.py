@@ -52,6 +52,31 @@ def _is_quota_error(error_message: Optional[str]) -> bool:
     return any(marker in lowered for marker in _QUOTA_ERROR_MARKERS)
 
 
+# Aspect-ratio / resolution suffixes stripped to get a model's quota family.
+_MODEL_VARIANT_SUFFIXES = (
+    "-4k", "-2k", "_4k", "_2k", "_1080p",
+    "-landscape", "-portrait", "-square", "-four-three", "-three-four",
+)
+
+
+def model_quota_key(model: Optional[str]) -> str:
+    """Reduce an API model id to its quota family (the underlying Flow model).
+
+    Flow quota is PER MODEL: every aspect-ratio / resolution variant of one model
+    (e.g. all gemini-3.0-pro-image-*) shares a single daily quota. So the per-model
+    cooldown is keyed by the base family, not the full variant id.
+    """
+    key = (model or "").strip().lower()
+    changed = True
+    while changed and key:
+        changed = False
+        for suf in _MODEL_VARIANT_SUFFIXES:
+            if key.endswith(suf):
+                key = key[: -len(suf)]
+                changed = True
+    return key
+
+
 class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
@@ -63,6 +88,38 @@ class TokenManager:
         self._refresh_locks: dict[int, asyncio.Lock] = {}
         self._project_locks: dict[int, asyncio.Lock] = {}
         self._refresh_futures: dict[int, asyncio.Task] = {}
+        # Per-(token, model-family) quota cooldown. Quota is per model, so a token
+        # that exhausted one model stays usable for the others — only the specific
+        # model is paused here (in memory; cleared on restart). See [[per-model quota]].
+        self._model_quota_until: dict[tuple, datetime] = {}
+
+    # How long a single model stays paused on a token after a quota hit before retry.
+    MODEL_QUOTA_COOLDOWN_MINUTES = 30
+
+    def mark_model_quota_exhausted(self, token_id: int, model: Optional[str]):
+        """Pause ONLY this model for this token after a per-model quota error."""
+        key = model_quota_key(model)
+        if not key:
+            return
+        until = datetime.now(timezone.utc) + timedelta(minutes=self.MODEL_QUOTA_COOLDOWN_MINUTES)
+        self._model_quota_until[(token_id, key)] = until
+        debug_logger.log_warning(
+            f"[MODEL_QUOTA] Token {token_id} model '{key}' quota exhausted; pausing only "
+            f"this model for {self.MODEL_QUOTA_COOLDOWN_MINUTES}m (other models stay active)"
+        )
+
+    def is_model_quota_exhausted(self, token_id: int, model: Optional[str]) -> bool:
+        """True if this token's quota for the given model's family is on cooldown."""
+        key = model_quota_key(model)
+        if not key:
+            return False
+        until = self._model_quota_until.get((token_id, key))
+        if not until:
+            return False
+        if datetime.now(timezone.utc) >= until:
+            self._model_quota_until.pop((token_id, key), None)
+            return False
+        return True
 
     async def _get_token_lock(
         self,
@@ -689,7 +746,7 @@ class TokenManager:
         else:
             await self.db.increment_token_stats(token_id, "image")
 
-    async def record_error(self, token_id: int, error_message: Optional[str] = None):
+    async def record_error(self, token_id: int, error_message: Optional[str] = None, model: Optional[str] = None):
         """Record token error and auto-disable if threshold reached.
 
         Environmental failures (reCAPTCHA / captcha / upstream anti-abuse) are
@@ -705,17 +762,10 @@ class TokenManager:
             return
 
         if _is_quota_error(error_message):
-            # Out of daily/model quota — not the token's fault. Cool it down so the
-            # load balancer skips it; auto_recover_tokens re-enables it after a wait.
-            debug_logger.log_warning(
-                f"[QUOTA] Token {token_id} hit a usage quota; cooling down (will auto-recover)"
-            )
-            await self.db.update_token(
-                token_id,
-                is_active=False,
-                ban_reason="daily_quota",
-                banned_at=datetime.now(timezone.utc),
-            )
+            # Quota is PER MODEL — pause ONLY this model for this token. The token
+            # stays active and keeps serving every other model (which have their own
+            # separate daily quotas). Do NOT disable the whole token.
+            self.mark_model_quota_exhausted(token_id, model)
             return
 
         await self.db.increment_token_stats(token_id, "error")

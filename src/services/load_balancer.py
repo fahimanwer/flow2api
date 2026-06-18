@@ -188,6 +188,11 @@ class LoadBalancer:
             if model and not for_image_generation and not supports_model_for_tier(model, normalized_tier):
                 filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)
                 continue
+            # Per-model quota: skip this token only for the specific model it has
+            # exhausted; it stays available for every other model (separate quotas).
+            if model and self.token_manager.is_model_quota_exhausted(token.id, model):
+                filtered_reasons[token.id] = f"模型配额已用尽，冷却中: {model}"
+                continue
             if for_image_generation:
                 if not token.image_enabled:
                     filtered_reasons[token.id] = "图片生成已禁用"
@@ -339,6 +344,13 @@ class LoadBalancer:
         if model and not supported_tokens:
             tier_label = get_paygate_tier_label(required_tier)
             return f"当前模型需要 {tier_label} 账号，但没有可用的 {tier_label} 账号: {model}"
+
+        # All otherwise-usable tokens have exhausted THIS model's quota (other
+        # models still work on them). Report it as a model-quota cooldown.
+        if model and supported_tokens and all(
+            self.token_manager.is_model_quota_exhausted(t.id, model) for t in supported_tokens
+        ):
+            return f"当前模型 {model} 今日配额已用尽(冷却中)，其他模型仍可用。"
 
         capability_tokens = []
         for token in supported_tokens:
