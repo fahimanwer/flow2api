@@ -26,6 +26,7 @@ class ExtensionCaptchaService:
         self.db = db
         self.active_connections: list[ExtensionConnection] = []
         self.pending_requests: dict[str, tuple[asyncio.Future, WebSocket]] = {}
+        self._rr_index = 0  # round-robin cursor for empty-route (shared pool) browsers
 
     @classmethod
     async def get_instance(cls, db=None) -> "ExtensionCaptchaService":
@@ -77,10 +78,14 @@ class ExtensionCaptchaService:
         # A keyed route such as "9223" belongs to a specific browser/account
         # and must never be borrowed by another token just because it is the
         # only extension online.
-        for conn in self.active_connections:
-            if not conn.route_key:
-                return conn
-        return None
+        # Round-robin across ALL connected empty-route browsers so reCAPTCHA
+        # minting load is spread across them (each browser/IP stays under
+        # Google's rate limit) instead of hammering a single one.
+        empty_conns = [c for c in self.active_connections if not c.route_key]
+        if not empty_conns:
+            return None
+        self._rr_index = (self._rr_index + 1) % len(empty_conns)
+        return empty_conns[self._rr_index % len(empty_conns)]
 
     def _describe_routes(self) -> str:
         labels = []
