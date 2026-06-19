@@ -634,7 +634,7 @@ class FlowClient:
 
         if last_error is not None:
             raise last_error
-        raise RuntimeError("图片生成请求失败")
+        raise RuntimeError("Image generation request failed")
 
     # ========== 认证相关 (使用ST) ==========
 
@@ -733,7 +733,7 @@ class FlowClient:
 
         if last_error is not None:
             raise last_error
-        raise RuntimeError("创建项目失败")
+        raise RuntimeError("Failed to create project")
 
     async def delete_project(self, st: str, project_id: str):
         """删除项目
@@ -990,7 +990,7 @@ class FlowClient:
 
         if last_error is not None:
             raise last_error
-        raise RuntimeError("上传图片失败")
+        raise RuntimeError("Failed to upload image")
 
     # ========== 图片生成 (使用AT) - 同步返回 ==========
 
@@ -2255,7 +2255,7 @@ class FlowClient:
                     return result
                 except Exception as e:
                     debug_logger.log_error(f"[CONCAT] 解码 encodedVideo 失败: {e}")
-                    raise Exception(f"解码拼接视频失败: {e}")
+                    raise Exception(f"Failed to decode stitched video: {e}")
             
             # SUCCESSFUL but neither outputUri nor encodedVideo
             if "SUCCESSFUL" in status:
@@ -2263,12 +2263,12 @@ class FlowClient:
 
             if "FAILED" in status or "ERROR" in status:
                 debug_logger.log_error(f"[CONCAT] 失败: {status}, 响应: {json.dumps(result, ensure_ascii=False)[:300]}")
-                raise Exception(f"视频拼接失败: {status}")
+                raise Exception(f"Video stitching failed: {status}")
             
             await asyncio.sleep(poll_interval)
         
         debug_logger.log_error(f"[CONCAT] 超时 ({timeout}s)，放弃拼接")
-        raise Exception(f"视频拼接超时 ({timeout}s)")
+        raise Exception(f"Video stitching timed out ({timeout}s)")
 
     # ========== 视频放大 (Video Upsampler) ==========
 
@@ -2447,7 +2447,7 @@ class FlowClient:
 
         if last_error is not None:
             raise last_error
-        raise RuntimeError("视频状态查询失败")
+        raise RuntimeError("Video status query failed")
 
     async def get_media_url_redirect(
         self,
@@ -2473,9 +2473,9 @@ class FlowClient:
             RuntimeError: 网络错误、未返回 3xx，或缺少 Location 头。
         """
         if not media_name:
-            raise ValueError("get_media_url_redirect: media_name 为空")
+            raise ValueError("get_media_url_redirect: media_name is empty")
         if not st:
-            raise ValueError("get_media_url_redirect: 缺少 ST token")
+            raise ValueError("get_media_url_redirect: missing ST token")
 
         url = (
             f"{self.labs_base_url}/trpc/media.getMediaUrlRedirect"
@@ -2537,7 +2537,7 @@ class FlowClient:
         except Exception as e:
             debug_logger.log_error(f"[MEDIA REDIRECT] 请求失败: media={media_name}, error={e}")
             raise RuntimeError(
-                f"getMediaUrlRedirect 请求失败 (media={media_name}): {e}"
+                f"getMediaUrlRedirect request failed (media={media_name}): {e}"
             ) from e
 
         duration_ms = (time.time() - start_time) * 1000
@@ -2568,7 +2568,7 @@ class FlowClient:
                 f"media={media_name}, location={location}"
             )
             raise RuntimeError(
-                f"getMediaUrlRedirect 未返回重定向 "
+                f"getMediaUrlRedirect did not return a redirect "
                 f"(status={status_code}, media={media_name})"
             )
 
@@ -2659,15 +2659,15 @@ class FlowClient:
         """判断是否需要重试，返回日志提示内容"""
         error_lower = error_str.lower()
         if "403" in error_lower:
-            return "403错误"
+            return "403 error"
         if "429" in error_lower or "too many requests" in error_lower:
-            return "429限流"
+            return "429 rate limit"
         if self._is_retryable_network_error(error_str):
-            return "网络/TLS错误"
+            return "network/TLS error"
         if "recaptcha evaluation failed" in error_lower:
-            return "reCAPTCHA 验证失败"
+            return "reCAPTCHA verification failed"
         if "recaptcha" in error_lower:
-            return "reCAPTCHA 错误"
+            return "reCAPTCHA error"
         if any(keyword in error_lower for keyword in [
             "http error 500",
             "public_error",
@@ -2678,7 +2678,7 @@ class FlowClient:
             "server error",
             "upstream error",
         ]):
-            return "500/内部错误"
+            return "500/internal error"
         return None
 
     async def _notify_browser_captcha_error(
@@ -2775,12 +2775,12 @@ class FlowClient:
         timeout = max(5, int(config.remote_browser_timeout or 60))
 
         if not base_url:
-            raise RuntimeError("remote_browser 服务地址未配置")
+            raise RuntimeError("remote_browser service URL is not configured")
         if not api_key:
-            raise RuntimeError("remote_browser API Key 未配置")
+            raise RuntimeError("remote_browser API Key is not configured")
 
         if not (base_url.startswith("http://") or base_url.startswith("https://")):
-            raise RuntimeError("remote_browser 服务地址格式错误")
+            raise RuntimeError("remote_browser service URL is malformed")
 
         return base_url, api_key, timeout
 
@@ -2846,7 +2846,7 @@ class FlowClient:
         try:
             status_code, text = await asyncio.to_thread(do_request)
         except Exception as e:
-            raise RuntimeError(f"remote_browser 请求失败: {e}") from e
+            raise RuntimeError(f"remote_browser request failed: {e}") from e
 
         return status_code, FlowClient._parse_json_response_text(text), text
 
@@ -2890,7 +2890,7 @@ class FlowClient:
                     **request_kwargs,
                 )
         except Exception as e:
-            raise RuntimeError(f"remote_browser 请求失败: {e}") from e
+            raise RuntimeError(f"remote_browser request failed: {e}") from e
 
         status_code = int(getattr(response, "status_code", 0) or 0)
         text = response.text or ""
@@ -2923,10 +2923,10 @@ class FlowClient:
                 detail = payload.get("detail") or payload.get("message") or str(payload)
             if not detail:
                 detail = (response_text or "").strip() or f"HTTP {status_code}"
-            raise RuntimeError(f"remote_browser 请求失败: {detail}")
+            raise RuntimeError(f"remote_browser request failed: {detail}")
 
         if not isinstance(payload, dict):
-            raise RuntimeError("remote_browser 返回格式错误")
+            raise RuntimeError("remote_browser returned an invalid format")
 
         return payload
 
@@ -3119,7 +3119,7 @@ class FlowClient:
                 fingerprint = payload.get("fingerprint") if isinstance(payload.get("fingerprint"), dict) else None
                 self._set_request_fingerprint(fingerprint if token else None)
                 if not token or not session_id:
-                    raise RuntimeError(f"remote_browser 返回缺少 token/session_id: {payload}")
+                    raise RuntimeError(f"remote_browser response missing token/session_id: {payload}")
                 return token, str(session_id)
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA RemoteBrowser] 错误: {str(e)}")

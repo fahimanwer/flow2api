@@ -343,14 +343,14 @@ class LoadBalancer:
 
         if model and not supported_tokens:
             tier_label = get_paygate_tier_label(required_tier)
-            return f"当前模型需要 {tier_label} 账号，但没有可用的 {tier_label} 账号: {model}"
+            return f"This model requires a {tier_label} account, but no {tier_label} account is available: {model}"
 
         # All otherwise-usable tokens have exhausted THIS model's quota (other
         # models still work on them). Report it as a model-quota cooldown.
         if model and supported_tokens and all(
             self.token_manager.is_model_quota_exhausted(t.id, model) for t in supported_tokens
         ):
-            return f"当前模型 {model} 今日配额已用尽(冷却中)，其他模型仍可用。"
+            return f"Model {model} has reached today's quota (cooling down); other models are still available."
 
         capability_tokens = []
         for token in supported_tokens:
@@ -362,8 +362,8 @@ class LoadBalancer:
 
         if supported_tokens and not capability_tokens:
             if for_image_generation:
-                return "当前有符合档位的账号，但图片生成功能已全部禁用。"
+                return "Eligible accounts exist, but image generation is disabled on all of them."
             if for_video_generation:
-                return "当前有符合档位的账号，但视频生成功能已全部禁用。"
+                return "Eligible accounts exist, but video generation is disabled on all of them."
 
         return None
