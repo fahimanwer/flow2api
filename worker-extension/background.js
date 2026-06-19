@@ -121,6 +121,12 @@ function tabExists(tabId) {
   });
 }
 
+function queryFlowTabs() {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ url: "https://labs.google/fx/tools/flow*" }, (tabs) => resolve(tabs || []));
+  });
+}
+
 // Create a fresh hidden Labs tab and return its id (ready + settled).
 async function createLabsTab() {
   const tab = await chrome.tabs.create({ url: LABS_URL, active: false });
@@ -129,10 +135,35 @@ async function createLabsTab() {
   return tab.id;
 }
 
-// Ensure a persistent tab exists; returns its id.
+// Ensure exactly ONE persistent Labs tab exists; returns its id.
+// Survives service-worker restarts (id persisted in storage) and cleans up any
+// duplicate/orphaned Flow tabs so they don't pile up.
 async function ensurePersistentTab() {
+  // 1) live in-memory tab
   if (await tabExists(persistentTabId)) return persistentTabId;
+
+  // 2) tab id remembered across a service-worker restart
+  const stored = (await chrome.storage.local.get(["persistentTabId"])).persistentTabId;
+  if (stored && await tabExists(stored)) {
+    persistentTabId = stored;
+    return persistentTabId;
+  }
+
+  // 3) adopt an existing Flow tab and close any extras (de-dupe / cleanup)
+  const existing = await queryFlowTabs();
+  if (existing.length > 0) {
+    persistentTabId = existing[0].id;
+    for (let i = 1; i < existing.length; i++) {
+      try { await chrome.tabs.remove(existing[i].id); } catch (_) {}
+    }
+    await chrome.storage.local.set({ persistentTabId });
+    if (existing.length > 1) await log("INFO", "Closed duplicate Flow tabs", { kept: persistentTabId, closed: existing.length - 1 });
+    return persistentTabId;
+  }
+
+  // 4) none exist -> create one
   persistentTabId = await createLabsTab();
+  await chrome.storage.local.set({ persistentTabId });
   await log("INFO", "Persistent Labs tab opened", { tabId: persistentTabId });
   return persistentTabId;
 }
@@ -359,7 +390,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 /* ------------------------------ lifecycle ---------------------------- */
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === persistentTabId) persistentTabId = null;
+  if (tabId === persistentTabId) {
+    persistentTabId = null;
+    chrome.storage.local.remove("persistentTabId");
+  }
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
