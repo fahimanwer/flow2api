@@ -11,6 +11,13 @@
  * browser. Reliability is the priority — persistent tab is recreated on loss,
  * the socket auto-reconnects, and an alarm revives everything if Chrome suspends
  * the service worker.
+ *
+ * Anti-tab-storm guarantees (post sleep/wake): the extension only ever closes
+ * tabs IT created (tracked in storage), never the user's own Labs tabs; tab
+ * creation is bounded by a storage-backed lease + a hard ceiling so a wake storm
+ * can never pile up tabs; and if Google Labs needs a fresh login (session expired
+ * during sleep -> redirect to accounts.google.com) it STOPS opening tabs, backs
+ * off, and raises a "login required" badge instead of churning Chrome to a crash.
  */
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
@@ -19,6 +26,12 @@ const SESSION_COOKIE = "__Secure-next-auth.session-token";
 
 const ALARM_SESSION = "flow2api_session_refresh";
 const ALARM_KEEPALIVE = "flow2api_keepalive";
+
+// Tab-creation safety rails.
+const LEASE_MS = 25000;            // creation lease lifetime (> worst-case tab load ~16s)
+const MAX_OWNED_TABS = 2;          // hard ceiling fuse: never keep more owned Labs tabs than this
+const LOGIN_HOSTS = ["accounts.google.com", "consent.google.com", "signin.google.com"];
+const AUTH_BACKOFF_MS = [60000, 300000, 900000, 1800000]; // 1m, 5m, 15m, 30m (capped)
 
 const DEFAULT_SETTINGS = {
   // Baked-in config so the extension works the moment it is loaded — no setup.
@@ -37,8 +50,10 @@ let ws = null;
 let lastMintAt = 0;       // timestamp of the last reCAPTCHA mint (for pacing)
 let heartbeatInterval = null;
 let reconnectTimer = null;
-let persistentTabId = null;
+let persistentTabId = null;           // in-memory cache of the live persistent tab id
 let tokenQueue = Promise.resolve();   // serialize token requests
+let ensureChain = Promise.resolve();  // serialize persistent-tab ensures within this SW life
+let ownedQueue = Promise.resolve();   // serialize owned-tab-id storage mutations
 let connecting = false;
 
 /* ----------------------------- settings ----------------------------- */
@@ -79,7 +94,71 @@ async function log(level, message, details) {
   await chrome.storage.local.set({ logs });
 }
 
-/* --------------------------- persistent tab -------------------------- */
+/* ------------------------------ user signal -------------------------- */
+
+// The toolbar badge is the reliable, always-visible "login required" signal —
+// it survives the user being away (lid closed) and needs no icon asset.
+function setBadge(state) {
+  try {
+    if (!chrome.action) return;
+    if (state === "login_required") {
+      chrome.action.setBadgeText({ text: "!" });
+      chrome.action.setBadgeBackgroundColor({ color: "#f06262" });
+      chrome.action.setTitle({ title: "Flow2API Worker — Google Labs login required" });
+    } else {
+      chrome.action.setBadgeText({ text: "" });
+      chrome.action.setTitle({ title: "Flow2API Worker" });
+    }
+  } catch (_) {}
+}
+
+async function notifyLogin() {
+  // Best-effort desktop notification; the badge is the guaranteed signal.
+  try {
+    await chrome.notifications.create("flow2api_login_" + Date.now(), {
+      type: "basic",
+      iconUrl: "data:image/svg+xml;base64," + btoa(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" rx="18" fill="#f06262"/><text x="48" y="68" font-size="64" text-anchor="middle" fill="#fff" font-family="sans-serif">!</text></svg>'
+      ),
+      title: "Flow2API Worker — login needed",
+      message: "Your Google Labs session expired. Open Google Labs and sign in again to resume reCAPTCHA minting.",
+      priority: 2
+    });
+  } catch (_) {}
+}
+
+/* ------------------------------ auth state --------------------------- */
+
+async function getAuthState() {
+  const { authState } = await chrome.storage.local.get(["authState"]);
+  return authState || { state: "ok", failCount: 0, nextRetryAt: 0 };
+}
+
+// Enter the "login required" circuit-breaker: stop opening tabs, back off
+// (growing interval), and raise the badge so the user knows to re-login.
+async function setLoginRequired(reason) {
+  const cur = await getAuthState();
+  const transition = cur.state !== "login_required";
+  const failCount = (cur.state === "login_required" ? cur.failCount : 0) + 1;
+  const backoff = AUTH_BACKOFF_MS[Math.min(failCount - 1, AUTH_BACKOFF_MS.length - 1)];
+  await chrome.storage.local.set({
+    authState: { state: "login_required", failCount, nextRetryAt: Date.now() + backoff, reason: reason || "" }
+  });
+  setBadge("login_required");
+  await log("ERROR", "Google Labs login required — pausing tab creation", { reason, backoffMs: backoff });
+  if (transition) notifyLogin(reason);
+}
+
+async function clearLoginRequired() {
+  const cur = await getAuthState();
+  if (cur.state !== "ok") {
+    await chrome.storage.local.set({ authState: { state: "ok", failCount: 0, nextRetryAt: 0 } });
+    setBadge("ok");
+    await log("SUCCESS", "Google Labs session restored");
+  }
+}
+
+/* --------------------------- tab utilities --------------------------- */
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -90,6 +169,32 @@ async function paceMint(intervalMs) {
   const wait = lastMintAt + intervalMs - Date.now();
   if (wait > 0) await sleep(wait);
   lastMintAt = Date.now();
+}
+
+function getTab(tabId) {
+  return new Promise((resolve) => {
+    if (tabId == null) { resolve(null); return; }
+    chrome.tabs.get(tabId, (tab) => resolve(chrome.runtime.lastError ? null : (tab || null)));
+  });
+}
+
+function tabUrlOf(tab) { return (tab && (tab.url || tab.pendingUrl)) || ""; }
+function isFlowUrl(u) { return !!u && u.startsWith(LABS_URL); }
+
+// A tab counts as "on Flow" if EITHER its committed url OR its pending (loading)
+// url is the Flow URL — checked independently so an about:blank-then-Flow tab
+// (which reports url:"about:blank", pendingUrl:Flow) is not missed.
+function tabOnFlow(tab) {
+  return !!tab && (isFlowUrl(tab.url || "") || isFlowUrl(tab.pendingUrl || ""));
+}
+
+// A tab is "usable" (ready to mint) only when navigation has COMMITTED to Flow.
+function tabUsable(tab) { return !!tab && isFlowUrl(tab.url || ""); }
+
+function isLoginTab(tab) {
+  const u = tabUrlOf(tab);
+  try { const h = new URL(u).hostname; return LOGIN_HOSTS.some((x) => h === x || h.endsWith("." + x)); }
+  catch (_) { return false; }
 }
 
 function waitForTabComplete(tabId, timeoutMs = 15000) {
@@ -112,61 +217,244 @@ function waitForTabComplete(tabId, timeoutMs = 15000) {
   });
 }
 
-function tabExists(tabId) {
-  return new Promise((resolve) => {
-    if (tabId == null) { resolve(false); return; }
-    chrome.tabs.get(tabId, (tab) => {
-      resolve(!chrome.runtime.lastError && !!tab);
-    });
-  });
-}
-
-function queryFlowTabs() {
-  return new Promise((resolve) => {
-    chrome.tabs.query({ url: "https://labs.google/fx/tools/flow*" }, (tabs) => resolve(tabs || []));
-  });
-}
-
-// Create a fresh hidden Labs tab and return its id (ready + settled).
-async function createLabsTab() {
-  const tab = await chrome.tabs.create({ url: LABS_URL, active: false });
-  await waitForTabComplete(tab.id);
-  await sleep(1200); // let grecaptcha settle
-  return tab.id;
-}
-
-// Ensure exactly ONE persistent Labs tab exists; returns its id.
-// Survives service-worker restarts (id persisted in storage) and cleans up any
-// duplicate/orphaned Flow tabs so they don't pile up.
-async function ensurePersistentTab() {
-  // 1) live in-memory tab
-  if (await tabExists(persistentTabId)) return persistentTabId;
-
-  // 2) tab id remembered across a service-worker restart
-  const stored = (await chrome.storage.local.get(["persistentTabId"])).persistentTabId;
-  if (stored && await tabExists(stored)) {
-    persistentTabId = stored;
-    return persistentTabId;
-  }
-
-  // 3) adopt an existing Flow tab and close any extras (de-dupe / cleanup)
-  const existing = await queryFlowTabs();
-  if (existing.length > 0) {
-    persistentTabId = existing[0].id;
-    for (let i = 1; i < existing.length; i++) {
-      try { await chrome.tabs.remove(existing[i].id); } catch (_) {}
+async function hasSessionCookie() {
+  try {
+    let c = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
+    if (!c) {
+      const all = await chrome.cookies.getAll({ domain: "labs.google" });
+      c = all.find((x) => x.name === SESSION_COOKIE) || null;
     }
-    await chrome.storage.local.set({ persistentTabId });
-    if (existing.length > 1) await log("INFO", "Closed duplicate Flow tabs", { kept: persistentTabId, closed: existing.length - 1 });
+    return !!(c && c.value);
+  } catch (_) {
+    return true; // don't block on cookie API errors
+  }
+}
+
+/* --------------------------- owned-tab registry ---------------------- */
+// We only ever CLOSE tabs we opened ourselves (tracked here), never the user's
+// own Labs tabs. All mutations are serialized to avoid lost-update races with
+// the onRemoved listener.
+
+function mutateOwned(fn) {
+  ownedQueue = ownedQueue.then(async () => {
+    const { ownedTabIds = [] } = await chrome.storage.local.get(["ownedTabIds"]);
+    const next = fn(ownedTabIds.slice());
+    await chrome.storage.local.set({ ownedTabIds: next });
+    return next;
+  }).catch(() => []);
+  return ownedQueue;
+}
+async function getOwned() {
+  const { ownedTabIds = [] } = await chrome.storage.local.get(["ownedTabIds"]);
+  return ownedTabIds;
+}
+function addOwned(id) { return mutateOwned((a) => (a.includes(id) ? a : a.concat(id))); }
+function removeOwned(id) { return mutateOwned((a) => a.filter((x) => x !== id)); }
+
+// Live owned tabs that are on Flow (committed or loading).
+async function queryOwnedFlowTabs() {
+  const owned = await getOwned();
+  const out = [];
+  for (const id of owned) {
+    const tab = await getTab(id);
+    if (tab && tabOnFlow(tab)) out.push({ id, tab });
+  }
+  return out;
+}
+
+// Every live owned tab (regardless of URL — counts login/loading tabs too), used
+// by the absolute create ceiling so nothing slips outside the fuse.
+async function queryOwnedLiveTabs() {
+  const owned = await getOwned();
+  const out = [];
+  for (const id of owned) {
+    const tab = await getTab(id);
+    if (tab) out.push({ id, tab });
+  }
+  return out;
+}
+
+// Close every owned tab and clear all persistent state (used by ephemeral-mode boot).
+async function closeAllOwnedTabs() {
+  for (const id of await getOwned()) { try { await chrome.tabs.remove(id); } catch (_) {} }
+  await mutateOwned(() => []);
+  persistentTabId = null;
+  await chrome.storage.local.remove("persistentTabId");
+}
+
+// Close every OWNED Labs tab except one to keep. Prunes dead/closed ids and never
+// keeps a tab sitting on a login page. Returns the kept id (or null). This is the
+// hard global cap: even if every other guard failed, at most one owned tab survives.
+async function sweepOwnedTabs(keepId = null) {
+  const owned = await getOwned();
+  const live = [];
+  for (const id of owned) {
+    const tab = await getTab(id);
+    if (tab) live.push({ id, tab });
+  }
+  if (live.length === 0) { await mutateOwned(() => []); return null; } // prune dead ids; keep persistentTabId untouched
+
+  // Choose which to keep: explicit keepId, else a committed-Flow tab, else first.
+  let keep = keepId != null ? live.find((x) => x.id === keepId) : null;
+  if (!keep) keep = live.find((x) => tabUsable(x.tab)) || null;
+  if (!keep) keep = live[0];
+  // Never keep a login-redirected tab around.
+  if (keep && isLoginTab(keep.tab)) keep = null;
+
+  let closed = 0;
+  const survivors = [];
+  for (const x of live) {
+    if (keep && x.id === keep.id) { survivors.push(x.id); continue; }
+    try { await chrome.tabs.remove(x.id); closed++; } catch (_) {}
+  }
+  await mutateOwned((cur) => cur.filter((id) => survivors.includes(id)));
+
+  if (keep) {
+    persistentTabId = keep.id;
+    await chrome.storage.local.set({ persistentTabId: keep.id });
+  } else {
+    persistentTabId = null;
+    await chrome.storage.local.remove("persistentTabId");
+  }
+  if (closed > 0) await log("INFO", "Swept extra owned Labs tabs", { kept: keep ? keep.id : null, closed });
+  return keep ? keep.id : null;
+}
+
+// Find a live, COMMITTED-to-Flow tab we can mint in right now (or null). Only
+// considers tabs WE own (the durable owned-list) — never adopts a tab by URL, so
+// a user's own Labs tab can never be claimed and later closed by the sweep.
+async function findUsableLabsTab() {
+  for (const id of await getOwned()) {
+    const tab = await getTab(id);
+    if (tabUsable(tab)) return id;
+  }
+  return null;
+}
+
+/* --------------------------- tab creation ---------------------------- */
+
+// Open ONE hidden Labs tab, wait for it to settle, and verify it actually reached
+// Flow (not a login/consent redirect). Records ownership + a durable creation
+// lease BEFORE the long load so a service-worker crash mid-load can't orphan it
+// or let a respawned worker create a second tab. Throws on login redirect (and
+// trips the circuit breaker). Used for BOTH persistent and ephemeral modes; it
+// does NOT itself assign persistentTabId (callers own that policy).
+async function openLabsTab() {
+  // Absolute create ceiling: enforced at the single creation chokepoint, so NO
+  // caller (persistent, ephemeral, warm, retry) can push owned tabs past the cap.
+  const liveOwned = await queryOwnedLiveTabs();
+  if (liveOwned.length >= MAX_OWNED_TABS) await sweepOwnedTabs();
+
+  await chrome.storage.local.set({ creationLease: { state: "creating", expiresAt: Date.now() + LEASE_MS } });
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: LABS_URL, active: false });
+  } catch (e) {
+    await chrome.storage.local.remove("creationLease");
+    throw e;
+  }
+  await addOwned(tab.id);
+  await chrome.storage.local.set({ creationLease: { state: "creating", tabId: tab.id, expiresAt: Date.now() + LEASE_MS } });
+
+  try {
+    await waitForTabComplete(tab.id);
+    const settled = await getTab(tab.id);
+    if (!tabOnFlow(settled)) {
+      // Redirected away from Flow (login/consent) or vanished — don't keep it,
+      // and don't let it be recreated forever.
+      try { await chrome.tabs.remove(tab.id); } catch (_) {}
+      await removeOwned(tab.id);
+      if (isLoginTab(settled)) await setLoginRequired("Labs redirected to " + tabUrlOf(settled));
+      throw new Error("labs tab did not reach Flow URL (" + (tabUrlOf(settled) || "gone") + ")");
+    }
+    await sleep(1200); // let grecaptcha settle
+    return tab.id;
+  } finally {
+    await chrome.storage.local.remove("creationLease");
+  }
+}
+
+// Ensure exactly ONE persistent Labs tab exists; returns its id. Serialized via
+// ensureChain (one at a time within this SW life) and guarded across SW respawns
+// by the storage lease + owned-tab ceiling, so concurrent callers (warm-up,
+// keepalive, session refresh, token backlog) can never spawn a tab storm.
+function ensurePersistentTab() {
+  ensureChain = ensureChain.then(_ensurePersistentTab, _ensurePersistentTab);
+  return ensureChain;
+}
+
+async function _ensurePersistentTab() {
+  // 0) Circuit breaker: while login is required and backoff is active, refuse —
+  //    but first recover immediately if the user has logged back in (cookie back),
+  //    so a token request right after re-login isn't needlessly rejected.
+  const auth = await getAuthState();
+  if (auth.state === "login_required" && Date.now() < (auth.nextRetryAt || 0)) {
+    if (await hasSessionCookie()) { await clearLoginRequired(); }
+    else throw new Error("login_required");
+  }
+
+  // 1) Already have a live, usable tab -> adopt + collapse any extras to one.
+  const usable = await findUsableLabsTab();
+  if (usable != null) {
+    persistentTabId = usable;
+    await chrome.storage.local.set({ persistentTabId: usable });
+    await sweepOwnedTabs(usable);
     return persistentTabId;
   }
 
-  // 4) none exist -> create one
-  persistentTabId = await createLabsTab();
-  await chrome.storage.local.set({ persistentTabId });
+  // 2) Honor an in-flight creation lease (possibly from a prior SW life): wait a
+  //    beat and re-check instead of starting a second creation.
+  const { creationLease } = await chrome.storage.local.get(["creationLease"]);
+  if (creationLease && creationLease.expiresAt > Date.now()) {
+    await sleep(1500);
+    const again = await findUsableLabsTab();
+    if (again != null) { persistentTabId = again; await sweepOwnedTabs(again); return persistentTabId; }
+  }
+
+  // 3) Hard ceiling fuse: never exceed MAX_OWNED_TABS owned Labs tabs.
+  const ownedFlow = await queryOwnedFlowTabs();
+  if (ownedFlow.length >= MAX_OWNED_TABS) {
+    const kept = await sweepOwnedTabs();
+    if (kept != null) {
+      const t = await getTab(kept);
+      if (tabUsable(t)) { persistentTabId = kept; return persistentTabId; }
+    }
+  }
+
+  // 4) Auth gate: don't open a tab that will just bounce to login.
+  if (!(await hasSessionCookie())) {
+    await setLoginRequired("session cookie missing");
+    throw new Error("login_required");
+  }
+
+  // 5) Create exactly one.
+  const id = await openLabsTab();
+  await clearLoginRequired();
+  persistentTabId = id;
+  await chrome.storage.local.set({ persistentTabId: id });
+  await sweepOwnedTabs(id); // close anything that snuck in during the load window
   await log("INFO", "Persistent Labs tab opened", { tabId: persistentTabId });
   return persistentTabId;
 }
+
+// Warm/keep the persistent tab, respecting the login circuit breaker. Recovers
+// promptly: if login was required but the user has since logged back in (cookie
+// present again), clear the breaker and proceed.
+async function maybeEnsurePersistentTab() {
+  const settings = await getSettings();
+  if (settings.tabMode !== "persistent") return;
+  const auth = await getAuthState();
+  if (auth.state === "login_required") {
+    if (await hasSessionCookie()) {
+      await clearLoginRequired();
+    } else if (Date.now() < (auth.nextRetryAt || 0)) {
+      return; // still backing off
+    }
+  }
+  ensurePersistentTab().catch(() => {});
+}
+
+/* ------------------------------- minting ----------------------------- */
 
 // Run grecaptcha.enterprise.execute in the given tab's MAIN world.
 async function mintTokenInTab(tabId, action, timeoutMs) {
@@ -214,10 +502,21 @@ async function handleGetToken(data, settings) {
     try {
       let tabId;
       if (settings.tabMode === "ephemeral") {
-        ephemeralTabId = await createLabsTab();
+        ephemeralTabId = await openLabsTab();
         tabId = ephemeralTabId;
       } else {
-        if (attempt === 2) { persistentTabId = null; } // force recreate on retry
+        if (attempt === 2) {
+          // First mint failed. If the current tab isn't a usable Flow tab, the
+          // breaker/auth gate will handle it; if it IS Flow but still failing,
+          // drop that owned tab so a fresh one is created (no sticky bad tab).
+          const cur = await findUsableLabsTab();
+          if (cur != null) {
+            try { await chrome.tabs.remove(cur); } catch (_) {}
+            await removeOwned(cur);
+            persistentTabId = null;
+            await chrome.storage.local.remove("persistentTabId");
+          }
+        }
         tabId = await ensurePersistentTab();
       }
 
@@ -226,13 +525,20 @@ async function handleGetToken(data, settings) {
       sendWS({ req_id: data.req_id, status: "success", token });
       return;
     } catch (e) {
-      await log("ERROR", `token attempt ${attempt} failed`, { error: String(e && e.message || e) });
+      const msg = String(e && e.message || e);
+      await log("ERROR", `token attempt ${attempt} failed`, { error: msg });
+      if (msg === "login_required") {
+        // No point retrying — surface immediately so the backend can route elsewhere.
+        sendWS({ req_id: data.req_id, status: "error", error: "worker login required (re-login to Google Labs)" });
+        return;
+      }
       if (attempt === 2) {
-        sendWS({ req_id: data.req_id, status: "error", error: "worker failed: " + String(e && e.message || e) });
+        sendWS({ req_id: data.req_id, status: "error", error: "worker failed: " + msg });
       }
     } finally {
       if (ephemeralTabId != null) {
         try { await chrome.tabs.remove(ephemeralTabId); } catch (_) {}
+        await removeOwned(ephemeralTabId);
       }
     }
   }
@@ -286,8 +592,8 @@ async function connectWS() {
     sendWS({ type: "register", route_key: settings.routeKey, client_label: settings.clientLabel });
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(() => sendWS({ type: "ping" }), 20000);
-    // Warm the persistent tab so the first real request is fast.
-    if (settings.tabMode === "persistent") ensurePersistentTab().catch(() => {});
+    // Warm the persistent tab so the first real request is fast (login-aware).
+    maybeEnsurePersistentTab();
   };
 
   ws.onmessage = (event) => {
@@ -331,9 +637,10 @@ async function refreshSession() {
   const { updateUrl } = deriveUrls(settings);
 
   try {
-    // Make sure a Labs tab is loaded so the session cookie is fresh/active.
+    // Make sure a Labs tab is loaded so the session cookie is fresh/active
+    // (login-aware: won't spin up tabs while a re-login is required).
     if (settings.tabMode === "persistent") {
-      await ensurePersistentTab();
+      await maybeEnsurePersistentTab();
     }
     // Read the session-token cookie directly (no extra tab needed).
     let cookie = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
@@ -342,7 +649,7 @@ async function refreshSession() {
       cookie = all.find((c) => c.name === SESSION_COOKIE) || null;
     }
     if (!cookie || !cookie.value) {
-      await log("ERROR", "session-token cookie not found — are you logged into Google Labs?");
+      await setLoginRequired("session-token cookie not found");
       return { success: false, error: "session-token not found (log into Google Labs)" };
     }
 
@@ -357,6 +664,7 @@ async function refreshSession() {
       return { success: false, error: `server ${resp.status}` };
     }
     const result = await resp.json();
+    await clearLoginRequired(); // a valid cookie pushed -> session is healthy
     await log("SUCCESS", "Session token pushed to Flow2API", { action: result.action, message: result.message });
     return { success: true, message: result.message, action: result.action };
   } catch (e) {
@@ -380,9 +688,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await refreshSession();
   } else if (alarm.name === ALARM_KEEPALIVE) {
     connectWS();
-    const settings = await getSettings();
-    if (settings.tabMode === "persistent" && ws && ws.readyState === WebSocket.OPEN) {
-      ensurePersistentTab().catch(() => {});
+    // Only ensure a tab when we actually have an OPEN socket — never spin up
+    // tabs while disconnected. The call itself is login-aware and serialized.
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      maybeEnsurePersistentTab();
     }
   }
 });
@@ -390,15 +699,35 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 /* ------------------------------ lifecycle ---------------------------- */
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  removeOwned(tabId).catch(() => {});
   if (tabId === persistentTabId) {
     persistentTabId = null;
     chrome.storage.local.remove("persistentTabId");
   }
 });
 
+// On SW boot/wake: drop a stale (expired) creation lease, restore the badge, and
+// collapse our owned tabs. Persistent mode keeps exactly one; ephemeral mode keeps
+// none. A still-valid lease is preserved so a genuinely in-flight create isn't
+// duplicated. Runs BEFORE connectWS so the socket's warm-up can't race the janitor.
+async function reconcileTabsOnBoot() {
+  const settings = await getSettings();
+  const { creationLease } = await chrome.storage.local.get(["creationLease"]);
+  if (!creationLease || (creationLease.expiresAt || 0) <= Date.now()) {
+    await chrome.storage.local.remove("creationLease");
+  }
+  setBadge((await getAuthState()).state);
+  if (settings.tabMode === "ephemeral") {
+    await closeAllOwnedTabs();   // ephemeral mode never keeps a persistent tab
+  } else {
+    await sweepOwnedTabs();      // collapse owned tabs to exactly one
+  }
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   await log("INFO", "Flow2API Worker installed");
   await setupAlarms();
+  await reconcileTabsOnBoot();
   connectWS();
   // Kick off an immediate session push so the backend is valid right away.
   refreshSession().catch(() => {});
@@ -406,6 +735,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.runtime.onStartup.addListener(async () => {
   await setupAlarms();
+  await reconcileTabsOnBoot();
   connectWS();
 });
 
@@ -435,6 +765,9 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   }
 });
 
-// Boot (covers the service-worker waking up).
-setupAlarms();
-connectWS();
+// Boot (covers the service-worker waking up). Sequenced: janitor before warm-up.
+(async () => {
+  await setupAlarms();
+  await reconcileTabsOnBoot();
+  connectWS();
+})();
