@@ -1,5 +1,6 @@
 """Token manager for Flow2API with AT auto-refresh"""
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from ..core.database import Database
@@ -7,8 +8,30 @@ from ..core.config import config
 from ..core.models import Token, Project
 from ..core.logger import debug_logger
 from ..core.monitoring import record_token_refresh
-from .flow_client import FlowClient
+from .flow_client import FlowClient, FlowAPIError
 from .proxy_manager import ProxyManager
+
+
+@dataclass
+class RefreshOutcome:
+    """Result of an AT refresh attempt.
+
+    ``reason`` is one of:
+      - ``ok``                    success
+      - ``st_expired``            ST/credential is invalid (401 / UNAUTHENTICATED)
+      - ``network``               transport/proxy/timeout failure (token is fine)
+      - ``st_refresh_unavailable``ST refresh not possible in the current mode
+      - ``unknown``               unclassified failure
+
+    Truthiness mirrors ``success`` so any legacy ``if outcome:`` check that we
+    might have missed still behaves correctly.
+    """
+
+    success: bool
+    reason: str = "ok"
+
+    def __bool__(self) -> bool:
+        return self.success
 
 
 # Error fragments that indicate an *environmental* failure (reCAPTCHA / captcha /
@@ -504,15 +527,35 @@ class TokenManager:
             return True
         return self._should_refresh_at(token)
 
-    async def ensure_valid_token(self, token: Optional[Token]) -> Optional[Token]:
-        """确保 token 的 AT 可用，并在必要时返回刷新后的最新对象。"""
+    async def ensure_valid_token(
+        self,
+        token: Optional[Token],
+        disable_on_failure: bool = True,
+    ) -> Optional[Token]:
+        """确保 token 的 AT 可用，并在必要时返回刷新后的最新对象。
+
+        Args:
+            token: 待校验的 token。
+            disable_on_failure: 自动取流路径（负载均衡 / 生成）默认 True：
+                凭证失效（ST 过期）时禁用该 token，使其退出可用池。
+                网络/未知错误不会禁用（避免误杀正常账号）。
+                手动管理动作（如刷新余额）应传入 False，永不禁用。
+        """
         if not token:
             return None
 
         if not self._should_refresh_at(token):
             return token
 
-        if not await self._refresh_at(token.id):
+        outcome = await self._refresh_at(token.id)
+        if not outcome.success:
+            # Only a confirmed credential failure removes the token from the
+            # pool. Transient network errors leave it enabled to be retried.
+            if disable_on_failure and outcome.reason == "st_expired":
+                debug_logger.log_error(
+                    f"[AT_REFRESH] Token {token.id}: ST expired, disabling token"
+                )
+                await self.disable_token(token.id)
             return None
 
         return await self.db.get_token(token.id)
@@ -532,8 +575,14 @@ class TokenManager:
         return valid_token is not None
 
 
-    async def _refresh_at_inner(self, token_id: int) -> bool:
-        """Perform exactly one real AT refresh attempt."""
+    async def _refresh_at_inner(self, token_id: int) -> RefreshOutcome:
+        """Perform exactly one real AT refresh attempt.
+
+        Side-effect-free with respect to enabling/disabling the token: the
+        disable decision belongs to the caller (automatic pool path disables on
+        credential failure; manual admin actions never disable). See
+        ``ensure_valid_token``.
+        """
         refresh_lock = await self._get_token_lock(
             self._refresh_locks,
             self._refresh_lock_guard,
@@ -542,31 +591,35 @@ class TokenManager:
         async with refresh_lock:
             token = await self.db.get_token(token_id)
             if not token:
-                return False
+                return RefreshOutcome(False, "unknown")
 
-            result = await self._do_refresh_at(token_id, token.st)
-            if result:
-                return True
+            outcome = await self._do_refresh_at(token_id, token.st)
+            if outcome.success:
+                return outcome
 
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: first AT refresh failed, trying ST refresh...")
-            new_st = await self._try_refresh_st(token_id, token)
-            if new_st:
-                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
-                result = await self._do_refresh_at(token_id, new_st)
-                if result:
-                    return True
+            # Only attempt a (browser/personal) ST refresh when the failure is
+            # an expired/invalid ST. A network blip must NOT trigger a session
+            # refresh nor be treated as a dead credential.
+            if outcome.reason == "st_expired":
+                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST expired, trying ST refresh...")
+                new_st = await self._try_refresh_st(token_id, token)
+                if new_st:
+                    debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
+                    retry = await self._do_refresh_at(token_id, new_st)
+                    if retry.success:
+                        return retry
+                    outcome = retry
 
-            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
-            await self.disable_token(token_id)
-            return False
+            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed ({outcome.reason})")
+            return outcome
 
-    async def _refresh_at(self, token_id: int) -> bool:
+    async def _refresh_at(self, token_id: int) -> RefreshOutcome:
         """Coalesce concurrent AT refresh calls for the same token."""
         existing_task = self._refresh_futures.get(token_id)
         if existing_task:
             return await existing_task
 
-        async def runner() -> bool:
+        async def runner() -> RefreshOutcome:
             try:
                 return await self._refresh_at_inner(token_id)
             finally:
@@ -578,7 +631,26 @@ class TokenManager:
         self._refresh_futures[token_id] = task
         return await task
 
-    async def _do_refresh_at(self, token_id: int, st: str) -> bool:
+    def _is_auth_error(self, error: Exception) -> bool:
+        """True iff the error is an authentication failure (ST/AT invalid).
+
+        Prefers the structured status code/reason from FlowAPIError and only
+        falls back to substring matching for legacy/wrapped errors.
+        """
+        if isinstance(error, FlowAPIError):
+            return error.status_code == 401 or error.reason == "UNAUTHENTICATED"
+        error_msg = str(error)
+        return "401" in error_msg or "UNAUTHENTICATED" in error_msg
+
+    def _classify_refresh_error(self, error: Exception) -> str:
+        """Map a refresh exception to a RefreshOutcome reason."""
+        if self._is_auth_error(error):
+            return "st_expired"
+        if self.flow_client._is_timeout_error(error) or self.flow_client._is_proxy_connection_error(error):
+            return "network"
+        return "unknown"
+
+    async def _do_refresh_at(self, token_id: int, st: str) -> RefreshOutcome:
         """执行 AT 刷新的核心逻辑
 
         Args:
@@ -586,7 +658,9 @@ class TokenManager:
             st: Session Token
 
         Returns:
-            True if refresh successful AND AT is valid, False otherwise
+            RefreshOutcome(success, reason). success=True iff a valid AT was
+            obtained. On failure, reason distinguishes st_expired / network /
+            unknown so callers can decide whether to disable the token.
         """
         try:
             debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 开始刷新AT...")
@@ -624,24 +698,24 @@ class TokenManager:
                 )
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT 验证成功（余额: {credits_result.get('credits', 0)}）")
                 record_token_refresh("at", "success")
-                return True
+                return RefreshOutcome(True, "ok")
             except Exception as verify_err:
                 # AT 验证失败（可能返回 401），说明 ST 已过期
-                error_msg = str(verify_err)
-                if "401" in error_msg or "UNAUTHENTICATED" in error_msg:
+                if self._is_auth_error(verify_err):
                     debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证失败 (401)，ST 可能已过期")
                     record_token_refresh("at", "failure")
-                    return False
+                    return RefreshOutcome(False, "st_expired")
                 else:
-                    # 其他错误（如网络问题），仍视为成功
-                    debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {error_msg}")
+                    # 其他错误（如网络问题），仍视为成功（AT 已写入，验证仅是网络抖动）
+                    debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {str(verify_err)}")
                     record_token_refresh("at", "success")
-                    return True
+                    return RefreshOutcome(True, "ok")
 
         except Exception as e:
-            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: AT刷新失败 - {str(e)}")
+            reason = self._classify_refresh_error(e)
+            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: AT刷新失败 ({reason}) - {str(e)}")
             record_token_refresh("at", "failure")
-            return False
+            return RefreshOutcome(False, reason)
 
     async def _try_refresh_st(self, token_id: int, token) -> Optional[str]:
         """尝试通过浏览器刷新 Session Token
@@ -931,8 +1005,8 @@ class TokenManager:
         if not token:
             return 0
 
-        # 确保AT有效
-        token = await self.ensure_valid_token(token)
+        # 确保AT有效（手动刷新余额：失败时绝不禁用 token）
+        token = await self.ensure_valid_token(token, disable_on_failure=False)
         if not token:
             return 0
 

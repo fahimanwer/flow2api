@@ -878,42 +878,65 @@ async def refresh_at(
     """
     from ..core.logger import debug_logger
     from ..core.config import config
-    
-    debug_logger.log_info(f"[API] 手动刷新 AT 请求: token_id={token_id}, captcha_method={config.captcha_method}")
-    
-    try:
-        # 调用token_manager的内部刷新方法（包含 ST 自动刷新逻辑）
-        success = await token_manager._refresh_at(token_id)
 
-        if success:
+    debug_logger.log_info(f"[API] 手动刷新 AT 请求: token_id={token_id}, captcha_method={config.captcha_method}")
+
+    # Reason-specific guidance. Manual refresh NEVER disables the token (the
+    # disable decision lives only in the automatic pool path), so the operator
+    # can safely retry / re-supply credentials without losing the row.
+    reason_messages = {
+        "st_expired": (
+            "AT刷新失败：Session Token (ST) 已过期或失效，需要重新提供新的 ST"
+            "（在 worker 浏览器重新登录 Google Labs，或手动粘贴新的 ST）。"
+            "此问题与打码模式无关，token 未被禁用。 / "
+            "Session Token expired or invalid — supply a fresh ST "
+            "(re-login in the worker browser or paste a new ST). "
+            "This fails in any captcha mode; the token was not disabled."
+        ),
+        "network": (
+            "AT刷新失败：访问 Google Labs 时发生网络/代理错误，请检查代理与网络后重试。"
+            "token 未被禁用。 / "
+            "Network or proxy error reaching Google Labs while refreshing — "
+            "check proxy/connection and retry. The token was not disabled."
+        ),
+        "st_refresh_unavailable": (
+            "AT刷新失败：当前模式下后端无法自动刷新 ST，请提供新的 ST 或触发扩展推送。"
+            "token 未被禁用。 / "
+            "The backend cannot auto-refresh the ST in this mode — supply a fresh "
+            "ST or trigger the extension push. The token was not disabled."
+        ),
+    }
+
+    try:
+        # 调用token_manager的内部刷新方法（手动路径：永不禁用 token）
+        outcome = await token_manager._refresh_at(token_id)
+
+        if outcome.success:
             # 获取更新后的token信息
             updated_token = await token_manager.get_token(token_id)
-            
-            message = "AT刷新成功"
-            if config.captcha_method == "personal":
-                message += "（支持ST自动刷新）"
-            
+
             debug_logger.log_info(f"[API] AT 刷新成功: token_id={token_id}")
-            
+
             return {
                 "success": True,
-                "message": message,
+                "message": "AT刷新成功 / AT refreshed successfully",
                 "token": {
                     "id": updated_token.id,
                     "email": updated_token.email,
                     "at_expires": updated_token.at_expires.isoformat() if updated_token.at_expires else None
                 }
             }
-        else:
-            debug_logger.log_error(f"[API] AT 刷新失败: token_id={token_id}")
-            
-            error_detail = "AT刷新失败"
-            if config.captcha_method != "personal":
-                error_detail += f"（当前打码模式: {config.captcha_method}，ST自动刷新仅在 personal 模式下可用）"
-            
-            raise HTTPException(status_code=500, detail=error_detail)
-    except HTTPException:
-        raise
+
+        debug_logger.log_error(f"[API] AT 刷新失败: token_id={token_id}, reason={outcome.reason}")
+
+        detail = reason_messages.get(
+            outcome.reason,
+            "AT刷新失败（未知原因），请查看服务端日志。 / "
+            "AT refresh failed (unknown reason) — check server logs.",
+        )
+        # Expected application-level failure: respond 200 with success=false so the
+        # admin UI shows the guidance toast (it renders d.detail).
+        return {"success": False, "reason": outcome.reason, "detail": detail}
     except Exception as e:
         debug_logger.log_error(f"[API] 刷新AT异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"刷新AT失败: {str(e)}")

@@ -21,6 +21,23 @@ except ImportError:
     httpx = None
 
 
+class FlowAPIError(Exception):
+    """Structured Flow API HTTP error that preserves the upstream status code
+    and Google API ``reason`` (e.g. ``UNAUTHENTICATED``).
+
+    ``str(self)`` reproduces the legacy message text verbatim so every existing
+    caller that inspects the message string keeps working unchanged. New callers
+    can branch on ``status_code`` / ``reason`` for robust classification instead
+    of substring matching.
+    """
+
+    def __init__(self, status_code: int, message: str, reason: str = ""):
+        self.status_code = status_code
+        self.reason = reason or ""
+        self.message = message
+        super().__init__(message)
+
+
 class FlowClient:
     """VideoFX API客户端"""
 
@@ -286,6 +303,7 @@ class FlowClient:
                 if response.status_code >= 400:
                     # 解析错误响应
                     error_reason = f"HTTP Error {response.status_code}"
+                    parsed_reason = ""
                     try:
                         error_body = response.json()
                         # 提取 Google API 错误格式中的 reason
@@ -296,22 +314,28 @@ class FlowClient:
                             details = error_info.get("details", [])
                             for detail in details:
                                 if detail.get("reason"):
-                                    error_reason = detail.get("reason")
+                                    parsed_reason = detail.get("reason")
+                                    error_reason = parsed_reason
                                     break
                             if error_message:
                                 error_reason = f"{error_reason}: {error_message}"
                     except:
                         error_reason = f"HTTP Error {response.status_code}: {response.text[:200]}"
-                    
+
                     # 失败时输出请求体和错误内容到控制台
                     debug_logger.log_error(f"[API FAILED] URL: {url}")
                     debug_logger.log_error(f"[API FAILED] Request Body: {json_data}")
                     debug_logger.log_error(f"[API FAILED] Response: {response.text}")
-                    
-                    raise Exception(error_reason)
+
+                    raise FlowAPIError(response.status_code, error_reason, parsed_reason)
 
                 return response.json()
 
+        except FlowAPIError:
+            # Structured HTTP error (4xx/5xx). Not a transport failure, so never
+            # retry via urllib and never re-wrap — preserve status_code/reason
+            # so callers can classify (e.g. 401/UNAUTHENTICATED => ST expired).
+            raise
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
             error_msg = str(e)
@@ -336,6 +360,11 @@ class FlowClient:
                         proxy_url,
                         request_timeout,
                     )
+                except FlowAPIError:
+                    # urllib reached the server and got an HTTP error — preserve
+                    # the structured status/reason instead of masking it as a
+                    # generic transport failure.
+                    raise
                 except Exception as fallback_error:
                     debug_logger.log_error(
                         f"[HTTP FALLBACK] urllib 回退也失败: {fallback_error}"
@@ -412,13 +441,13 @@ class FlowClient:
             payload = exc.read() if hasattr(exc, "read") else b""
             status_code = int(getattr(exc, "code", 500) or 500)
             body_text = payload.decode("utf-8", errors="replace")
-            raise Exception(f"HTTP Error {status_code}: {body_text[:200]}") from exc
+            raise FlowAPIError(status_code, f"HTTP Error {status_code}: {body_text[:200]}") from exc
         except Exception as exc:
             raise Exception(str(exc)) from exc
 
         body_text = payload.decode("utf-8", errors="replace")
         if status_code >= 400:
-            raise Exception(f"HTTP Error {status_code}: {body_text[:200]}")
+            raise FlowAPIError(status_code, f"HTTP Error {status_code}: {body_text[:200]}")
 
         try:
             return json.loads(body_text) if body_text else {}
