@@ -7,6 +7,7 @@ const DEFAULTS = {
   refreshIntervalMinutes: 60,
   tabMode: "persistent",
   mintIntervalMs: 2000,
+  proxyAuto: true,
   proxyUrl: ""
 };
 
@@ -28,6 +29,7 @@ function load() {
     $("refreshIntervalMinutes").value = s.refreshIntervalMinutes;
     $("tabMode").value = s.tabMode;
     $("mintIntervalMs").value = s.mintIntervalMs;
+    $("proxyAuto").checked = s.proxyAuto !== false;
     $("proxyUrl").value = s.proxyUrl;
   });
   renderLogs();
@@ -43,6 +45,7 @@ function save() {
     refreshIntervalMinutes: Math.max(5, parseInt($("refreshIntervalMinutes").value, 10) || 60),
     tabMode: $("tabMode").value === "ephemeral" ? "ephemeral" : "persistent",
     mintIntervalMs: Math.max(0, parseInt($("mintIntervalMs").value, 10) || 2000),
+    proxyAuto: $("proxyAuto").checked,
     proxyUrl: $("proxyUrl").value.trim()
   };
   try { new URL(settings.serverBase); } catch (e) { setStatus("Server URL is invalid.", false); return; }

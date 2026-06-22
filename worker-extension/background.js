@@ -48,11 +48,13 @@ const DEFAULT_SETTINGS = {
   refreshIntervalMinutes: 60,
   tabMode: "persistent",  // "persistent" (reuse one hidden tab) | "ephemeral" (open/close per token)
   mintIntervalMs: 2000,   // min spacing between reCAPTCHA mints; paces one browser under Google's rate limit
-  // Per-profile egress proxy. Empty = direct (no proxy) = today's behavior.
-  // Each Chrome profile gets its OWN proxy URL so each mints reCAPTCHA and holds
-  // its Google session from a DIFFERENT IP. Form: http://USER:PASS@HOST:PORT
-  // Oxylabs sticky residential: bake -sessid-<id> into USER so the IP is stable
-  // across SW restarts (a flapping IP triggers Google's "verify it's you").
+  // Per-profile egress proxy. With proxyAuto ON (default), EACH Chrome profile
+  // auto-builds its OWN sticky Oxylabs session (a random per-profile sessid that
+  // persists in this profile's storage), so every profile mints reCAPTCHA and
+  // holds its Google session from a DIFFERENT IP with zero setup. proxyUrl, if
+  // set, overrides the auto URL (form: http://USER:PASS@HOST:PORT). proxyAuto
+  // false + empty proxyUrl = direct (no proxy).
+  proxyAuto: true,
   proxyUrl: ""
 };
 
@@ -80,6 +82,7 @@ function getSettings() {
         refreshIntervalMinutes: Math.max(5, parseInt(stored.refreshIntervalMinutes, 10) || 60),
         tabMode: stored.tabMode === "ephemeral" ? "ephemeral" : "persistent",
         mintIntervalMs: Math.max(0, parseInt(stored.mintIntervalMs, 10) || 2000),
+        proxyAuto: stored.proxyAuto !== false,
         proxyUrl: (stored.proxyUrl || "").trim()
       });
     });
@@ -108,6 +111,40 @@ function deriveUrls(settings) {
 let proxyCreds = null;               // { username, password } or null (for onAuthRequired)
 const answeredAuthReqs = new Set();  // requestIds already answered (407 loop guard)
 
+// Baked-in Oxylabs residential base (zip-and-load distribution, like apiKey).
+// proxyAuto builds a per-profile STICKY session from this: each profile gets a
+// random sessid persisted in its own storage -> its own stable exit IP. No cc
+// pin (any-country sticky). sesstime=30 = Oxylabs residential sticky ceiling.
+const PROXY_BASE = {
+  user: "user-fahim_ZpTwH",
+  pass: "6Fk+WKveSpned",
+  host: "disp.oxylabs.io",
+  port: 8003,
+  sesstimeMin: 30
+};
+
+// Get-or-create this profile's random sticky session id (persisted, so the
+// profile keeps the SAME residential IP across SW restarts — a flapping IP
+// triggers Google's "verify it's you").
+async function getProxySessionId() {
+  let { proxySessionId } = await chrome.storage.local.get(["proxySessionId"]);
+  if (!proxySessionId) {
+    proxySessionId = "p" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+    await chrome.storage.local.set({ proxySessionId });
+  }
+  return proxySessionId;
+}
+
+// Effective proxy URL: manual proxyUrl overrides; else proxyAuto builds a sticky
+// Oxylabs URL from PROXY_BASE + this profile's sessid; else "" (direct).
+async function resolveProxyUrl(settings) {
+  if (settings.proxyUrl) return settings.proxyUrl;
+  if (!settings.proxyAuto) return "";
+  const sessid = await getProxySessionId();
+  const b = PROXY_BASE;
+  return `http://${b.user}-sessid-${sessid}-sesstime-${b.sesstimeMin}:${b.pass}@${b.host}:${b.port}`;
+}
+
 // Parse "http://user:pass@host:port". We split the credentials MANUALLY instead
 // of via URL.username/password so proxy-special chars (e.g. '+' in the Oxylabs
 // password) survive verbatim. Returns null on empty/invalid (=> direct).
@@ -134,9 +171,9 @@ function backendBypassHosts(settings) {
   return out;
 }
 
-// Apply (or, if proxyUrl empty/invalid, clear) the per-profile proxy. Idempotent.
+// Apply (or, if resolved empty/invalid, clear) the per-profile proxy. Idempotent.
 async function applyProxy(settings) {
-  const p = parseProxyUrl(settings.proxyUrl);
+  const p = parseProxyUrl(await resolveProxyUrl(settings));
   if (!p) { await clearProxy(); return; }
   proxyCreds = { username: p.username, password: p.password };
   const config = {
