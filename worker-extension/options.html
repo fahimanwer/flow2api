@@ -72,7 +72,7 @@
   <p class="hint">Higher = slower minting but fewer <b>TOO_MUCH_TRAFFIC</b> rate flags under heavy load. 0 = none. ~2000 ≈ ≤30/min.</p>
 
   <label><input type="checkbox" id="proxyAuto" style="width:auto;vertical-align:middle;margin-right:6px" /> Auto per-profile proxy <span class="pill">random IP · no setup</span></label>
-  <p class="hint">ON (default): this profile auto-gets its OWN sticky residential IP, so it mints reCAPTCHA + holds its Google session from a different IP than your other profiles — zero setup. Only Google/Labs traffic is proxied; backend stays direct. If a profile gets a Google "verify it's you", re-login through it (or turn this off to revert).</p>
+  <p class="hint">ON (default): this profile auto-gets its OWN static IP (one of the proxy's IPs), so it mints reCAPTCHA from a different IP than your other profiles — zero setup. <b>Only the Flow site + reCAPTCHA URLs are proxied</b>; your normal browsing (Google search, everything else) and the backend stay direct. If a profile gets a Google "verify it's you", re-login through it (or turn this off to revert).</p>
 
   <label for="proxyUrl">Proxy override (optional)</label>
   <input type="text" id="proxyUrl" placeholder="http://user:pass@host:port — blank = use Auto" />

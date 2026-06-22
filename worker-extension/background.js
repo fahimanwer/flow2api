@@ -111,38 +111,40 @@ function deriveUrls(settings) {
 let proxyCreds = null;               // { username, password } or null (for onAuthRequired)
 const answeredAuthReqs = new Set();  // requestIds already answered (407 loop guard)
 
-// Baked-in Oxylabs residential base (zip-and-load distribution, like apiKey).
-// proxyAuto builds a per-profile STICKY session from this: each profile gets a
-// random sessid persisted in its own storage -> its own stable exit IP. No cc
-// pin (any-country sticky). sesstime=30 = Oxylabs residential sticky ceiling.
+// Baked-in Oxylabs static-ISP base (zip-and-load distribution, like apiKey).
+// This account is a STATIC ISP plan: disp.oxylabs.io ports 8001-8005 are 5
+// DISTINCT fixed residential IPs (sessid/sesstime suffixes don't work here).
+// proxyAuto gives each profile its own random port -> its own static IP, so
+// profiles mint reCAPTCHA from different IPs. Up to 5 distinct IPs available.
 const PROXY_BASE = {
   user: "user-fahim_ZpTwH",
   pass: "6Fk+WKveSpned",
   host: "disp.oxylabs.io",
-  port: 8003,
-  sesstimeMin: 30
+  ports: [8001, 8002, 8003, 8004, 8005]
 };
 
-// Get-or-create this profile's random sticky session id (persisted, so the
-// profile keeps the SAME residential IP across SW restarts — a flapping IP
-// triggers Google's "verify it's you").
-async function getProxySessionId() {
-  let { proxySessionId } = await chrome.storage.local.get(["proxySessionId"]);
-  if (!proxySessionId) {
-    proxySessionId = "p" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-    await chrome.storage.local.set({ proxySessionId });
+// Get-or-create this profile's port (one of the 5 static IPs), persisted so the
+// profile keeps the SAME IP across SW restarts (a flapping IP triggers Google's
+// "verify it's you"). Random pick; with <=5 profiles this usually gives distinct
+// IPs — for guaranteed-distinct, set a specific :port via the proxy override.
+async function getProxyPort() {
+  let { proxyPort } = await chrome.storage.local.get(["proxyPort"]);
+  const ports = PROXY_BASE.ports;
+  if (!proxyPort || !ports.includes(proxyPort)) {
+    proxyPort = ports[Math.floor(Math.random() * ports.length)];
+    await chrome.storage.local.set({ proxyPort });
   }
-  return proxySessionId;
+  return proxyPort;
 }
 
-// Effective proxy URL: manual proxyUrl overrides; else proxyAuto builds a sticky
-// Oxylabs URL from PROXY_BASE + this profile's sessid; else "" (direct).
+// Effective proxy URL: manual proxyUrl overrides; else proxyAuto builds the
+// Oxylabs URL from PROXY_BASE + this profile's port; else "" (direct).
 async function resolveProxyUrl(settings) {
   if (settings.proxyUrl) return settings.proxyUrl;
   if (!settings.proxyAuto) return "";
-  const sessid = await getProxySessionId();
   const b = PROXY_BASE;
-  return `http://${b.user}-sessid-${sessid}-sesstime-${b.sesstimeMin}:${b.pass}@${b.host}:${b.port}`;
+  const port = await getProxyPort();
+  return `http://${b.user}:${b.pass}@${b.host}:${port}`;
 }
 
 // Parse "http://user:pass@host:port". We split the credentials MANUALLY instead
@@ -162,32 +164,35 @@ function parseProxyUrl(raw) {
   };
 }
 
-// Hosts that must NEVER go through the proxy: the backend (so /captcha_ws and
-// /api/plugin/update-token go DIRECT) + loopback. bypassList matches by HOST,
-// so one backend entry covers both the wss and https endpoints (same host).
-function backendBypassHosts(settings) {
-  const out = ["localhost", "127.0.0.1", "[::1]"];
-  try { out.push(new URL(settings.serverBase).hostname); } catch (_) {}
-  return out;
+// PAC proxy token for a parsed proxy ("PROXY host:port" / "SOCKS5 host:port").
+function pacProxyToken(p) {
+  const kind = p.scheme === "socks5" ? "SOCKS5" : p.scheme === "socks4" ? "SOCKS" : "PROXY";
+  return `${kind} ${p.host}:${p.port}`;
 }
 
 // Apply (or, if resolved empty/invalid, clear) the per-profile proxy. Idempotent.
+// Uses a PAC script so ONLY the Flow site + reCAPTCHA-mint URLs go through the
+// proxy — the user's normal browsing (Google search, everything else) and the
+// Flow2API backend go DIRECT. This stops the proxy from hijacking the whole
+// profile while still making reCAPTCHA mint from the per-profile residential IP.
 async function applyProxy(settings) {
   const p = parseProxyUrl(await resolveProxyUrl(settings));
   if (!p) { await clearProxy(); return; }
   proxyCreds = { username: p.username, password: p.password };
-  const config = {
-    mode: "fixed_servers",
-    rules: {
-      singleProxy: { scheme: p.scheme, host: p.host, port: p.port },
-      bypassList: backendBypassHosts(settings)
-    }
-  };
+  const P = pacProxyToken(p);
+  const pac = [
+    "function FindProxyForURL(url, host) {",
+    "  var P = '" + P + "';",
+    "  if (dnsDomainIs(host, 'labs.google')) return P;",                 // the Flow site + its session
+    "  if (shExpMatch(url, '*://www.google.com/recaptcha/*')) return P;", // reCAPTCHA mint
+    "  if (shExpMatch(url, '*://www.gstatic.com/recaptcha/*')) return P;",// reCAPTCHA assets
+    "  if (dnsDomainIs(host, 'recaptcha.net')) return P;",               // reCAPTCHA fallback domain
+    "  return 'DIRECT';",                                                // everything else untouched
+    "}"
+  ].join("\n");
   try {
-    await chrome.proxy.settings.set({ value: config, scope: "regular" });
-    await log("SUCCESS", "Per-profile proxy applied", {
-      host: p.host, port: p.port, scheme: p.scheme, bypass: config.rules.bypassList
-    });
+    await chrome.proxy.settings.set({ value: { mode: "pac_script", pacScript: { data: pac } }, scope: "regular" });
+    await log("SUCCESS", "Per-profile proxy applied (Flow + reCAPTCHA only)", { host: p.host, port: p.port });
   } catch (e) {
     await log("ERROR", "Failed to apply proxy", { error: e.message });
   }
