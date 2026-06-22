@@ -77,9 +77,16 @@ document.addEventListener("DOMContentLoaded", () => {
   load();
   $("saveBtn").addEventListener("click", save);
   $("testBtn").addEventListener("click", () => {
+    setStatus("Reconnecting captcha socket…", true);
     chrome.runtime.sendMessage({ action: "testCaptchaConnection" }, () => {
-      setStatus("Reconnecting captcha socket…", true);
-      setTimeout(renderLogs, 1500);
+      // Poll the real socket state and report it (instead of leaving "Reconnecting…").
+      setTimeout(() => {
+        chrome.runtime.sendMessage({ action: "getConnState" }, (r) => {
+          if (r && r.connected) setStatus("Captcha socket connected ✓", true);
+          else setStatus("Socket not open yet — check logs below.", false);
+          renderLogs();
+        });
+      }, 2500);
     });
   });
   $("refreshBtn").addEventListener("click", () => {

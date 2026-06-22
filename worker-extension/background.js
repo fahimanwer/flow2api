@@ -929,6 +929,10 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+  if (req.action === "getConnState") {
+    sendResponse({ connected: !!(ws && ws.readyState === WebSocket.OPEN) });
+    return true;
+  }
   if (req.action === "getLogs") {
     chrome.storage.local.get(["logs"]).then(({ logs = [] }) => sendResponse({ logs }));
     return true;
