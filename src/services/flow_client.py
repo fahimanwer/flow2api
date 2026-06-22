@@ -3169,20 +3169,46 @@ class FlowClient:
                     self._set_request_fingerprint(None)
             else:
                 self._set_request_fingerprint(None)
-            token = await self._get_api_captcha_token(captcha_method, project_id, action)
+            api_result = await self._get_api_captcha_token(captcha_method, project_id, action)
+            if api_result is None:
+                return None, None
+            token, captcha_user_agent = api_result
+            # 把打码服务返回的 userAgent 合并到 fingerprint, 让 Flow API 提交请求沿用同一 UA。
+            # 否则 Google reCAPTCHA V3 评估会因 UA 不一致判定 UNUSUAL_ACTIVITY 并返回
+            # "reCAPTCHA evaluation failed"。其他 Client Hint (sec-ch-ua-platform 等)
+            # 由 _make_request 根据 UA 自动推断 (Windows → "Windows", etc.)。
+            if captcha_user_agent:
+                existing_fp = self._request_fingerprint_ctx.get()
+                merged_fp = dict(existing_fp) if isinstance(existing_fp, dict) else {}
+                merged_fp["user_agent"] = captcha_user_agent
+                self._set_request_fingerprint(merged_fp)
+                debug_logger.log_info(
+                    f"[reCAPTCHA {captcha_method}] 已将打码 UA 注入请求指纹: "
+                    f"{captcha_user_agent[:80]}"
+                )
             return token, None
         else:
             debug_logger.log_info(f"[reCAPTCHA] 未知的打码方式: {captcha_method}")
             self._set_request_fingerprint(None)
             return None, None
 
-    async def _get_api_captcha_token(self, method: str, project_id: str, action: str = "IMAGE_GENERATION") -> Optional[str]:
+    async def _get_api_captcha_token(
+        self,
+        method: str,
+        project_id: str,
+        action: str = "IMAGE_GENERATION"
+    ) -> Optional[tuple[str, str]]:
         """通用API打码服务
-        
+
         Args:
             method: 打码服务类型
             project_id: 项目ID
             action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
+
+        Returns:
+            (gRecaptchaResponse, userAgent) 元组, 或 None (失败时)。
+            返回 userAgent 是为了让后续 Flow API 请求沿用打码时的 UA,
+            避免 reCAPTCHA V3 评估因 UA 不一致判定 UNUSUAL_ACTIVITY。
         """
         # 获取配置
         if method == "yescaptcha":
@@ -3286,7 +3312,10 @@ class FlowClient:
                         response = solution.get('gRecaptchaResponse')
                         if response:
                             debug_logger.log_info(f"[reCAPTCHA {method}] Token获取成功")
-                            return response
+                            # 同时返回 userAgent, 调用方会注入到 fingerprint context,
+                            # 保证 Flow API 提交请求时使用与打码一致的 UA。
+                            user_agent = solution.get('userAgent')
+                            return response, user_agent
 
                     await asyncio.sleep(3)
 
