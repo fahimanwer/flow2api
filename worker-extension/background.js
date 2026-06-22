@@ -27,6 +27,10 @@ const SESSION_COOKIE = "__Secure-next-auth.session-token";
 const ALARM_SESSION = "flow2api_session_refresh";
 const ALARM_KEEPALIVE = "flow2api_keepalive";
 
+// WebSocket heartbeat: keep the MV3 service worker alive (Chrome 116+ resets the
+// idle timer on WS traffic). 15s gives margin under the ~30s idle limit + timer jitter.
+const HEARTBEAT_MS = 15000;
+
 // Tab-creation safety rails.
 const LEASE_MS = 25000;            // creation lease lifetime (> worst-case tab load ~16s)
 const MAX_OWNED_TABS = 2;          // hard ceiling fuse: never keep more owned Labs tabs than this
@@ -492,7 +496,7 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
   throw new Error("empty token result");
 }
 
-async function handleGetToken(data, settings) {
+async function handleGetToken(data, settings, responseSocket = ws) {
   const action = data.action || "IMAGE_GENERATION";
   const timeoutMs = action === "VIDEO_GENERATION" ? 30000 : 20000;
 
@@ -522,18 +526,18 @@ async function handleGetToken(data, settings) {
 
       await paceMint(settings.mintIntervalMs);
       const token = await mintTokenInTab(tabId, action, timeoutMs);
-      sendWS({ req_id: data.req_id, status: "success", token });
+      sendWS({ req_id: data.req_id, status: "success", token }, responseSocket);
       return;
     } catch (e) {
       const msg = String(e && e.message || e);
       await log("ERROR", `token attempt ${attempt} failed`, { error: msg });
       if (msg === "login_required") {
         // No point retrying — surface immediately so the backend can route elsewhere.
-        sendWS({ req_id: data.req_id, status: "error", error: "worker login required (re-login to Google Labs)" });
+        sendWS({ req_id: data.req_id, status: "error", error: "worker login required (re-login to Google Labs)" }, responseSocket);
         return;
       }
       if (attempt === 2) {
-        sendWS({ req_id: data.req_id, status: "error", error: "worker failed: " + msg });
+        sendWS({ req_id: data.req_id, status: "error", error: "worker failed: " + msg }, responseSocket);
       }
     } finally {
       if (ephemeralTabId != null) {
@@ -546,10 +550,20 @@ async function handleGetToken(data, settings) {
 
 /* ------------------------------ WebSocket ---------------------------- */
 
-function sendWS(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify(obj)); } catch (_) {}
+// Send on the preferred socket (the one a request arrived on) if it's open,
+// else fall back to the current global socket. Replying on a reconnected socket
+// is now safe because the server matches responses by req_id, not by connection.
+function sendWS(obj, preferredSocket = ws) {
+  const payload = JSON.stringify(obj);
+  const sockets = [];
+  if (preferredSocket) sockets.push(preferredSocket);
+  if (ws && ws !== preferredSocket) sockets.push(ws);
+  for (const socket of sockets) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      try { socket.send(payload); return true; } catch (_) {}
+    }
   }
+  return false;
 }
 
 async function connectWS() {
@@ -578,41 +592,48 @@ async function connectWS() {
   if (settings.routeKey) url.searchParams.set("route_key", settings.routeKey);
   if (settings.clientLabel) url.searchParams.set("client_label", settings.clientLabel);
 
+  let socket;
   try {
-    ws = new WebSocket(url.toString());
+    socket = new WebSocket(url.toString());
+    ws = socket;
   } catch (e) {
     connecting = false;
     scheduleReconnect();
     return;
   }
 
-  ws.onopen = () => {
+  // Bind handlers to THIS socket (not the global `ws`) so a superseded
+  // connection from a reconnect can't clobber the live one's state.
+  socket.onopen = () => {
+    if (ws !== socket) { try { socket.close(); } catch (_) {} return; }
     connecting = false;
     log("SUCCESS", "Captcha WebSocket connected", { routeKey: settings.routeKey || "(empty)" });
-    sendWS({ type: "register", route_key: settings.routeKey, client_label: settings.clientLabel });
+    sendWS({ type: "register", route_key: settings.routeKey, client_label: settings.clientLabel }, socket);
     if (heartbeatInterval) clearInterval(heartbeatInterval);
-    heartbeatInterval = setInterval(() => sendWS({ type: "ping" }), 20000);
+    heartbeatInterval = setInterval(() => sendWS({ type: "ping" }, socket), HEARTBEAT_MS);
     // Warm the persistent tab so the first real request is fast (login-aware).
     maybeEnsurePersistentTab();
   };
 
-  ws.onmessage = (event) => {
+  socket.onmessage = (event) => {
     let data;
     try { data = JSON.parse(event.data); } catch (_) { return; }
     if (data.type === "register_ack") return;
     if (data.type === "get_token") {
-      tokenQueue = tokenQueue.then(() => handleGetToken(data, settings)).catch(() => {});
+      // Reply on the exact socket the request arrived on (falls back to current).
+      tokenQueue = tokenQueue.then(() => handleGetToken(data, settings, socket)).catch(() => {});
     }
   };
 
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (ws !== socket) return; // a superseded socket closed — ignore
     connecting = false;
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     ws = null;
     scheduleReconnect();
   };
 
-  ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  socket.onerror = () => { try { socket.close(); } catch (_) {} };
 }
 
 function scheduleReconnect(delayMs = 2000) {

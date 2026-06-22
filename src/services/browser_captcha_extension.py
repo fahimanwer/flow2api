@@ -25,7 +25,7 @@ class ExtensionCaptchaService:
     def __init__(self, db=None):
         self.db = db
         self.active_connections: list[ExtensionConnection] = []
-        self.pending_requests: dict[str, tuple[asyncio.Future, WebSocket]] = {}
+        self.pending_requests: dict[str, asyncio.Future] = {}
         self._rr_index = 0  # round-robin cursor for empty-route (shared pool) browsers
 
     @classmethod
@@ -149,10 +149,14 @@ class ExtensionCaptchaService:
 
             req_id = payload.get("req_id")
             if req_id and req_id in self.pending_requests:
-                future, owner_websocket = self.pending_requests[req_id]
-                if websocket is not owner_websocket:
-                    debug_logger.log_warning(f"[Extension Captcha] Ignoring response from non-owner connection: {req_id}")
-                    return
+                # Match the response by req_id alone (a unique uuid4). The socket
+                # the answer returns on may differ from the one we dispatched to —
+                # MV3 service workers get suspended/revived and reconnect on a NEW
+                # socket between receiving a get_token and replying. Binding the
+                # future to one websocket would drop those valid answers as
+                # "non-owner" and force a 20s timeout. req_id is the real
+                # correlation key, so accept it from whichever socket carries it.
+                future = self.pending_requests[req_id]
                 if not future.done():
                     future.set_result(payload)
         except Exception as e:
@@ -180,7 +184,7 @@ class ExtensionCaptchaService:
 
         req_id = f"req_{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
-        self.pending_requests[req_id] = (future, conn.websocket)
+        self.pending_requests[req_id] = future
 
         request_data = {
             "type": "get_token",
