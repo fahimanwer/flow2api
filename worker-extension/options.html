@@ -71,6 +71,10 @@
   <input type="number" id="mintIntervalMs" min="0" max="10000" value="2000" />
   <p class="hint">Higher = slower minting but fewer <b>TOO_MUCH_TRAFFIC</b> rate flags under heavy load. 0 = none. ~2000 ≈ ≤30/min.</p>
 
+  <label for="proxyUrl">Egress proxy URL <span class="pill">per profile</span></label>
+  <input type="text" id="proxyUrl" placeholder="http://user:pass@host:port (empty = direct)" />
+  <p class="hint">Routes THIS Chrome profile's Google/Labs traffic (reCAPTCHA mint + session) through its own IP, so each profile mints from a different IP. Backend traffic stays direct. Use a <b>sticky</b> residential session (e.g. Oxylabs <code>-sessid-</code> suffix). Empty = direct (today's behavior).</p>
+
   <div class="btns">
     <button class="primary" id="saveBtn">Save</button>
     <button class="ghost" id="testBtn">Reconnect</button>

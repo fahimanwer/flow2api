@@ -47,7 +47,13 @@ const DEFAULT_SETTINGS = {
   clientLabel: "",        // optional friendly name shown in the backend logs
   refreshIntervalMinutes: 60,
   tabMode: "persistent",  // "persistent" (reuse one hidden tab) | "ephemeral" (open/close per token)
-  mintIntervalMs: 2000    // min spacing between reCAPTCHA mints; paces one browser under Google's rate limit
+  mintIntervalMs: 2000,   // min spacing between reCAPTCHA mints; paces one browser under Google's rate limit
+  // Per-profile egress proxy. Empty = direct (no proxy) = today's behavior.
+  // Each Chrome profile gets its OWN proxy URL so each mints reCAPTCHA and holds
+  // its Google session from a DIFFERENT IP. Form: http://USER:PASS@HOST:PORT
+  // Oxylabs sticky residential: bake -sessid-<id> into USER so the IP is stable
+  // across SW restarts (a flapping IP triggers Google's "verify it's you").
+  proxyUrl: ""
 };
 
 let ws = null;
@@ -73,7 +79,8 @@ function getSettings() {
         clientLabel: (stored.clientLabel || "").trim(),
         refreshIntervalMinutes: Math.max(5, parseInt(stored.refreshIntervalMinutes, 10) || 60),
         tabMode: stored.tabMode === "ephemeral" ? "ephemeral" : "persistent",
-        mintIntervalMs: Math.max(0, parseInt(stored.mintIntervalMs, 10) || 2000)
+        mintIntervalMs: Math.max(0, parseInt(stored.mintIntervalMs, 10) || 2000),
+        proxyUrl: (stored.proxyUrl || "").trim()
       });
     });
   });
@@ -86,6 +93,96 @@ function deriveUrls(settings) {
   const updateUrl = `${base.protocol}//${base.host}/api/plugin/update-token`;
   return { wsUrl, updateUrl };
 }
+
+/* ------------------------------- proxy ------------------------------- */
+// Per-profile residential egress so each Chrome profile mints reCAPTCHA and
+// holds its Google session from a DIFFERENT IP, spreading Google's per-IP
+// reCAPTCHA flag across profiles without more machines.
+//
+// chrome.proxy applies to the WHOLE profile. We deliberately BYPASS the
+// Flow2API backend (the /captcha_ws WebSocket + /api/plugin/update-token) so
+// only Google traffic egresses through the metered residential proxy — the
+// long-lived heartbeat socket would otherwise burn proxy bandwidth and risk
+// the sticky tunnel dropping. Empty proxyUrl => proxy cleared (direct egress).
+
+let proxyCreds = null;               // { username, password } or null (for onAuthRequired)
+const answeredAuthReqs = new Set();  // requestIds already answered (407 loop guard)
+
+// Parse "http://user:pass@host:port". We split the credentials MANUALLY instead
+// of via URL.username/password so proxy-special chars (e.g. '+' in the Oxylabs
+// password) survive verbatim. Returns null on empty/invalid (=> direct).
+function parseProxyUrl(raw) {
+  const s = (raw || "").trim();
+  if (!s) return null;
+  const m = s.match(/^(https?|socks5|socks4):\/\/(?:([^:@/]+)(?::([^@/]*))?@)?([^:/?#]+):(\d+)\/?$/i);
+  if (!m) return null;
+  return {
+    scheme: m[1].toLowerCase(),            // "http" | "https" | "socks5" | "socks4"
+    username: m[2] ? decodeURIComponent(m[2]) : "",
+    password: m[3] != null ? m[3] : "",    // RAW (not decoded) — keeps literal '+'
+    host: m[4],
+    port: parseInt(m[5], 10)
+  };
+}
+
+// Hosts that must NEVER go through the proxy: the backend (so /captcha_ws and
+// /api/plugin/update-token go DIRECT) + loopback. bypassList matches by HOST,
+// so one backend entry covers both the wss and https endpoints (same host).
+function backendBypassHosts(settings) {
+  const out = ["localhost", "127.0.0.1", "[::1]"];
+  try { out.push(new URL(settings.serverBase).hostname); } catch (_) {}
+  return out;
+}
+
+// Apply (or, if proxyUrl empty/invalid, clear) the per-profile proxy. Idempotent.
+async function applyProxy(settings) {
+  const p = parseProxyUrl(settings.proxyUrl);
+  if (!p) { await clearProxy(); return; }
+  proxyCreds = { username: p.username, password: p.password };
+  const config = {
+    mode: "fixed_servers",
+    rules: {
+      singleProxy: { scheme: p.scheme, host: p.host, port: p.port },
+      bypassList: backendBypassHosts(settings)
+    }
+  };
+  try {
+    await chrome.proxy.settings.set({ value: config, scope: "regular" });
+    await log("SUCCESS", "Per-profile proxy applied", {
+      host: p.host, port: p.port, scheme: p.scheme, bypass: config.rules.bypassList
+    });
+  } catch (e) {
+    await log("ERROR", "Failed to apply proxy", { error: e.message });
+  }
+}
+
+async function clearProxy() {
+  proxyCreds = null;
+  answeredAuthReqs.clear();
+  try { await chrome.proxy.settings.clear({ scope: "regular" }); } catch (_) {}
+  await log("INFO", "Per-profile proxy cleared (direct egress)");
+}
+
+// MV3 proxy-auth: supply Oxylabs creds ASYNC, ONLY for proxy (407) challenges —
+// never for origin (Google) 401s, so the Google session login is untouched.
+// requestId de-dup avoids an infinite 407 loop when creds are wrong.
+chrome.webRequest.onAuthRequired.addListener(
+  (details, asyncCallback) => {
+    if (!details.isProxy || !proxyCreds) { asyncCallback({}); return; }
+    if (answeredAuthReqs.has(details.requestId)) {     // already tried -> creds bad
+      answeredAuthReqs.delete(details.requestId);
+      asyncCallback({ cancel: true });
+      return;
+    }
+    answeredAuthReqs.add(details.requestId);
+    asyncCallback({ authCredentials: { username: proxyCreds.username, password: proxyCreds.password } });
+  },
+  { urls: ["<all_urls>"] },
+  ["asyncBlocking"]        // permitted in MV3 because of "webRequestAuthProvider"
+);
+const _clearAuthReq = (d) => answeredAuthReqs.delete(d.requestId);
+chrome.webRequest.onCompleted.addListener(_clearAuthReq, { urls: ["<all_urls>"] });
+chrome.webRequest.onErrorOccurred.addListener(_clearAuthReq, { urls: ["<all_urls>"] });
 
 /* ------------------------------- logging ----------------------------- */
 
@@ -747,6 +844,7 @@ async function reconcileTabsOnBoot() {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await log("INFO", "Flow2API Worker installed");
+  await applyProxy(await getSettings());   // proxy live before any network use
   await setupAlarms();
   await reconcileTabsOnBoot();
   connectWS();
@@ -755,6 +853,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.runtime.onStartup.addListener(async () => {
+  await applyProxy(await getSettings());   // proxy live before WS/Google
   await setupAlarms();
   await reconcileTabsOnBoot();
   connectWS();
@@ -771,8 +870,11 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   }
   if (req.action === "settingsChanged") {
-    setupAlarms();
-    closeSocket(); connectWS();
+    (async () => {
+      await applyProxy(await getSettings());   // proxy may have changed -> re-apply/clear
+      await setupAlarms();
+      closeSocket(); connectWS();
+    })();
     sendResponse({ ok: true });
     return true;
   }
@@ -786,8 +888,9 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   }
 });
 
-// Boot (covers the service-worker waking up). Sequenced: janitor before warm-up.
+// Boot (covers the service-worker waking up). Sequenced: proxy, then janitor, then warm-up.
 (async () => {
+  await applyProxy(await getSettings());   // proxy live before WS/Google
   await setupAlarms();
   await reconcileTabsOnBoot();
   connectWS();

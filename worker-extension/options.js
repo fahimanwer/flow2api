@@ -6,7 +6,8 @@ const DEFAULTS = {
   clientLabel: "",
   refreshIntervalMinutes: 60,
   tabMode: "persistent",
-  mintIntervalMs: 2000
+  mintIntervalMs: 2000,
+  proxyUrl: ""
 };
 
 const $ = (id) => document.getElementById(id);
@@ -27,6 +28,7 @@ function load() {
     $("refreshIntervalMinutes").value = s.refreshIntervalMinutes;
     $("tabMode").value = s.tabMode;
     $("mintIntervalMs").value = s.mintIntervalMs;
+    $("proxyUrl").value = s.proxyUrl;
   });
   renderLogs();
 }
@@ -40,10 +42,14 @@ function save() {
     clientLabel: $("clientLabel").value.trim(),
     refreshIntervalMinutes: Math.max(5, parseInt($("refreshIntervalMinutes").value, 10) || 60),
     tabMode: $("tabMode").value === "ephemeral" ? "ephemeral" : "persistent",
-    mintIntervalMs: Math.max(0, parseInt($("mintIntervalMs").value, 10) || 2000)
+    mintIntervalMs: Math.max(0, parseInt($("mintIntervalMs").value, 10) || 2000),
+    proxyUrl: $("proxyUrl").value.trim()
   };
   try { new URL(settings.serverBase); } catch (e) { setStatus("Server URL is invalid.", false); return; }
   if (!settings.apiKey) { setStatus("API Key is required.", false); return; }
+  if (settings.proxyUrl && !/^(https?|socks5|socks4):\/\/.+:\d+\/?$/i.test(settings.proxyUrl)) {
+    setStatus("Proxy URL must look like http://user:pass@host:port", false); return;
+  }
 
   chrome.storage.local.set(settings, () => {
     chrome.runtime.sendMessage({ action: "settingsChanged" }, () => {});

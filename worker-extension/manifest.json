@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow2API Worker",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "All-in-one Flow2API worker: supplies real-browser reCAPTCHA tokens (persistent tab) and keeps the Google Labs login session fresh.",
   "permissions": [
     "storage",
@@ -9,11 +9,13 @@
     "scripting",
     "cookies",
     "alarms",
-    "notifications"
+    "notifications",
+    "proxy",
+    "webRequest",
+    "webRequestAuthProvider"
   ],
   "host_permissions": [
-    "https://labs.google/*",
-    "https://*.google.com/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"
