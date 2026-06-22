@@ -920,6 +920,15 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+  if (req.action === "disableProxy") {
+    // One-click panic disable: turn off auto, clear any override, drop the proxy now.
+    (async () => {
+      await chrome.storage.local.set({ proxyAuto: false, proxyUrl: "" });
+      await clearProxy();
+    })();
+    sendResponse({ ok: true });
+    return true;
+  }
   if (req.action === "getLogs") {
     chrome.storage.local.get(["logs"]).then(({ logs = [] }) => sendResponse({ logs }));
     return true;

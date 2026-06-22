@@ -90,5 +90,13 @@ document.addEventListener("DOMContentLoaded", () => {
       renderLogs();
     });
   });
+  $("disableProxyBtn").addEventListener("click", () => {
+    chrome.runtime.sendMessage({ action: "disableProxy" }, () => {
+      $("proxyAuto").checked = false;
+      $("proxyUrl").value = "";
+      setStatus("Proxy disabled (direct egress).", true);
+      setTimeout(renderLogs, 800);
+    });
+  });
   setInterval(renderLogs, 4000);
 });
