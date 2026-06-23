@@ -26,6 +26,15 @@ const SESSION_COOKIE = "__Secure-next-auth.session-token";
 
 const ALARM_SESSION = "flow2api_session_refresh";
 const ALARM_KEEPALIVE = "flow2api_keepalive";
+const ALARM_RELOAD = "flow2api_session_reload";
+
+// Proactive session-cookie roll: reload the persistent Labs tab when the
+// session-token cookie is within this window of expiry, so NextAuth re-issues
+// (rolls) a fresh cookie long before it can drift to expiry.
+const RELOAD_THRESHOLD_MS = 24 * 60 * 60 * 1000;  // reload when < 24h to expiry
+const RELOAD_MIN_GAP_MS   = 2 * 60 * 60 * 1000;   // never reload more than ~once / 2h
+const RELOAD_ACTIVE_MS    = 45 * 1000;            // skip reload if a mint started in last 45s (>= VIDEO 30s)
+const COOKIE_SETTLE_MS    = 1500;                 // let NextAuth write the rolled cookie
 
 // WebSocket heartbeat: keep the MV3 service worker alive (Chrome 116+ resets the
 // idle timer on WS traffic). 15s gives margin under the ~30s idle limit + timer jitter.
@@ -60,6 +69,8 @@ const DEFAULT_SETTINGS = {
 
 let ws = null;
 let lastMintAt = 0;       // timestamp of the last reCAPTCHA mint (for pacing)
+let mintInFlight = false; // true while handleGetToken holds the persistent tab (in-mem only)
+let lastReloadAt = 0;     // timestamp of last proactive reload (in-mem rate cap)
 let heartbeatInterval = null;
 let reconnectTimer = null;
 let persistentTabId = null;           // in-memory cache of the live persistent tab id
@@ -636,6 +647,17 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
 }
 
 async function handleGetToken(data, settings, responseSocket = ws) {
+  // Mark the persistent tab as in-use so proactive reload / session-refresh
+  // fallback never reload it out from under an in-flight mint.
+  mintInFlight = true;
+  try {
+    return await _handleGetToken(data, settings, responseSocket);
+  } finally {
+    mintInFlight = false;
+  }
+}
+
+async function _handleGetToken(data, settings, responseSocket = ws) {
   const action = data.action || "IMAGE_GENERATION";
   const timeoutMs = action === "VIDEO_GENERATION" ? 30000 : 20000;
 
@@ -788,6 +810,102 @@ function closeSocket() {
 
 /* --------------------------- session refresh ------------------------- */
 
+// Drop an owned tab (best-effort remove + deregister + clear persistent pointer).
+async function dropOwnedTab(tabId) {
+  try { await chrome.tabs.remove(tabId); } catch (_) {}
+  await removeOwned(tabId);
+  if (tabId === persistentTabId) {
+    persistentTabId = null;
+    await chrome.storage.local.remove("persistentTabId");
+  }
+}
+
+// Time-to-expiry (ms) of the session-token cookie. null = no cookie; 0 = present
+// but session-scoped (no expirationDate) -> treat as roll-eligible on cadence so
+// the proactive feature never silently no-ops. Mirrors hasSessionCookie's read.
+async function sessionCookieTimeToExpiry() {
+  let c = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
+  if (!c) {
+    const all = await chrome.cookies.getAll({ domain: "labs.google" });
+    c = all.find((x) => x.name === SESSION_COOKIE) || null;
+  }
+  if (!c || !c.value) return null;
+  if (!c.expirationDate) return 0; // session cookie, no expiry -> eligible to roll
+  return c.expirationDate * 1000 - Date.now();
+}
+
+// Force NextAuth to re-issue (roll) the session-token cookie by navigating a Labs
+// tab: reload an existing usable owned tab if we have one (no MAX_OWNED_TABS
+// pressure), else open one fresh via openLabsTab() (ceiling/lease/login-redirect
+// safe). NEVER throws. Returns the live tab id on Flow, or null if we ended up off
+// Flow / logged out (the breaker is armed inside on a real login bounce). Does NOT
+// read or push the cookie — the caller re-reads after COOKIE_SETTLE_MS.
+async function rollSessionTab() {
+  let tabId = await findUsableLabsTab();
+  if (tabId != null) {
+    try {
+      await chrome.tabs.reload(tabId, { bypassCache: false });
+    } catch (_) {
+      await dropOwnedTab(tabId); // tab vanished mid-reload -> fall through to fresh open
+      tabId = null;
+    }
+    if (tabId != null) {
+      await waitForTabComplete(tabId);
+      const settled = await getTab(tabId);
+      if (!tabOnFlow(settled)) {
+        if (isLoginTab(settled)) await setLoginRequired("reload bounced to " + tabUrlOf(settled));
+        else await log("WARN", "Reload settled off-Flow (non-login)", { url: tabUrlOf(settled) });
+        await dropOwnedTab(tabId);
+        return null;
+      }
+      await sleep(1200); // grecaptcha settle, mirror openLabsTab
+      return tabId;
+    }
+  }
+  // No usable tab to reload -> open one fresh. openLabsTab enforces the ceiling,
+  // records the lease, and arms login_required + throws on a login redirect.
+  try {
+    const id = await openLabsTab();
+    persistentTabId = id;
+    await chrome.storage.local.set({ persistentTabId: id });
+    await sweepOwnedTabs(id); // collapse to exactly one
+    return id;
+  } catch (e) {
+    await log("WARN", "rollSessionTab fresh open failed", { error: e && e.message });
+    return null; // breaker already armed by openLabsTab if this was a login bounce
+  }
+}
+
+// Expiry-aware proactive roll, run on ALARM_RELOAD via tokenQueue so it never
+// races a mint. Login-aware + rate-capped + yields to active traffic.
+async function maybeReloadForRoll() {
+  const settings = await getSettings();
+  if (settings.tabMode !== "persistent") return;          // ephemeral reopens every mint anyway
+  if (mintInFlight) return;                                // a mint is holding the tab right now
+  if (Date.now() - lastMintAt < RELOAD_ACTIVE_MS) return; // busy serving -> defer
+
+  // Circuit-breaker gate, mirroring maybeEnsurePersistentTab.
+  const auth = await getAuthState();
+  if (auth.state === "login_required") {
+    if (await hasSessionCookie()) await clearLoginRequired();
+    else if (Date.now() < (auth.nextRetryAt || 0)) return;
+  }
+
+  if (Date.now() - lastReloadAt < RELOAD_MIN_GAP_MS) return; // hard rate cap
+
+  const ttl = await sessionCookieTimeToExpiry();
+  if (ttl === null) return;               // no cookie -> let refreshSession's fallback handle it
+  if (ttl > RELOAD_THRESHOLD_MS) return;  // plenty of life left -> common no-op case
+  if (ttl === 0) await log("INFO", "Session cookie has no expiry; rolling on cadence");
+
+  lastReloadAt = Date.now();
+  const tabId = await rollSessionTab();   // never throws; arms breaker on login bounce
+  if (tabId == null) return;              // bounced to login / off-Flow -> handled inside
+
+  await refreshSession();                 // push the freshly rolled cookie
+  await log("INFO", "Proactive reload rolled session cookie", { tabId, prevTtlMs: ttl });
+}
+
 async function refreshSession() {
   const settings = await getSettings();
   if (!settings.serverBase || !settings.connectionToken) {
@@ -809,8 +927,44 @@ async function refreshSession() {
       cookie = all.find((c) => c.name === SESSION_COOKIE) || null;
     }
     if (!cookie || !cookie.value) {
-      await setLoginRequired("session-token cookie not found");
-      return { success: false, error: "session-token not found (log into Google Labs)" };
+      // FALLBACK: the cookie read came back empty even though Google may still be
+      // logged in. In persistent mode, force a navigation (reload existing tab, or
+      // open a fresh one) so NextAuth re-issues the cookie, then re-read. Only end
+      // at login_required if we genuinely bounced to a login page (armed inside
+      // rollSessionTab/openLabsTab) — never on a transient empty read.
+      if (settings.tabMode === "persistent") {
+        // B1: never reload the tab out from under an in-flight / very recent mint.
+        if (mintInFlight || (Date.now() - lastMintAt < RELOAD_ACTIVE_MS)) {
+          return { success: false, error: "busy minting, retry next cycle" };
+        }
+        const tabId = await rollSessionTab(); // never throws; arms breaker on login bounce
+        if (tabId == null) {
+          const auth = await getAuthState();
+          return {
+            success: false,
+            error: auth.state === "login_required"
+              ? "login required (Google Labs logged out)"
+              : "reload fallback failed (will retry)",
+          };
+        }
+        await sleep(COOKIE_SETTLE_MS); // let NextAuth write the rolled cookie
+        cookie = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
+        if (!cookie) {
+          const all2 = await chrome.cookies.getAll({ domain: "labs.google" });
+          cookie = all2.find((c) => c.name === SESSION_COOKIE) || null;
+        }
+        if (!cookie || !cookie.value) {
+          // On Flow but still no cookie: unhealthy, not necessarily logged out.
+          // Fail soft — next ALARM_SESSION retries; do NOT setLoginRequired here.
+          await log("WARN", "Cookie still missing after reload (will retry next cycle)");
+          return { success: false, error: "session-token missing after reload (will retry)" };
+        }
+        // recovered -> fall through to push below
+      } else {
+        // Ephemeral mode: unchanged behavior.
+        await setLoginRequired("session-token cookie not found");
+        return { success: false, error: "session-token not found (log into Google Labs)" };
+      }
     }
 
     const resp = await fetch(updateUrl, {
@@ -839,8 +993,10 @@ async function setupAlarms() {
   const settings = await getSettings();
   await chrome.alarms.clear(ALARM_SESSION);
   await chrome.alarms.clear(ALARM_KEEPALIVE);
+  await chrome.alarms.clear(ALARM_RELOAD);
   chrome.alarms.create(ALARM_SESSION, { periodInMinutes: settings.refreshIntervalMinutes, delayInMinutes: 0.1 });
   chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: 1 }); // revive SW/socket/tab
+  chrome.alarms.create(ALARM_RELOAD, { periodInMinutes: 180, delayInMinutes: 5 }); // ~3h proactive cookie roll
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -852,6 +1008,14 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // tabs while disconnected. The call itself is login-aware and serialized.
     if (ws && ws.readyState === WebSocket.OPEN) {
       maybeEnsurePersistentTab();
+    }
+  } else if (alarm.name === ALARM_RELOAD) {
+    // Proactive cookie roll. Enqueue on tokenQueue so it serializes FIFO with
+    // mints — it waits for any in-flight mint and blocks the next mint only while
+    // the tab reloads. Never on ensureChain. Only when the socket is OPEN, so we
+    // never spin tabs while disconnected (mirrors the keepalive guard).
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      tokenQueue = tokenQueue.then(() => maybeReloadForRoll()).catch(() => {});
     }
   }
 });
