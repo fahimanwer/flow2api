@@ -787,6 +787,39 @@ class FlowClient:
             timeout=self._get_control_plane_timeout(),
         )
 
+    # ========== 媒体获取 (使用AT) ==========
+
+    async def get_media(self, at: str, media_name: str) -> dict:
+        """获取媒体内容 (视频返回base64编码数据)
+
+        Google 的 batchCheckAsyncVideoGenerationStatus 接口在视频生成成功后
+        不返回下载 URL。需要通过 GET /v1/media/{name} 获取视频内容。
+
+        Args:
+            at: Access Token
+            media_name: 媒体名称 (UUID格式)
+
+        Returns:
+            {
+                "name": "uuid",
+                "video": {
+                    "encodedVideo": "base64...",
+                    "seed": 74602,
+                    "prompt": "...",
+                    "model": "veo_3_1_t2v_fast",
+                    "aspectRatio": "VIDEO_ASPECT_RATIO_LANDSCAPE"
+                }
+            }
+        """
+        url = f"{self.api_base_url}/media/{media_name}"
+        return await self._make_request(
+            method="GET",
+            url=url,
+            use_at=True,
+            at_token=at,
+            timeout=max(60, int(self.timeout or 120)),
+        )
+
     # ========== 余额查询 (使用AT) ==========
 
     async def get_credits(self, at: str) -> dict:

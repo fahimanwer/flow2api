@@ -442,6 +442,35 @@ class FileCache:
                 )
                 raise Exception(normalized_error) from e
 
+    async def cache_base64_video(self, base64_data: str) -> str:
+        """Cache base64 encoded video data to local file
+
+        Args:
+            base64_data: Base64 encoded video data (without data:video/... prefix)
+
+        Returns:
+            Local cache filename
+        """
+        import base64 as _b64
+        import uuid as _uuid
+
+        unique_id = hashlib.md5(f"{_uuid.uuid4()}{time.time()}".encode()).hexdigest()
+        filename = f"{unique_id}.mp4"
+        file_path = self.cache_dir / filename
+
+        try:
+            video_data = _b64.b64decode(base64_data)
+            self._write_cached_content(file_path, video_data)
+            debug_logger.log_info(f"Base64 video cached: {filename} ({len(video_data)} bytes)")
+            return filename
+        except Exception as e:
+            debug_logger.log_error(
+                error_message=f"Failed to cache base64 video: {str(e)}",
+                status_code=0,
+                response_text=""
+            )
+            raise Exception(f"Failed to cache base64 video: {str(e)}")
+
     async def cache_base64_image(self, base64_data: str, resolution: str = "") -> str:
         """
         Cache base64 encoded image data to local file

@@ -2035,19 +2035,52 @@ class GenerationHandler:
                     )
                     aspect_ratio = video_info.get("aspectRatio", "VIDEO_ASPECT_RATIO_LANDSCAPE")
 
-                    # New schema: fifeUrl absent → fetch CDN URL via labs.google
-                    # /trpc/media.getMediaUrlRedirect (returns 3xx with Location).
+                    # New schema: fifeUrl absent -> first ask labs.google for a CDN
+                    # redirect; if that fails, fetch the media bytes from the API.
                     if not video_url and media_name:
                         try:
                             video_url = await self.flow_client.get_media_url_redirect(
                                 token.st, media_name
                             )
                         except Exception as e:
-                            error_msg = f"Video generation failed: failed to fetch video URL: {e}"
-                            await self._fail_video_task(checked_operations, error_msg)
-                            self._mark_generation_failed(generation_result, error_msg)
-                            yield self._create_error_response(error_msg, status_code=502)
-                            return
+                            debug_logger.log_warning(
+                                f"[VIDEO] get_media_url_redirect failed for media={media_name}: {e}"
+                            )
+
+                    if not video_url:
+                        media_name_for_fetch = (
+                            media_name
+                            or operation.get("mediaName")
+                            or operation["operation"].get("name")
+                            or ""
+                        )
+                        if media_name_for_fetch:
+                            if stream:
+                                yield self._create_stream_chunk("Video generation complete, downloading media file...\n")
+                            try:
+                                media_result = await self.flow_client.get_media(
+                                    token.at, media_name_for_fetch
+                                )
+                                encoded_video = (
+                                    media_result.get("video", {}).get("encodedVideo", "")
+                                )
+                                if encoded_video:
+                                    cached_filename = await self.file_cache.cache_base64_video(
+                                        encoded_video
+                                    )
+                                    video_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                                    video_info["fifeUrl"] = video_url
+                                    debug_logger.log_info(
+                                        f"[VIDEO] Video fetched via get_media and cached: {cached_filename}"
+                                    )
+                                else:
+                                    debug_logger.log_error(
+                                        "[VIDEO] get_media returned empty encodedVideo"
+                                    )
+                            except Exception as fetch_err:
+                                debug_logger.log_error(
+                                    f"[VIDEO] Failed to fetch video via get_media: {fetch_err}"
+                                )
 
                     if not video_url:
                         error_msg = "Video generation failed: video URL is empty"
