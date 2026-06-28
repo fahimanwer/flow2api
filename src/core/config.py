@@ -35,8 +35,23 @@ class Config:
         """Load configuration from setting.toml, falling back to the example file."""
         config_dir = Path(__file__).parent.parent.parent / "config"
         config_path = config_dir / "setting.toml"
-        if not config_path.exists():
-            config_path = config_dir / "setting_example.toml"
+        fallback_path = config_dir / "setting_example.toml"
+
+        if config_path.exists() and not config_path.is_file():
+            print(
+                f"[Config] 检测到 {config_path} 不是普通文件，"
+                f"将回退到 {fallback_path.name}。请检查 Docker 挂载或本地配置路径。"
+            )
+            config_path = fallback_path
+        elif not config_path.exists():
+            config_path = fallback_path
+
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"配置文件不存在或不可读取: {config_path}. "
+                f"请确认 config 目录下存在可用的 setting.toml 或 setting_example.toml"
+            )
+
         with open(config_path, "rb") as f:
             return tomli.load(f)
 
