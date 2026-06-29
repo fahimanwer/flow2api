@@ -942,6 +942,147 @@ async def refresh_at(
         raise HTTPException(status_code=500, detail=f"刷新AT失败: {str(e)}")
 
 
+@router.post("/api/tokens/{token_id}/route-key")
+async def set_token_route_key(
+    token_id: int,
+    request: dict,
+    token: str = Depends(verify_admin_token)
+):
+    """绑定/解绑 token 与某个浏览器扩展的 Route Key（仅元数据，无需有效 ST）。
+
+    用于「按需会话刷新」的定向。留空表示解绑(NULL)。刻意不走 PUT /api/tokens/{id}
+    （那条路径强制 st_to_at，已过期的 ST 行无法绑定）。
+    """
+    from ..core.logger import debug_logger
+
+    target = await token_manager.get_token(token_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Token not found")
+
+    value = (request.get("extension_route_key") or "").strip()
+    # Write via the DB layer directly so we can clear to NULL: token_manager.update_token
+    # treats extension_route_key=None as "leave unchanged", whereas db.update_token writes
+    # whatever kwarg we pass (incl. NULL). value or None => "" unbinds to NULL.
+    await db.update_token(token_id, extension_route_key=(value or None))
+    updated = await token_manager.get_token(token_id)
+    debug_logger.log_info(f"[API] 设置 route_key: token_id={token_id}, route_key={value or '(cleared)'}")
+    return {
+        "success": True,
+        "message": "Route Key 已更新 / Route key updated",
+        "token": {
+            "id": updated.id,
+            "email": updated.email,
+            "extension_route_key": updated.extension_route_key or "",
+        },
+    }
+
+
+@router.post("/api/tokens/{token_id}/refresh-session")
+async def refresh_session_via_extension(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """按需刷新 Google Labs 会话：命令绑定该账号的 worker 浏览器读取实时 cookie 并推送新 ST。
+
+    仅当该浏览器仍处于登录状态时有效；已登出/过期的会话无法通过任何命令恢复
+    （需人工在该浏览器重新登录）。结果通过 status 如实回报，绝不谎报 refreshed。
+    """
+    from ..core.logger import debug_logger
+    from ..services.browser_captcha_extension import ExtensionCaptchaService
+
+    target = await token_manager.get_token(token_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Token not found")
+
+    def _tok(t):
+        return {
+            "id": t.id,
+            "email": t.email,
+            "extension_route_key": t.extension_route_key or "",
+            "at_expires": t.at_expires.isoformat() if t.at_expires else None,
+        }
+
+    # Manual action: NEVER disables the token (mirrors refresh-at). Every expected
+    # failure returns HTTP 200 + success:false so the UI shows the guidance toast.
+    reason_messages = {
+        "not_bound": (
+            "会话刷新失败：该 token 未绑定浏览器（extension_route_key 为空）。请先为其设置 Route Key，"
+            "并在对应浏览器扩展中填入相同的 Route Key，否则可能刷新到错误账号。token 未被禁用。 / "
+            "Not bound: set this token's Route Key AND the same Route Key in that browser's "
+            "extension first (an unbound refresh could hit the wrong account). Token not disabled."
+        ),
+        "no_browser": (
+            "会话刷新失败：没有与该 Route Key 匹配且在线的浏览器扩展，请确认对应浏览器已打开并连接。"
+            "token 未被禁用。 / "
+            "No online extension matches this token's Route Key — open/connect that browser. "
+            "Token not disabled."
+        ),
+        "logged_out": (
+            "会话刷新失败：目标浏览器已从 Google Labs 登出，必须人工在该浏览器重新登录后再试。"
+            "登出状态下任何命令都无法恢复会话。token 未被禁用。 / "
+            "Target browser is logged OUT of Google Labs — a human must re-login there, then retry. "
+            "No command can refresh a logged-out session. Token not disabled."
+        ),
+        "busy": (
+            "会话刷新暂缓：该浏览器正在出验证码(mint)，未在出码途中重载标签页，请稍后重试。 / "
+            "Busy minting; the tab was not reloaded mid-mint — retry shortly."
+        ),
+        "timeout": (
+            "会话刷新超时：浏览器未在时限内响应（可能繁忙或 service worker 休眠），请重试。token 未被禁用。 / "
+            "Timed out waiting for the browser (busy, or its service worker slept) — retry. Token not disabled."
+        ),
+        "network": (
+            "会话刷新失败：推送新 ST 时发生网络/代理或服务器错误，请检查后重试。token 未被禁用。 / "
+            "Network/proxy or server error pushing the new ST — check and retry. Token not disabled."
+        ),
+        "not_configured": (
+            "会话刷新失败：worker 扩展缺少 Server URL / Connection Token 配置。 / "
+            "The worker extension is missing its Server URL / Connection Token."
+        ),
+        "account_mismatch": (
+            "会话刷新失败：该浏览器登录的 Google 账号与此 token 不一致，已拒绝写入（避免覆盖错误账号）。"
+            "请改用正确账号的浏览器。token 未被禁用。 / "
+            "The browser is logged into a DIFFERENT Google account than this token — refused to "
+            "write (would corrupt the wrong account). Use the correct account's browser. Token not disabled."
+        ),
+        "unknown": (
+            "会话刷新失败（未知原因），请查看服务端日志。 / "
+            "Session refresh failed (unknown reason) — check server logs."
+        ),
+    }
+
+    route_key = (target.extension_route_key or "").strip()
+    if not route_key:
+        debug_logger.log_info(f"[API] 会话刷新被拒绝(not_bound): token_id={token_id}")
+        return {"success": False, "reason": "not_bound",
+                "detail": reason_messages["not_bound"], "token": _tok(target)}
+
+    try:
+        service = await ExtensionCaptchaService.get_instance(db=db)
+        result = await service.request_session_refresh(token_id, timeout=30)
+        status = (result or {}).get("status")
+
+        if status == "refreshed":
+            updated = await token_manager.get_token(token_id)
+            debug_logger.log_info(f"[API] 会话刷新成功 via extension: token_id={token_id}")
+            return {
+                "success": True,
+                "message": "会话刷新成功 / Session refreshed successfully",
+                "token": _tok(updated),
+            }
+
+        debug_logger.log_error(f"[API] 会话刷新失败: token_id={token_id}, status={status}")
+        return {
+            "success": False,
+            "reason": status or "unknown",
+            "detail": reason_messages.get(status, reason_messages["unknown"]),
+            "token": _tok(target),
+        }
+    except Exception as e:
+        debug_logger.log_error(f"[API] 会话刷新异常: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"会话刷新失败: {str(e)}")
+
+
 @router.post("/api/tokens/st2at")
 async def st_to_at(
     request: ST2ATRequest,
@@ -2157,6 +2298,10 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     if not session_token:
         raise HTTPException(status_code=400, detail="Missing session_token")
 
+    # Optional explicit attribution for admin-triggered on-demand refresh. When
+    # absent (autonomous extension pushes), we fall back to email matching below.
+    token_id_override = request.get("token_id")
+
     # Step 1: Convert ST to AT to get user info (including email)
     try:
         result = await token_manager.flow_client.st_to_at(session_token)
@@ -2180,8 +2325,27 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
 
-    # Step 2: Check if token with this email exists
-    existing_token = await db.get_token_by_email(email)
+    # Step 2: Resolve which token row this update applies to.
+    # On-demand refresh threads an explicit token_id so the ST is attributed to the
+    # CORRECT row even when emails are duplicated, guarded by an email match so a
+    # wrong/spoofed token_id can never overwrite a different account's ST. This runs
+    # OUTSIDE the st_to_at try/except above, so the 409 is surfaced (not swallowed
+    # into a 400). Autonomous pushes (no token_id) keep the original email path.
+    if token_id_override is not None:
+        try:
+            tid = int(token_id_override)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid token_id")
+        existing_token = await db.get_token(tid)
+        if not existing_token:
+            raise HTTPException(status_code=404, detail=f"Token {tid} not found")
+        if (existing_token.email or "").strip().lower() != (email or "").strip().lower():
+            raise HTTPException(
+                status_code=409,
+                detail=f"account mismatch: cookie is {email}, token {tid} is {existing_token.email}",
+            )
+    else:
+        existing_token = await db.get_token_by_email(email)
 
     if existing_token:
         # Update existing token

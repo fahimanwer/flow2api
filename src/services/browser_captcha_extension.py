@@ -147,6 +147,10 @@ class ExtensionCaptchaService:
                     )
                 return
 
+            # Type-agnostic correlation: ANY framed reply carrying a known req_id
+            # resolves its future — get_token's token result AND the
+            # session_refresh_result ack both route through here. Do NOT add a
+            # `type` check; request_session_refresh relies on this.
             req_id = payload.get("req_id")
             if req_id and req_id in self.pending_requests:
                 # Match the response by req_id alone (a unique uuid4). The socket
@@ -215,6 +219,53 @@ class ExtensionCaptchaService:
         except Exception as e:
             debug_logger.log_error(f"[Extension Captcha] Communication error: {e}")
             return None
+        finally:
+            self.pending_requests.pop(req_id, None)
+
+    async def request_session_refresh(self, token_id: Optional[int], timeout: int = 30) -> dict:
+        """Tell the worker browser BOUND to this token to refresh its Google Labs
+        session NOW (read the live cookie, push a fresh ST), and return the result.
+
+        Targets only the extension whose route_key matches the token's
+        extension_route_key. Refuses to act on an empty route_key: an empty key
+        would round-robin to a RANDOM shared-pool browser (_select_connection)
+        and read the WRONG account's cookie — so we return ``not_bound`` instead.
+        Only works while that browser is still logged in; a logged-out session
+        surfaces as ``logged_out`` (no command can recover it).
+        """
+        route_key = await self._resolve_route_key(token_id)
+        if not route_key:
+            return {"status": "not_bound", "token_id": token_id}
+        conn = self._select_connection(route_key)
+        if conn is None:
+            return {
+                "status": "no_browser",
+                "route_key": route_key,
+                "available": self._describe_routes() or "none",
+            }
+
+        req_id = f"refresh_{uuid.uuid4().hex}"
+        future = asyncio.get_running_loop().create_future()
+        self.pending_requests[req_id] = future
+        try:
+            debug_logger.log_info(
+                f"[Extension Captcha] Dispatching session refresh via route_key={route_key}, "
+                f"label={conn.client_label or '-'}, token_id={token_id}, req_id={req_id}"
+            )
+            await conn.websocket.send_text(json.dumps({
+                "type": "refresh_session",
+                "req_id": req_id,
+                "route_key": route_key,
+                "token_id": token_id,
+            }))
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result if isinstance(result, dict) else {"status": "error", "error": "malformed ack"}
+        except asyncio.TimeoutError:
+            debug_logger.log_error(f"[Extension Captcha] Timeout waiting for session refresh (req_id: {req_id})")
+            return {"status": "timeout", "req_id": req_id, "route_key": route_key}
+        except Exception as e:
+            debug_logger.log_error(f"[Extension Captcha] Session refresh communication error: {e}")
+            return {"status": "error", "error": str(e)}
         finally:
             self.pending_requests.pop(req_id, None)
 

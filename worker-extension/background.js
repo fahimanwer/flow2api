@@ -784,6 +784,13 @@ async function connectWS() {
       // Reply on the exact socket the request arrived on (falls back to current).
       tokenQueue = tokenQueue.then(() => handleGetToken(data, settings, socket)).catch(() => {});
     }
+    if (data.type === "refresh_session") {
+      // Direct call (NOT tokenQueue): refreshSession's common path is tab-free
+      // (cookie read + POST), so it can't conflict with an in-flight mint, and the
+      // only tab-reloading path (empty-cookie fallback) is already mint-busy-guarded.
+      // Queueing behind a long (video) mint would blow the backend's 30s wait.
+      handleRefreshSession(data, socket);
+    }
   };
 
   socket.onclose = () => {
@@ -906,11 +913,11 @@ async function maybeReloadForRoll() {
   await log("INFO", "Proactive reload rolled session cookie", { tabId, prevTtlMs: ttl });
 }
 
-async function refreshSession() {
+async function refreshSession(token_id = null) {
   const settings = await getSettings();
   if (!settings.serverBase || !settings.connectionToken) {
     await log("INFO", "Session refresh skipped (need Server URL + Connection Token)");
-    return { success: false, error: "not configured" };
+    return { success: false, error: "not configured", reason: "not_configured" };
   }
   const { updateUrl } = deriveUrls(settings);
 
@@ -935,7 +942,7 @@ async function refreshSession() {
       if (settings.tabMode === "persistent") {
         // B1: never reload the tab out from under an in-flight / very recent mint.
         if (mintInFlight || (Date.now() - lastMintAt < RELOAD_ACTIVE_MS)) {
-          return { success: false, error: "busy minting, retry next cycle" };
+          return { success: false, error: "busy minting, retry next cycle", reason: "busy" };
         }
         const tabId = await rollSessionTab(); // never throws; arms breaker on login bounce
         if (tabId == null) {
@@ -945,6 +952,7 @@ async function refreshSession() {
             error: auth.state === "login_required"
               ? "login required (Google Labs logged out)"
               : "reload fallback failed (will retry)",
+            reason: auth.state === "login_required" ? "logged_out" : "network",
           };
         }
         await sleep(COOKIE_SETTLE_MS); // let NextAuth write the rolled cookie
@@ -957,34 +965,55 @@ async function refreshSession() {
           // On Flow but still no cookie: unhealthy, not necessarily logged out.
           // Fail soft — next ALARM_SESSION retries; do NOT setLoginRequired here.
           await log("WARN", "Cookie still missing after reload (will retry next cycle)");
-          return { success: false, error: "session-token missing after reload (will retry)" };
+          return { success: false, error: "session-token missing after reload (will retry)", reason: "network" };
         }
         // recovered -> fall through to push below
       } else {
         // Ephemeral mode: unchanged behavior.
         await setLoginRequired("session-token cookie not found");
-        return { success: false, error: "session-token not found (log into Google Labs)" };
+        return { success: false, error: "session-token not found (log into Google Labs)", reason: "logged_out" };
       }
     }
 
     const resp = await fetch(updateUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.connectionToken}` },
-      body: JSON.stringify({ session_token: cookie.value })
+      body: JSON.stringify(token_id != null ? { session_token: cookie.value, token_id } : { session_token: cookie.value })
     });
     if (!resp.ok) {
       const txt = await resp.text();
       await log("ERROR", "Session push failed", { status: resp.status, body: txt.slice(0, 200) });
-      return { success: false, error: `server ${resp.status}` };
+      return {
+        success: false,
+        error: `server ${resp.status}`,
+        reason: resp.status === 409 ? "account_mismatch" : resp.status === 400 ? "logged_out" : "network",
+      };
     }
     const result = await resp.json();
     await clearLoginRequired(); // a valid cookie pushed -> session is healthy
     await log("SUCCESS", "Session token pushed to Flow2API", { action: result.action, message: result.message });
-    return { success: true, message: result.message, action: result.action };
+    return { success: true, message: result.message, action: result.action, reason: "refreshed" };
   } catch (e) {
     await log("ERROR", "Session refresh error", { error: e.message });
-    return { success: false, error: e.message };
+    return { success: false, error: e.message, reason: "network" };
   }
+}
+
+// Backend (admin UI) asked THIS specific browser to refresh its session NOW.
+// Called directly (not via tokenQueue) — see the onmessage refresh_session branch.
+// Replies with an honest status the backend maps to a UI toast; never lies "refreshed".
+async function handleRefreshSession(data, responseSocket = ws) {
+  let status, msg = null, err = null;
+  try {
+    const r = await refreshSession(data.token_id);
+    status = r.reason || (r.success ? "refreshed" : "network");
+    msg = r.message || null;
+    err = r.error || null;
+  } catch (e) {
+    status = "network";
+    err = e && e.message;
+  }
+  sendWS({ type: "session_refresh_result", req_id: data.req_id, status, message: msg, error: err }, responseSocket);
 }
 
 /* ------------------------------- alarms ------------------------------ */
