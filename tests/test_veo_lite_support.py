@@ -1,10 +1,22 @@
 import types
 import unittest
-from unittest.mock import AsyncMock
+from io import BytesIO
+from unittest.mock import AsyncMock, patch
 
+from PIL import Image
+
+from src.api.routes import _normalize_openai_request
+from src.core.models import ChatCompletionRequest, ChatMessage
 from src.core.model_resolver import resolve_model_name
 from src.services.flow_client import FlowClient
 from src.services.generation_handler import MODEL_CONFIG, GenerationHandler
+
+
+def _make_image_bytes(size: tuple[int, int], color: str = "white") -> bytes:
+    image = Image.new("RGB", size, color=color)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 class VeoLiteModelResolverTests(unittest.TestCase):
@@ -46,6 +58,45 @@ class VeoLiteModelResolverTests(unittest.TestCase):
         )
 
         self.assertEqual(resolved, "veo_3_1_i2v_s_6s_1080p")
+
+    def test_resolve_quality_8s_alias_to_portrait_variant(self):
+        request = types.SimpleNamespace(
+            generationConfig=types.SimpleNamespace(aspectRatio="portrait")
+        )
+
+        resolved = resolve_model_name(
+            "veo_3_1_t2v_8s",
+            request=request,
+            model_config=MODEL_CONFIG,
+        )
+
+        self.assertEqual(resolved, "veo_3_1_t2v_portrait_8s")
+
+    def test_resolve_quality_8s_upsample_alias_to_portrait_variant(self):
+        request = types.SimpleNamespace(
+            generationConfig=types.SimpleNamespace(aspectRatio="portrait", imageSize="4k")
+        )
+
+        resolved = resolve_model_name(
+            "veo_3_1_i2v_s_8s",
+            request=request,
+            model_config=MODEL_CONFIG,
+        )
+
+        self.assertEqual(resolved, "veo_3_1_i2v_s_portrait_8s_4k")
+
+    def test_image_model_follows_reference_image_aspect_ratio(self):
+        request = types.SimpleNamespace(generationConfig=None)
+        portrait_image = _make_image_bytes((900, 1600))
+
+        resolved = resolve_model_name(
+            "gemini-3.0-pro-image",
+            request=request,
+            model_config=MODEL_CONFIG,
+            images=[portrait_image],
+        )
+
+        self.assertEqual(resolved, "gemini-3.0-pro-image-portrait")
 
 
 class VeoLiteGenerationHandlerTests(unittest.TestCase):
@@ -105,6 +156,14 @@ class VeoLiteGenerationHandlerTests(unittest.TestCase):
         self.assertEqual(cfg["upsample"]["model_key"], "veo_3_1_upsampler_1080p")
         self.assertEqual(cfg["upsample"]["resolution"], "VIDEO_RESOLUTION_1080P")
 
+    def test_explicit_8s_aliases_reuse_default_upstream_keys(self):
+        self.assertEqual(MODEL_CONFIG["veo_3_1_t2v_8s"]["model_key"], "veo_3_1_t2v")
+        self.assertEqual(MODEL_CONFIG["veo_3_1_i2v_s_8s"]["model_key"], "veo_3_1_i2v_s_fl")
+        self.assertEqual(
+            MODEL_CONFIG["veo_3_1_r2v_fast_ultra_8s"]["model_key"],
+            "veo_3_1_r2v_fast_landscape_ultra",
+        )
+
     def test_short_duration_models_include_explicit_landscape_aliases(self):
         expected_aliases = {
             "veo_3_1_t2v_landscape_4s": "veo_3_1_t2v_4s",
@@ -113,6 +172,24 @@ class VeoLiteGenerationHandlerTests(unittest.TestCase):
             "veo_3_1_i2v_s_landscape_6s": "veo_3_1_i2v_s_6s",
             "veo_3_1_t2v_landscape_4s_4k": "veo_3_1_t2v_4s_4k",
             "veo_3_1_i2v_s_landscape_6s_1080p": "veo_3_1_i2v_s_6s_1080p",
+        }
+
+        for alias, target in expected_aliases.items():
+            self.assertIn(alias, MODEL_CONFIG)
+            self.assertEqual(MODEL_CONFIG[alias], MODEL_CONFIG[target])
+
+    def test_default_duration_models_include_explicit_8s_aliases(self):
+        expected_aliases = {
+            "veo_3_1_t2v_landscape_8s": "veo_3_1_t2v_8s",
+            "veo_3_1_t2v_landscape_8s_4k": "veo_3_1_t2v_8s_4k",
+            "veo_3_1_t2v_lite_landscape_8s": "veo_3_1_t2v_lite_8s_landscape",
+            "veo_3_1_i2v_s_landscape_8s": "veo_3_1_i2v_s_8s",
+            "veo_3_1_i2v_s_landscape_8s_1080p": "veo_3_1_i2v_s_8s_1080p",
+            "veo_3_1_i2v_lite_landscape_8s": "veo_3_1_i2v_lite_8s_landscape",
+            "veo_3_1_interpolation_lite_landscape_8s": "veo_3_1_interpolation_lite_8s_landscape",
+            "veo_3_1_r2v_fast_landscape_8s": "veo_3_1_r2v_fast_8s",
+            "veo_3_1_r2v_fast_landscape_ultra_8s": "veo_3_1_r2v_fast_ultra_8s",
+            "veo_3_1_r2v_fast_landscape_ultra_relaxed_8s": "veo_3_1_r2v_fast_ultra_relaxed_8s",
         }
 
         for alias, target in expected_aliases.items():
@@ -227,6 +304,38 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
             result["operations"][0]["status"],
             "MEDIA_GENERATION_STATUS_PENDING",
         )
+
+
+class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = FlowClient(proxy_manager=None)
+        self.client._acquire_video_launch_gate = AsyncMock(return_value=(True, None, None))
+        self.client._release_video_launch_gate = AsyncMock()
+        self.client._get_recaptcha_token = AsyncMock(return_value=("recaptcha-token", "browser-1"))
+        self.client._notify_browser_captcha_request_finished = AsyncMock()
+
+    async def test_openai_history_reference_image_can_drive_aspect_ratio(self):
+        portrait_image = _make_image_bytes((900, 1600))
+        request = ChatCompletionRequest(
+            model="gemini-3.0-pro-image",
+            messages=[
+                ChatMessage(role="user", content="先生成一张图"),
+                ChatMessage(
+                    role="assistant",
+                    content="![cat](https://example.com/cat.png)",
+                ),
+                ChatMessage(role="user", content="基于上一张图继续编辑"),
+            ],
+        )
+
+        with patch(
+            "src.api.routes.retrieve_image_data",
+            new=AsyncMock(return_value=portrait_image),
+        ):
+            normalized = await _normalize_openai_request(request)
+
+        self.assertEqual(normalized.model, "gemini-3.0-pro-image-portrait")
+        self.assertEqual(len(normalized.images), 1)
 
     async def test_check_video_status_uses_media_payload_and_normalizes_response(self):
         captured = {}

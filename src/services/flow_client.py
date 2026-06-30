@@ -1394,6 +1394,56 @@ class FlowClient:
                 return candidate
         return None
 
+    def _extract_video_metadata_from_media(
+        self,
+        media: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        video = media.get("video") if isinstance(media.get("video"), dict) else {}
+        generated_video = video.get("generatedVideo") if isinstance(video.get("generatedVideo"), dict) else {}
+        request_data = (
+            media.get("mediaMetadata", {})
+            .get("requestData", {})
+            .get("videoGenerationRequestData", {})
+            if isinstance(media.get("mediaMetadata"), dict)
+            else {}
+        )
+        control_input = request_data.get("videoModelControlInput", {}) if isinstance(request_data, dict) else {}
+        dimensions = video.get("dimensions") if isinstance(video.get("dimensions"), dict) else {}
+
+        media_name = self._extract_media_name(media)
+        aspect_ratio = (
+            self._find_nested_string(generated_video, ("aspectRatio",))
+            or self._find_nested_string(video, ("aspectRatio", "videoAspectRatio"))
+            or self._find_nested_string(control_input, ("videoAspectRatio", "aspectRatio"))
+            or self._find_nested_string(media.get("mediaMetadata", {}), ("videoAspectRatio", "aspectRatio"))
+        )
+        model_name = (
+            self._find_nested_string(generated_video, ("model",))
+            or self._find_nested_string(control_input, ("videoModelName", "videoModelKey"))
+        )
+        duration = (
+            self._find_nested_string(dimensions, ("length", "duration"))
+            or self._find_nested_string(generated_video, ("length", "duration"))
+        )
+
+        video_metadata: Dict[str, Any] = {}
+        if media_name:
+            video_metadata["mediaName"] = media_name
+            video_metadata["mediaGenerationId"] = media_name
+        if aspect_ratio:
+            video_metadata["aspectRatio"] = aspect_ratio
+        if model_name:
+            video_metadata["model"] = model_name
+        if duration:
+            video_metadata["duration"] = duration
+
+        embedded_url = self._extract_video_url_from_media(media)
+        if embedded_url:
+            video_metadata["embeddedUrl"] = embedded_url
+            video_metadata["fifeUrl"] = embedded_url
+
+        return video_metadata
+
     def _media_to_video_operation(
         self,
         media: Dict[str, Any],
@@ -1434,18 +1484,7 @@ class FlowClient:
         if scene_id:
             operation["sceneId"] = scene_id
 
-        video_url = self._extract_video_url_from_media(media)
-        aspect_ratio = (
-            self._find_nested_string(video, ("aspectRatio", "videoAspectRatio"))
-            or self._find_nested_string(media.get("mediaMetadata", {}), ("videoAspectRatio", "aspectRatio"))
-        )
-        video_metadata: Dict[str, Any] = {}
-        if video_url:
-            video_metadata["fifeUrl"] = video_url
-        if media_name:
-            video_metadata["mediaGenerationId"] = media_name
-        if aspect_ratio:
-            video_metadata["aspectRatio"] = aspect_ratio
+        video_metadata = self._extract_video_metadata_from_media(media)
         if video_metadata:
             operation["operation"]["metadata"] = {"video": video_metadata}
 

@@ -400,8 +400,8 @@ async def _extract_prompt_and_images_from_gemini_contents(
     return prompt, images
 
 
-def _resolve_request_model(model: str, request: Any) -> str:
-    resolved_model = resolve_model_name(model=model, request=request, model_config=MODEL_CONFIG)
+def _resolve_request_model(model: str, request: Any, images: Optional[List[bytes]] = None) -> str:
+    resolved_model = resolve_model_name(model=model, request=request, model_config=MODEL_CONFIG, images=images)
     if resolved_model != model:
         debug_logger.log_info(f"[ROUTE] 模型名已转换: {model} → {resolved_model}")
     return resolved_model
@@ -429,8 +429,11 @@ async def _normalize_openai_request(
         )
         if request.image and not images:
             images.append(await _load_image_bytes_from_uri(request.image))
-        model = _resolve_request_model(request.model, request)
+        model = _resolve_request_model(request.model, request, images=images)
+        initial_image_count = len(images)
         images = await _append_openai_reference_images(model, request.messages, images)
+        if len(images) != initial_image_count:
+            model = _resolve_request_model(request.model, request, images=images)
         return NormalizedGenerationRequest(
             model=model,
             prompt=prompt,
@@ -455,8 +458,8 @@ async def _normalize_gemini_request(
     model: str,
     request: GeminiGenerateContentRequest,
 ) -> NormalizedGenerationRequest:
-    resolved_model = _resolve_request_model(model, request)
     prompt, images = await _extract_prompt_and_images_from_gemini_contents(request.contents)
+    resolved_model = _resolve_request_model(model, request, images=images)
     system_instruction = _extract_text_from_gemini_content(request.systemInstruction)
     model_config = MODEL_CONFIG.get(resolved_model)
     media_model = bool(model_config and model_config.get("type") in {"image", "video"})

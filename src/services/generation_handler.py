@@ -735,6 +735,33 @@ def _apply_veo_3_1_model_updates():
     def add_alias(alias: str, target: str):
         MODEL_CONFIG[alias] = dict(MODEL_CONFIG[target])
 
+    def add_default_duration_aliases(
+        base_alias: str,
+        landscape_target: str,
+        portrait_target: str,
+        *,
+        fl_suffix: bool = False,
+    ):
+        if fl_suffix:
+            add_alias(f"{base_alias}_8s_fl", landscape_target)
+            add_alias(f"{base_alias}_portrait_8s_fl", portrait_target)
+            add_alias(f"{base_alias}_landscape_8s_fl", landscape_target)
+            return
+
+        add_alias(f"{base_alias}_8s", landscape_target)
+        add_alias(f"{base_alias}_portrait_8s", portrait_target)
+        add_alias(f"{base_alias}_landscape_8s", landscape_target)
+
+    def add_default_duration_upsample_aliases(
+        base_alias: str,
+        resolution_name: str,
+        landscape_target: str,
+        portrait_target: str,
+    ):
+        add_alias(f"{base_alias}_8s_{resolution_name}", landscape_target)
+        add_alias(f"{base_alias}_portrait_8s_{resolution_name}", portrait_target)
+        add_alias(f"{base_alias}_landscape_8s_{resolution_name}", landscape_target)
+
     # Non-fast/non-lite Veo 3.1 aliases must call Quality upstream keys.
     MODEL_CONFIG["veo_3_1_t2v_landscape"].update({"model_key": "veo_3_1_t2v"})
     MODEL_CONFIG["veo_3_1_t2v_portrait"].update({"model_key": "veo_3_1_t2v_portrait"})
@@ -895,6 +922,87 @@ def _apply_veo_3_1_model_updates():
     add_alias("veo_3_1_r2v_fast_landscape_ultra_relaxed", "veo_3_1_r2v_fast_ultra_relaxed")
     add_alias("veo_3_1_r2v_fast_landscape_ultra_4k", "veo_3_1_r2v_fast_ultra_4k")
     add_alias("veo_3_1_r2v_fast_landscape_ultra_1080p", "veo_3_1_r2v_fast_ultra_1080p")
+
+    add_default_duration_aliases(
+        "veo_3_1_t2v_fast",
+        "veo_3_1_t2v_fast_landscape",
+        "veo_3_1_t2v_fast_portrait",
+    )
+    add_default_duration_aliases(
+        "veo_3_1_t2v",
+        "veo_3_1_t2v_landscape",
+        "veo_3_1_t2v_portrait",
+    )
+    add_default_duration_aliases(
+        "veo_3_1_i2v_s_fast",
+        "veo_3_1_i2v_s_fast_fl",
+        "veo_3_1_i2v_s_fast_portrait_fl",
+        fl_suffix=True,
+    )
+    add_default_duration_aliases(
+        "veo_3_1_i2v_s",
+        "veo_3_1_i2v_s_landscape",
+        "veo_3_1_i2v_s_portrait",
+    )
+    add_default_duration_aliases(
+        "veo_3_1_r2v_fast",
+        "veo_3_1_r2v_fast",
+        "veo_3_1_r2v_fast_portrait",
+    )
+    add_alias("veo_3_1_r2v_fast_ultra_8s", "veo_3_1_r2v_fast_ultra")
+    add_alias("veo_3_1_r2v_fast_portrait_ultra_8s", "veo_3_1_r2v_fast_portrait_ultra")
+    add_alias("veo_3_1_r2v_fast_landscape_ultra_8s", "veo_3_1_r2v_fast_ultra")
+    add_alias(
+        "veo_3_1_r2v_fast_ultra_relaxed_8s",
+        "veo_3_1_r2v_fast_ultra_relaxed",
+    )
+    add_alias(
+        "veo_3_1_r2v_fast_portrait_ultra_relaxed_8s",
+        "veo_3_1_r2v_fast_portrait_ultra_relaxed",
+    )
+    add_alias(
+        "veo_3_1_r2v_fast_landscape_ultra_relaxed_8s",
+        "veo_3_1_r2v_fast_ultra_relaxed",
+    )
+
+    add_alias("veo_3_1_t2v_lite_8s_landscape", "veo_3_1_t2v_lite_landscape")
+    add_alias("veo_3_1_t2v_lite_8s_portrait", "veo_3_1_t2v_lite_portrait")
+    add_alias("veo_3_1_t2v_lite_landscape_8s", "veo_3_1_t2v_lite_landscape")
+    add_alias("veo_3_1_t2v_lite_portrait_8s", "veo_3_1_t2v_lite_portrait")
+    add_alias("veo_3_1_i2v_lite_8s_landscape", "veo_3_1_i2v_lite_landscape")
+    add_alias("veo_3_1_i2v_lite_8s_portrait", "veo_3_1_i2v_lite_portrait")
+    add_alias("veo_3_1_i2v_lite_landscape_8s", "veo_3_1_i2v_lite_landscape")
+    add_alias("veo_3_1_i2v_lite_portrait_8s", "veo_3_1_i2v_lite_portrait")
+    add_alias(
+        "veo_3_1_interpolation_lite_8s_landscape",
+        "veo_3_1_interpolation_lite_landscape",
+    )
+    add_alias(
+        "veo_3_1_interpolation_lite_8s_portrait",
+        "veo_3_1_interpolation_lite_portrait",
+    )
+    add_alias(
+        "veo_3_1_interpolation_lite_landscape_8s",
+        "veo_3_1_interpolation_lite_landscape",
+    )
+    add_alias(
+        "veo_3_1_interpolation_lite_portrait_8s",
+        "veo_3_1_interpolation_lite_portrait",
+    )
+
+    for resolution_name in ("4k", "1080p"):
+        add_default_duration_upsample_aliases(
+            "veo_3_1_t2v",
+            resolution_name,
+            f"veo_3_1_t2v_{resolution_name}",
+            f"veo_3_1_t2v_portrait_{resolution_name}",
+        )
+        add_default_duration_upsample_aliases(
+            "veo_3_1_i2v_s",
+            resolution_name,
+            f"veo_3_1_i2v_s_{resolution_name}",
+            f"veo_3_1_i2v_s_portrait_{resolution_name}",
+        )
 
 
 _apply_veo_3_1_model_updates()
