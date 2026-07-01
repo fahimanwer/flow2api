@@ -211,6 +211,34 @@ MODEL_CONFIG = {
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
     },
 
+    # 图片生成 - HARBOR_SEAL (Nano Banana 2 Lite)
+    # 轻量版，仅支持 1K（无 2K/4K 放大），支持 5 种比例
+    "nano-banana-2-lite-landscape": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE"
+    },
+    "nano-banana-2-lite-portrait": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT"
+    },
+    "nano-banana-2-lite-square": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE"
+    },
+    "nano-banana-2-lite-four-three": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"
+    },
+    "nano-banana-2-lite-three-four": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"
+    },
+
     # ========== 文生视频 (T2V - Text to Video) ==========
     # 不支持上传图片，只使用文本提示词生成
 

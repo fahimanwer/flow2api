@@ -24,6 +24,8 @@ IMAGE_BASE_MODELS = {
     "gemini-3.0-pro-image": "gemini-3.0-pro-image",
     # Gemini 3.1 Flash (NARWHAL)
     "gemini-3.1-flash-image": "gemini-3.1-flash-image",
+    # Nano Banana 2 Lite (HARBOR_SEAL) - 轻量版，仅 1K
+    "nano-banana-2-lite": "nano-banana-2-lite",
     # Imagen 4.0 (IMAGEN_3_5)
     "imagen-4.0-generate-preview": "imagen-4.0-generate-preview",
 }
@@ -70,6 +72,13 @@ MODEL_SUPPORTED_ASPECTS = {
         "four-three",
         "three-four",
     ],
+    "nano-banana-2-lite": [
+        "landscape",
+        "portrait",
+        "square",
+        "four-three",
+        "three-four",
+    ],
     "imagen-4.0-generate-preview": ["landscape", "portrait"],
 }
 
@@ -77,6 +86,7 @@ MODEL_SUPPORTED_ASPECTS = {
 MODEL_SUPPORTED_SIZES = {
     "gemini-3.0-pro-image": ["2k", "4k"],
     "gemini-3.1-flash-image": ["2k", "4k"],
+    "nano-banana-2-lite": [],  # Lite 版仅 1K，不支持放大
     "imagen-4.0-generate-preview": [],  # 不支持放大
 }
 
