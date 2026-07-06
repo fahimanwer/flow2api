@@ -1,71 +1,13 @@
-const DEFAULTS = {
-  serverBase: "https://flow.ashuthefire.com",
-  apiKey: "han1234",
-  connectionToken: "fahim",
-  routeKey: "",
-  clientLabel: "",
-  refreshIntervalMinutes: 60,
-  tabMode: "persistent",
-  mintIntervalMs: 2000,
-  proxyAuto: true,
-  proxyUrl: ""
-};
-
+// Staff popup: status-only. Everything (server, key, token, residential proxy) is
+// baked in and automatic — there is intentionally nothing to configure here.
 const $ = (id) => document.getElementById(id);
-
-function setStatus(msg, ok) {
-  const el = $("status");
-  el.textContent = msg;
-  el.className = ok ? "ok" : "err";
-}
-
-function load() {
-  chrome.storage.local.get(DEFAULTS, (s) => {
-    $("serverBase").value = s.serverBase;
-    $("apiKey").value = s.apiKey;
-    $("connectionToken").value = s.connectionToken;
-    $("routeKey").value = s.routeKey;
-    $("clientLabel").value = s.clientLabel;
-    $("refreshIntervalMinutes").value = s.refreshIntervalMinutes;
-    $("tabMode").value = s.tabMode;
-    $("mintIntervalMs").value = s.mintIntervalMs;
-    $("proxyAuto").checked = s.proxyAuto !== false;
-    $("proxyUrl").value = s.proxyUrl;
-  });
-  renderLogs();
-}
-
-function save() {
-  const settings = {
-    serverBase: $("serverBase").value.trim().replace(/\/+$/, ""),
-    apiKey: $("apiKey").value.trim(),
-    connectionToken: $("connectionToken").value.trim(),
-    routeKey: $("routeKey").value.trim(),
-    clientLabel: $("clientLabel").value.trim(),
-    refreshIntervalMinutes: Math.max(5, parseInt($("refreshIntervalMinutes").value, 10) || 60),
-    tabMode: $("tabMode").value === "ephemeral" ? "ephemeral" : "persistent",
-    mintIntervalMs: Math.max(0, parseInt($("mintIntervalMs").value, 10) || 2000),
-    proxyAuto: $("proxyAuto").checked,
-    proxyUrl: $("proxyUrl").value.trim()
-  };
-  try { new URL(settings.serverBase); } catch (e) { setStatus("Server URL is invalid.", false); return; }
-  if (!settings.apiKey) { setStatus("API Key is required.", false); return; }
-  if (settings.proxyUrl && !/^(https?|socks5|socks4):\/\/.+:\d+\/?$/i.test(settings.proxyUrl)) {
-    setStatus("Proxy URL must look like http://user:pass@host:port", false); return;
-  }
-
-  chrome.storage.local.set(settings, () => {
-    chrome.runtime.sendMessage({ action: "settingsChanged" }, () => {});
-    setStatus("Saved. Reconnecting…", true);
-    setTimeout(renderLogs, 1500);
-  });
-}
 
 function renderLogs() {
   chrome.runtime.sendMessage({ action: "getLogs" }, (resp) => {
-    if (!resp || !resp.logs) return;
+    if (chrome.runtime.lastError || !resp || !resp.logs) return;
     const box = $("logs");
-    box.innerHTML = resp.logs.slice(0, 30).map((l) => {
+    if (!box) return;
+    box.innerHTML = resp.logs.slice(0, 25).map((l) => {
       const t = (l.ts || "").slice(11, 19);
       const d = l.details ? " " + JSON.stringify(l.details).slice(0, 120) : "";
       return `<div class="l-${l.level}">${t} ${l.message}${d}</div>`;
@@ -73,37 +15,37 @@ function renderLogs() {
   });
 }
 
+function setStatus(kind, text) {
+  const el = $("statusBig");
+  el.className = kind;
+  el.textContent = text;
+}
+
+function refreshStatus() {
+  chrome.runtime.sendMessage({ action: "getConnState" }, (r) => {
+    if (chrome.runtime.lastError) return;
+    if (r && r.connected) {
+      setStatus("connected", "✅ Connected — working automatically");
+    } else {
+      setStatus("disconnected", "Not connected yet — make sure you're signed in to Google Labs, then click Reconnect");
+    }
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
-  load();
-  $("saveBtn").addEventListener("click", save);
-  $("testBtn").addEventListener("click", () => {
-    setStatus("Reconnecting captcha socket…", true);
+  refreshStatus();
+  renderLogs();
+
+  $("reconnectBtn").addEventListener("click", () => {
+    setStatus("checking", "Reconnecting…");
+    // Reconnect the captcha socket, then push a fresh session (also reports this
+    // profile's residential IP + browser UA to the backend).
     chrome.runtime.sendMessage({ action: "testCaptchaConnection" }, () => {
-      // Poll the real socket state and report it (instead of leaving "Reconnecting…").
-      setTimeout(() => {
-        chrome.runtime.sendMessage({ action: "getConnState" }, (r) => {
-          if (r && r.connected) setStatus("Captcha socket connected ✓", true);
-          else setStatus("Socket not open yet — check logs below.", false);
-          renderLogs();
-        });
-      }, 2500);
+      chrome.runtime.sendMessage({ action: "refreshSessionNow" }, () => {
+        setTimeout(() => { refreshStatus(); renderLogs(); }, 2500);
+      });
     });
   });
-  $("refreshBtn").addEventListener("click", () => {
-    setStatus("Refreshing session…", true);
-    chrome.runtime.sendMessage({ action: "refreshSessionNow" }, (r) => {
-      if (r && r.success) setStatus("Session pushed ✓ " + (r.message || ""), true);
-      else setStatus("Session refresh failed: " + ((r && r.error) || "?"), false);
-      renderLogs();
-    });
-  });
-  $("disableProxyBtn").addEventListener("click", () => {
-    chrome.runtime.sendMessage({ action: "disableProxy" }, () => {
-      $("proxyAuto").checked = false;
-      $("proxyUrl").value = "";
-      setStatus("Proxy disabled (direct egress).", true);
-      setTimeout(renderLogs, 800);
-    });
-  });
-  setInterval(renderLogs, 4000);
+
+  setInterval(() => { refreshStatus(); renderLogs(); }, 4000);
 });

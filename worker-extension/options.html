@@ -5,88 +5,34 @@
   <title>Flow2API Worker</title>
   <style>
     :root { color-scheme: light dark; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; width: 380px; margin: 0; padding: 16px; background: #0f1115; color: #e8eaed; }
-    h1 { font-size: 16px; margin: 0 0 4px; }
-    .sub { font-size: 11px; color: #9aa0a6; margin: 0 0 14px; }
-    label { display: block; font-size: 12px; font-weight: 600; margin: 12px 0 4px; }
-    .hint { font-size: 10.5px; color: #9aa0a6; margin: 2px 0 0; }
-    input[type="text"], input[type="password"], input[type="number"], select {
-      width: 100%; box-sizing: border-box; padding: 8px; border-radius: 8px;
-      border: 1px solid #2a2f3a; background: #161922; color: #e8eaed; font-size: 13px;
-    }
-    .row { display: flex; gap: 8px; }
-    .row > div { flex: 1; }
-    .btns { display: flex; gap: 8px; margin-top: 16px; }
-    button { flex: 1; padding: 9px; border-radius: 8px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; }
-    .primary { background: #3b6cf6; color: #fff; }
-    .ghost { background: #21262f; color: #e8eaed; }
-    #status { margin-top: 10px; font-size: 12px; min-height: 16px; }
-    .ok { color: #46d369; } .err { color: #f06262; }
-    .logs { margin-top: 14px; max-height: 160px; overflow:auto; background:#0b0d12; border:1px solid #2a2f3a; border-radius:8px; padding:8px; font-size:11px; line-height:1.5; }
-    .logs .l-SUCCESS { color:#46d369; } .logs .l-ERROR { color:#f06262; } .logs .l-INFO { color:#9aa0a6; }
-    .pill { display:inline-block; font-size:10px; padding:1px 6px; border-radius:10px; background:#21262f; margin-left:6px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; width: 300px; margin: 0; padding: 18px; background: #0f1115; color: #e8eaed; text-align: center; }
+    h1 { font-size: 15px; margin: 0 0 14px; font-weight: 600; }
+    #statusBig { font-size: 15px; font-weight: 600; padding: 14px 10px; border-radius: 10px; background: #161922; border: 1px solid #2a2f3a; line-height: 1.35; }
+    #statusBig.connected { color: #46d369; border-color: #22432b; background: #10231a; }
+    #statusBig.disconnected { color: #f0b562; border-color: #4a3a1f; background: #241d10; }
+    #statusBig.checking { color: #9aa0a6; }
+    .note { font-size: 12px; color: #b6bcc4; margin: 14px 2px 0; line-height: 1.5; }
+    .note b { color: #e8eaed; }
+    button { margin-top: 16px; width: 100%; padding: 10px; border-radius: 8px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; background: #3b6cf6; color: #fff; }
+    details { margin-top: 16px; text-align: left; }
+    summary { font-size: 11px; color: #6b7280; cursor: pointer; outline: none; }
+    .logs { margin-top: 8px; max-height: 150px; overflow: auto; background: #0b0d12; border: 1px solid #2a2f3a; border-radius: 8px; padding: 8px; font-size: 10.5px; line-height: 1.5; }
+    .logs .l-SUCCESS { color: #46d369; } .logs .l-ERROR { color: #f06262; } .logs .l-INFO, .logs .l-WARN { color: #9aa0a6; }
   </style>
 </head>
 <body>
   <h1>Flow2API Worker</h1>
-  <p class="sub">Supplies real-browser reCAPTCHA tokens + keeps the Google Labs login fresh. Keep a Labs tab logged in.</p>
 
-  <label for="serverBase">Server URL</label>
-  <input type="text" id="serverBase" placeholder="https://flow.ashuthefire.com" />
-  <p class="hint">Base URL only — the captcha socket and token endpoint are derived from it.</p>
+  <div id="statusBig" class="checking">Checking…</div>
 
-  <div class="row">
-    <div>
-      <label for="apiKey">API Key</label>
-      <input type="password" id="apiKey" placeholder="Flow2API API key" />
-    </div>
-    <div>
-      <label for="connectionToken">Connection Token</label>
-      <input type="text" id="connectionToken" placeholder="plugin token" />
-    </div>
-  </div>
+  <p class="note">Runs automatically. <b>Just keep this Chrome signed in to Google&nbsp;Labs.</b><br />Nothing to set up.</p>
 
-  <label for="routeKey">Route Key <span class="pill">unique per laptop</span></label>
-  <input type="text" id="routeKey" placeholder="e.g. account email or laptop id (leave empty for default)" />
-  <p class="hint">Must match this account's token's <b>extension_route_key</b> in the admin panel. Leave empty if the account's token has no route key.</p>
+  <button id="reconnectBtn">Reconnect</button>
 
-  <div class="row">
-    <div>
-      <label for="clientLabel">Client Label</label>
-      <input type="text" id="clientLabel" placeholder="e.g. staff-01" />
-    </div>
-    <div>
-      <label for="refreshIntervalMinutes">Session refresh (min)</label>
-      <input type="number" id="refreshIntervalMinutes" min="5" max="1440" value="60" />
-    </div>
-  </div>
-
-  <label for="tabMode">reCAPTCHA tab mode</label>
-  <select id="tabMode">
-    <option value="persistent">Persistent — keep one hidden tab, reuse it (fast, low churn)</option>
-    <option value="ephemeral">Per generation — open &amp; close a tab each time</option>
-  </select>
-
-  <label for="mintIntervalMs">Captcha pacing (ms between mints)</label>
-  <input type="number" id="mintIntervalMs" min="0" max="10000" value="2000" />
-  <p class="hint">Higher = slower minting but fewer <b>TOO_MUCH_TRAFFIC</b> rate flags under heavy load. 0 = none. ~2000 ≈ ≤30/min.</p>
-
-  <label><input type="checkbox" id="proxyAuto" style="width:auto;vertical-align:middle;margin-right:6px" /> Auto per-profile proxy <span class="pill">random IP · no setup</span></label>
-  <p class="hint">ON (default): this profile auto-gets its OWN static IP (one of the proxy's IPs), so it mints reCAPTCHA from a different IP than your other profiles — zero setup. <b>Only the Flow site + reCAPTCHA URLs are proxied</b>; your normal browsing (Google search, everything else) and the backend stay direct. If a profile gets a Google "verify it's you", re-login through it (or turn this off to revert).</p>
-
-  <label for="proxyUrl">Proxy override (optional)</label>
-  <input type="text" id="proxyUrl" placeholder="http://user:pass@host:port — blank = use Auto" />
-  <p class="hint">Leave blank to use Auto above. Set a URL only to pin a specific proxy/session for this profile.</p>
-
-  <div class="btns">
-    <button class="primary" id="saveBtn">Save</button>
-    <button class="ghost" id="testBtn">Reconnect</button>
-    <button class="ghost" id="refreshBtn">Refresh session now</button>
-    <button class="ghost" id="disableProxyBtn">Disable proxy</button>
-  </div>
-  <div id="status"></div>
-
-  <div class="logs" id="logs"></div>
+  <details>
+    <summary>Details (for support)</summary>
+    <div class="logs" id="logs"></div>
+  </details>
 
   <script src="options.js"></script>
 </body>

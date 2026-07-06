@@ -93,7 +93,10 @@ function getSettings() {
         refreshIntervalMinutes: Math.max(5, parseInt(stored.refreshIntervalMinutes, 10) || 60),
         tabMode: stored.tabMode === "ephemeral" ? "ephemeral" : "persistent",
         mintIntervalMs: Math.max(0, parseInt(stored.mintIntervalMs, 10) || 2000),
-        proxyAuto: stored.proxyAuto !== false,
+        // Residential proxy is ALWAYS on for staff builds: the backend redeems the
+        // generate call from the same residential IP the extension minted from, so a
+        // profile stuck on "direct egress" would break reCAPTCHA alignment. Not toggleable.
+        proxyAuto: true,
         proxyUrl: (stored.proxyUrl || "").trim()
       });
     });
