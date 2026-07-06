@@ -2464,6 +2464,10 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     # the redeem). Only auto-bind an empty or previously-auto ('auto-…') key — never
     # clobber an explicit admin-set Route Key.
     reported_route_key = (request.get("route_key") or "").strip() or None
+    # Two-pool routing: the extension's "Failed-image mode" switch. 'failed_image' reserves
+    # this account for staff-driven failed-image regeneration (excluded from the auto pool).
+    _pm = request.get("pool_mode")
+    reported_pool_mode = _pm if _pm in ("auto", "failed_image") else None
 
     # Step 1: Convert ST to AT to get user info (including email)
     try:
@@ -2533,6 +2537,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 _cur_rk = (existing_token.extension_route_key or "").strip()
                 if not _cur_rk or _cur_rk.startswith("auto-"):
                     _redeem_updates["extension_route_key"] = reported_route_key
+            if reported_pool_mode is not None:
+                _redeem_updates["pool_mode"] = reported_pool_mode
             if _redeem_updates:
                 await db.update_token(existing_token.id, **_redeem_updates)
                 debug_logger.event(
@@ -2583,6 +2589,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 _redeem_updates["browser_user_agent"] = reported_user_agent
             if reported_route_key:
                 _redeem_updates["extension_route_key"] = reported_route_key
+            if reported_pool_mode is not None:
+                _redeem_updates["pool_mode"] = reported_pool_mode
             if _redeem_updates:
                 await db.update_token(new_token.id, **_redeem_updates)
 

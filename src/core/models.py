@@ -50,6 +50,10 @@ class Token(BaseModel):
     redeem_proxy_url: Optional[str] = None  # per-account residential proxy for the generate call
     browser_user_agent: Optional[str] = None  # the extension browser's real User-Agent
 
+    # Two-pool routing: 'auto' (normal article images) or 'failed_image' (staff-driven
+    # failed-image regeneration). Reported by the extension's "Failed-image mode" switch.
+    pool_mode: Optional[str] = "auto"
+
     # 429禁用相关
     ban_reason: Optional[str] = None  # 禁用原因: "429_rate_limit" 或 None
     banned_at: Optional[datetime] = None  # 禁用时间

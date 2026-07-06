@@ -477,6 +477,7 @@ class Database:
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
                     ("redeem_proxy_url", "TEXT"),  # Slice B: per-account residential redeem proxy
                     ("browser_user_agent", "TEXT"),  # Slice B: extension browser real UA
+                    ("pool_mode", "TEXT DEFAULT 'auto'"),  # 'auto' | 'failed_image' (two-pool routing)
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -640,7 +641,8 @@ class Database:
                     ban_reason TEXT,
                     banned_at TIMESTAMP,
                     redeem_proxy_url TEXT,
-                    browser_user_agent TEXT
+                    browser_user_agent TEXT,
+                    pool_mode TEXT DEFAULT 'auto'
                 )
             """)
 

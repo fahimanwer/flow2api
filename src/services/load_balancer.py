@@ -14,6 +14,25 @@ from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
 
 
+def _token_pool(token) -> str:
+    return (getattr(token, "pool_mode", None) or "auto")
+
+
+def select_pool(tokens, pool: str):
+    """Restrict tokens to the requested pool (two-pool routing).
+
+    - 'auto' (default, the automatic article pipeline): use ONLY 'auto' accounts, so
+      'failed_image' accounts are RESERVED (never drained by the factory).
+    - 'failed_image' (staff-driven failed-image regeneration): use 'failed_image' accounts;
+      if none are active, fall back to 'auto' accounts so failed images still process when
+      nobody has flipped their extension into Failed-image mode.
+    """
+    if pool == "failed_image":
+        reserved = [t for t in tokens if _token_pool(t) == "failed_image"]
+        return reserved if reserved else [t for t in tokens if _token_pool(t) == "auto"]
+    return [t for t in tokens if _token_pool(t) == "auto"]
+
+
 class LoadBalancer:
     """Token load balancer with load-aware selection"""
 
@@ -145,6 +164,7 @@ class LoadBalancer:
         reserve: bool = False,
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
+        pool: str = "auto",
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -174,7 +194,9 @@ class LoadBalancer:
         await self.token_manager._ensure_quota_loaded()
 
         active_tokens = await self.token_manager.get_active_tokens()
-        debug_logger.log_info(f"[LOAD_BALANCER] 获取到 {len(active_tokens)} 个活跃Token")
+        # Two-pool routing: keep failed_image accounts out of the auto pool (and vice versa).
+        active_tokens = select_pool(active_tokens, pool)
+        debug_logger.log_info(f"[LOAD_BALANCER] 获取到 {len(active_tokens)} 个活跃Token (pool={pool})")
 
         if not active_tokens:
             debug_logger.log_info(f"[LOAD_BALANCER] ❌ 没有活跃的Token")
@@ -330,10 +352,11 @@ class LoadBalancer:
         for_image_generation: bool = False,
         for_video_generation: bool = False,
         model: Optional[str] = None,
+        pool: str = "auto",
     ) -> Optional[str]:
         """给出更明确的“无可用账号”原因，优先用于分辨率/tier 档位提示。"""
         await self.token_manager._ensure_quota_loaded()
-        active_tokens = await self.token_manager.get_active_tokens()
+        active_tokens = select_pool(await self.token_manager.get_active_tokens(), pool)
         if not active_tokens:
             return (
                 "No active account is available — every account is currently disabled, "

@@ -13,6 +13,11 @@
     #statusBig.checking { color: #9aa0a6; }
     .note { font-size: 12px; color: #b6bcc4; margin: 14px 2px 0; line-height: 1.5; }
     .note b { color: #e8eaed; }
+    .switchrow { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 16px; font-size: 13px; font-weight: 600; }
+    .switchrow input { width: 16px; height: 16px; }
+    .switchhint { font-size: 11px; color: #9aa0a6; margin: 6px 2px 0; line-height: 1.4; }
+    #failedModeState { font-weight: 600; }
+    #failedModeState.on { color: #f0b562; }
     button { margin-top: 16px; width: 100%; padding: 10px; border-radius: 8px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; background: #3b6cf6; color: #fff; }
     details { margin-top: 16px; text-align: left; }
     summary { font-size: 11px; color: #6b7280; cursor: pointer; outline: none; }
@@ -26,6 +31,12 @@
   <div id="statusBig" class="checking">Checking…</div>
 
   <p class="note">Runs automatically. <b>Just keep this Chrome signed in to Google&nbsp;Labs.</b><br />Nothing to set up.</p>
+
+  <label class="switchrow">
+    <input type="checkbox" id="failedImageMode" />
+    <span>Failed-image mode: <span id="failedModeState">Off</span></span>
+  </label>
+  <p class="switchhint">Turn ON while you fix failed images — this account is then used <b>only</b> for failed images and kept out of the automatic article generation.</p>
 
   <button id="reconnectBtn">Reconnect</button>
 

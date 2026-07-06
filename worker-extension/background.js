@@ -97,7 +97,11 @@ function getSettings() {
         // generate call from the same residential IP the extension minted from, so a
         // profile stuck on "direct egress" would break reCAPTCHA alignment. Not toggleable.
         proxyAuto: true,
-        proxyUrl: (stored.proxyUrl || "").trim()
+        proxyUrl: (stored.proxyUrl || "").trim(),
+        // "Failed-image mode" switch: when ON this account is reserved for staff-driven
+        // failed-image regeneration (reported as pool_mode=failed_image, kept out of the
+        // automatic article pool).
+        failedImageMode: stored.failedImageMode === true
       });
       const explicit = (stored.routeKey || "").trim();
       if (explicit) return build(explicit);
@@ -785,7 +789,7 @@ async function connectWS() {
     if (ws !== socket) { try { socket.close(); } catch (_) {} return; }
     connecting = false;
     log("SUCCESS", "Captcha WebSocket connected", { routeKey: settings.routeKey || "(empty)" });
-    sendWS({ type: "register", route_key: settings.routeKey, client_label: settings.clientLabel }, socket);
+    sendWS({ type: "register", route_key: settings.routeKey, client_label: settings.clientLabel, pool_mode: settings.failedImageMode ? "failed_image" : "auto" }, socket);
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(() => sendWS({ type: "ping" }, socket), HEARTBEAT_MS);
     // Warm the persistent tab so the first real request is fast (login-aware).
@@ -1003,6 +1007,8 @@ async function refreshSession(token_id = null) {
     // Bind this account to THIS device so its captcha minting routes back here (same
     // residential IP as the redeem). Uses the stable per-profile route key.
     if (settings.routeKey) pushBody.route_key = settings.routeKey;
+    // Two-pool routing: report this profile's pool from the "Failed-image mode" switch.
+    pushBody.pool_mode = settings.failedImageMode ? "failed_image" : "auto";
 
     const resp = await fetch(updateUrl, {
       method: "POST",

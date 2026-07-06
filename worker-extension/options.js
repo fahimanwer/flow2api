@@ -32,9 +32,35 @@ function refreshStatus() {
   });
 }
 
+function loadFailedMode() {
+  chrome.storage.local.get(["failedImageMode"], ({ failedImageMode }) => {
+    const on = failedImageMode === true;
+    $("failedImageMode").checked = on;
+    const s = $("failedModeState");
+    s.textContent = on ? "ON" : "Off";
+    s.className = on ? "on" : "";
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   refreshStatus();
   renderLogs();
+  loadFailedMode();
+
+  $("failedImageMode").addEventListener("change", (e) => {
+    const on = e.target.checked;
+    const s = $("failedModeState");
+    s.textContent = on ? "ON" : "Off";
+    s.className = on ? "on" : "";
+    // Persist, reconnect (re-register with the new pool), and push the session now so the
+    // backend updates this account's pool immediately.
+    chrome.storage.local.set({ failedImageMode: on }, () => {
+      chrome.runtime.sendMessage({ action: "settingsChanged" }, () => {});
+      chrome.runtime.sendMessage({ action: "refreshSessionNow" }, () => {
+        setTimeout(() => { refreshStatus(); renderLogs(); }, 1500);
+      });
+    });
+  });
 
   $("reconnectBtn").addEventListener("click", () => {
     setStatus("checking", "Reconnecting…");

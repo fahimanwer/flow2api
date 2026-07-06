@@ -1167,6 +1167,7 @@ class GenerationHandler:
         stream: bool = False,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        pool: str = "auto",
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1243,6 +1244,7 @@ class GenerationHandler:
                 reserve=False,
                 enforce_concurrency_filter=False,
                 track_pending=True,
+                pool=pool,
             )
         else:
             token = await self.load_balancer.select_token(
@@ -1251,6 +1253,7 @@ class GenerationHandler:
                 reserve=False,
                 enforce_concurrency_filter=False,
                 track_pending=True,
+                pool=pool,
             )
         perf_trace["token_select_ms"] = int((time.time() - token_select_started_at) * 1000)
 
@@ -1261,6 +1264,7 @@ class GenerationHandler:
                     for_image_generation=(generation_type == "image"),
                     for_video_generation=(generation_type == "video"),
                     model=model,
+                    pool=pool,
                 )
             if not error_msg:
                 error_msg = self._get_no_token_error_message(generation_type)

@@ -490,6 +490,7 @@ async def _collect_non_stream_result(
     images: List[bytes],
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
+    pool: str = "auto",
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -500,6 +501,7 @@ async def _collect_non_stream_result(
         stream=False,
         base_url_override=base_url_override,
         video_media_id=video_media_id,
+        pool=pool,
     ):
         result = chunk
 
@@ -720,6 +722,7 @@ async def _convert_openai_stream_chunk_to_gemini_event(
 async def _iterate_openai_stream(
     normalized: NormalizedGenerationRequest,
     base_url_override: Optional[str] = None,
+    pool: str = "auto",
 ):
     handler = _ensure_generation_handler()
     async for chunk in handler.handle_generation(
@@ -729,6 +732,7 @@ async def _iterate_openai_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        pool=pool,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -864,9 +868,14 @@ async def create_chat_completion(
 
         request_base_url = _get_request_base_url(raw_request)
 
+        # Two-pool routing: X-Flow-Pool=failed_image routes this request to the reserved
+        # failed-image account pool (staff regeneration). Anything else => the auto pool.
+        pool = "failed_image" if (raw_request.headers.get("x-flow-pool", "").strip().lower()
+                                  == "failed_image") else "auto"
+
         if request.stream:
             return StreamingResponse(
-                _iterate_openai_stream(normalized, request_base_url),
+                _iterate_openai_stream(normalized, request_base_url, pool=pool),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -882,6 +891,7 @@ async def create_chat_completion(
                 normalized.images,
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
+                pool=pool,
             )
         )
         return _build_openai_json_response(payload)
