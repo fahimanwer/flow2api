@@ -133,6 +133,8 @@ class TokenManager:
         # that exhausted one model stays usable for the others — only the specific
         # model is paused here (in memory; cleared on restart). See [[per-model quota]].
         self._model_quota_until: dict[tuple, datetime] = {}
+        # One-time lazy load of persisted cooldowns (survives restarts). See #3.
+        self._quota_loaded = False
 
     # Short cooldown for a generic/ambiguous rate-limit (could be transient).
     MODEL_QUOTA_COOLDOWN_MINUTES = 30
@@ -153,14 +155,35 @@ class TokenManager:
             # midnight; 12h avoids all-day re-probing without over-holding a false positive).
             return datetime.now(timezone.utc) + timedelta(hours=12)
 
-    def mark_model_quota_exhausted(
+    async def _ensure_quota_loaded(self):
+        """Lazily load persisted per-model cooldowns into memory once (survives restart)."""
+        if self._quota_loaded:
+            return
+        self._quota_loaded = True  # set first so a load error doesn't retry every call
+        try:
+            rows = await self.db.get_active_model_quota_cooldowns()
+            for token_id, model_key, until_iso in rows:
+                try:
+                    until = datetime.fromisoformat(until_iso)
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                    self._model_quota_until[(token_id, model_key)] = until
+                except Exception:
+                    continue
+            if rows:
+                debug_logger.event(f"[MODEL_QUOTA] loaded {len(rows)} persisted cooldown(s)")
+        except Exception as e:
+            debug_logger.op_warning(f"[MODEL_QUOTA] could not load persisted cooldowns: {e}")
+
+    async def mark_model_quota_exhausted(
         self, token_id: int, model: Optional[str], error_message: Optional[str] = None
     ):
         """Pause ONLY this model for this token after a per-model quota error.
 
         A DAILY quota hit is paused until the next Pacific-time reset (so we don't keep
         probing an exhausted model every 30 min all day and rack up 429s that look like
-        abusive traffic). Anything ambiguous keeps the short cooldown.
+        abusive traffic). Anything ambiguous keeps the short cooldown. Persisted so the
+        pause survives a redeploy/restart.
         """
         key = model_quota_key(model)
         if not key:
@@ -173,6 +196,10 @@ class TokenManager:
             until = datetime.now(timezone.utc) + timedelta(minutes=self.MODEL_QUOTA_COOLDOWN_MINUTES)
             scope = f"{self.MODEL_QUOTA_COOLDOWN_MINUTES}m"
         self._model_quota_until[(token_id, key)] = until
+        try:
+            await self.db.upsert_model_quota_cooldown(token_id, key, until)
+        except Exception as e:
+            debug_logger.op_warning(f"[MODEL_QUOTA] could not persist cooldown: {e}")
         debug_logger.event(
             f"[MODEL_QUOTA] token={token_id} model='{key}' quota exhausted; paused {scope} "
             f"(other models stay active)"
@@ -361,9 +388,20 @@ class TokenManager:
         # Reset error count when enabling (only reset total error_count, keep today_error_count)
         await self.db.reset_error_count(token_id)
 
-    async def disable_token(self, token_id: int):
-        """Disable a token"""
-        await self.db.update_token(token_id, is_active=False)
+    # Disable reasons the system set automatically. A token disabled for one of these
+    # is eligible to be auto-re-enabled when a fresh session is pushed (the credential
+    # is healthy again). A MANUAL disable leaves ban_reason NULL and is never auto-revived.
+    AUTO_DISABLE_REASONS = ("auto_st_expired", "auto_error", "429_rate_limit")
+
+    async def disable_token(self, token_id: int, reason: Optional[str] = None):
+        """Disable a token. `reason` records WHY: pass an auto_* reason for automatic
+        disables (so a later session push can auto-recover it); leave None for a manual
+        disable (ban_reason stays NULL → never auto-revived)."""
+        fields = {"is_active": False}
+        if reason is not None:
+            fields["ban_reason"] = reason
+            fields["banned_at"] = datetime.now(timezone.utc)
+        await self.db.update_token(token_id, **fields)
 
     # ========== Token添加 (支持Project创建) ==========
 
@@ -599,10 +637,11 @@ class TokenManager:
             # Only a confirmed credential failure removes the token from the
             # pool. Transient network errors leave it enabled to be retried.
             if disable_on_failure and outcome.reason == "st_expired":
-                debug_logger.log_error(
-                    f"[AT_REFRESH] Token {token.id}: ST expired, disabling token"
+                debug_logger.op_warning(
+                    f"[AT_REFRESH] token={token.id} ST expired → disabling (auto_st_expired; "
+                    f"auto-recovers on next session push)"
                 )
-                await self.disable_token(token.id)
+                await self.disable_token(token.id, reason="auto_st_expired")
             return None
 
         return await self.db.get_token(token.id)
@@ -929,7 +968,7 @@ class TokenManager:
             # stays active and keeps serving every other model (which have their own
             # separate daily quotas). Do NOT disable the whole token. Daily quota is
             # paused until the PT reset (see mark_model_quota_exhausted).
-            self.mark_model_quota_exhausted(token_id, model, error_message)
+            await self.mark_model_quota_exhausted(token_id, model, error_message)
             return
 
         await self.db.increment_token_stats(token_id, "error")

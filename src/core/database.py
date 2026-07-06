@@ -3,7 +3,7 @@ import asyncio
 import aiosqlite
 import json
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
@@ -860,6 +860,17 @@ class Database:
             # Token stats lookup index
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_stats_token_id ON token_stats(token_id)")
 
+            # Per-(token, model) daily-quota cooldowns. Persisted so a redeploy doesn't
+            # forget which models are spent and re-probe them (429 bursts look abusive).
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS model_quota_cooldowns (
+                    token_id INTEGER NOT NULL,
+                    model_key TEXT NOT NULL,
+                    until TIMESTAMP NOT NULL,
+                    PRIMARY KEY (token_id, model_key)
+                )
+            """)
+
             await db.commit()
 
     async def _migrate_request_logs(self, db):
@@ -1097,6 +1108,26 @@ class Database:
                 query = f"UPDATE tokens SET {', '.join(updates)} WHERE id = ?"
                 await db.execute(query, params)
                 await db.commit()
+
+    # ---- Per-(token, model) daily-quota cooldown persistence (see TokenManager) ----
+    async def upsert_model_quota_cooldown(self, token_id: int, model_key: str, until: datetime):
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "INSERT INTO model_quota_cooldowns (token_id, model_key, until) VALUES (?, ?, ?) "
+                "ON CONFLICT(token_id, model_key) DO UPDATE SET until = excluded.until",
+                (token_id, model_key, until.isoformat()),
+            )
+            await db.commit()
+
+    async def get_active_model_quota_cooldowns(self) -> List[tuple]:
+        """Return (token_id, model_key, until_iso) rows whose cooldown hasn't elapsed."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT token_id, model_key, until FROM model_quota_cooldowns WHERE until > ?",
+                (now_iso,),
+            )
+            return [tuple(row) for row in await cursor.fetchall()]
 
     async def delete_token(self, token_id: int):
         """Delete token and related data"""

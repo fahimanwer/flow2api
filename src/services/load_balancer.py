@@ -170,6 +170,9 @@ class LoadBalancer:
             f"视频生成={for_video_generation}, 模型={model}, 预占槽位={reserve})"
         )
 
+        # Ensure persisted per-model quota cooldowns are loaded before we filter on them.
+        await self.token_manager._ensure_quota_loaded()
+
         active_tokens = await self.token_manager.get_active_tokens()
         debug_logger.log_info(f"[LOAD_BALANCER] 获取到 {len(active_tokens)} 个活跃Token")
 
@@ -329,6 +332,7 @@ class LoadBalancer:
         model: Optional[str] = None,
     ) -> Optional[str]:
         """给出更明确的“无可用账号”原因，优先用于分辨率/tier 档位提示。"""
+        await self.token_manager._ensure_quota_loaded()
         active_tokens = await self.token_manager.get_active_tokens()
         if not active_tokens:
             return (

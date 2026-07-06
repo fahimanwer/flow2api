@@ -2531,9 +2531,17 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                     f"proxy={mask_proxy_url(reported_proxy_url)} ua_set={reported_user_agent is not None}"
                 )
 
-            # Check if auto-enable is enabled and token is disabled
-            if plugin_config.auto_enable_on_update and not existing_token.is_active:
+            # Auto-recover a disabled account. A fresh session push means the credential
+            # is healthy again, so if the account was AUTO-disabled (auto_* reason, e.g.
+            # ST expiry) we re-enable it. A MANUALLY disabled account (ban_reason NULL) is
+            # only revived when the admin opted into the broad auto_enable_on_update.
+            auto_disabled = (existing_token.ban_reason or "") in token_manager.AUTO_DISABLE_REASONS
+            if not existing_token.is_active and (auto_disabled or plugin_config.auto_enable_on_update):
                 await token_manager.enable_token(existing_token.id)
+                debug_logger.event(
+                    f"[TOKEN] auto-re-enabled token={existing_token.id} ({email}) "
+                    f"was={existing_token.ban_reason or 'manual'}"
+                )
                 return {
                     "success": True,
                     "message": f"Token updated and auto-enabled for {email}",
