@@ -133,11 +133,26 @@ class TokenManager:
         # that exhausted one model stays usable for the others — only the specific
         # model is paused here (in memory; cleared on restart). See [[per-model quota]].
         self._model_quota_until: dict[tuple, datetime] = {}
+        # Per-account reCAPTCHA/anti-bot progressive cooldown: token_id -> (until, strikes).
+        # Retained after expiry (NOT popped) so strikes escalate on a repeat failure;
+        # cleared only on success, or decayed inside mark_recaptcha_failure.
+        self._recaptcha_cd: dict[int, tuple] = {}
         # One-time lazy load of persisted cooldowns (survives restarts). See #3.
         self._quota_loaded = False
 
     # Short cooldown for a generic/ambiguous rate-limit (could be transient).
     MODEL_QUOTA_COOLDOWN_MINUTES = 30
+
+    # Per-ACCOUNT progressive cooldown for reCAPTCHA / "unusual activity" failures.
+    # Unlike quota (per-model), an anti-bot rejection reflects the account's IP/session
+    # REPUTATION, so the WHOLE token is paused across every model. Each consecutive strike
+    # escalates the pause (seconds, capped at the last value); a success resets it. Backing
+    # off — instead of re-picking a flagged account every few seconds and racking up more
+    # rejections — is what lets Google's reCAPTCHA score recover and stops the spiral.
+    RECAPTCHA_BACKOFF_SECONDS = (60, 180, 300, 600, 900, 1800)  # strike 1..6+, capped
+    # If the previous cooldown ended more than this ago, the next failure is treated as a
+    # fresh strike-1 (an occasional blip) rather than a continuation of an old burst.
+    RECAPTCHA_STRIKE_DECAY = timedelta(minutes=30)
 
     def _next_pt_daily_reset(self) -> datetime:
         """Next Google-Flow daily-quota reset = next midnight America/Los_Angeles (PT),
@@ -156,7 +171,8 @@ class TokenManager:
             return datetime.now(timezone.utc) + timedelta(hours=12)
 
     async def _ensure_quota_loaded(self):
-        """Lazily load persisted per-model cooldowns into memory once (survives restart)."""
+        """Lazily load ALL persisted cooldowns into memory once (survives restart):
+        per-model quota cooldowns AND per-account reCAPTCHA cooldowns."""
         if self._quota_loaded:
             return
         self._quota_loaded = True  # set first so a load error doesn't retry every call
@@ -174,6 +190,20 @@ class TokenManager:
                 debug_logger.event(f"[MODEL_QUOTA] loaded {len(rows)} persisted cooldown(s)")
         except Exception as e:
             debug_logger.op_warning(f"[MODEL_QUOTA] could not load persisted cooldowns: {e}")
+        try:
+            rc_rows = await self.db.get_active_recaptcha_cooldowns()
+            for token_id, until_iso, strikes in rc_rows:
+                try:
+                    until = datetime.fromisoformat(until_iso)
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                    self._recaptcha_cd[token_id] = (until, int(strikes))
+                except Exception:
+                    continue
+            if rc_rows:
+                debug_logger.event(f"[RECAPTCHA_CD] loaded {len(rc_rows)} persisted cooldown(s)")
+        except Exception as e:
+            debug_logger.op_warning(f"[RECAPTCHA_CD] could not load persisted cooldowns: {e}")
 
     async def mark_model_quota_exhausted(
         self, token_id: int, model: Optional[str], error_message: Optional[str] = None
@@ -217,6 +247,57 @@ class TokenManager:
             self._model_quota_until.pop((token_id, key), None)
             return False
         return True
+
+    async def mark_recaptcha_failure(self, token_id: int) -> None:
+        """Progressive per-account cooldown after a reCAPTCHA / unusual-activity failure.
+
+        Escalates with each consecutive strike (RECAPTCHA_BACKOFF_SECONDS) and pauses the
+        WHOLE token across every model (anti-bot reputation is account/IP-level, not
+        per-model). Strikes only keep climbing within a recent burst; a gap longer than
+        RECAPTCHA_STRIKE_DECAY since the last cooldown resets to strike 1. Persisted so a
+        redeploy doesn't forget and re-hammer a flagged account. Cleared on success.
+        """
+        now = datetime.now(timezone.utc)
+        strikes = 0
+        prev = self._recaptcha_cd.get(token_id)
+        if prev:
+            prev_until, prev_strikes = prev
+            if now < prev_until + self.RECAPTCHA_STRIKE_DECAY:
+                strikes = prev_strikes
+        strikes += 1
+        seconds = self.RECAPTCHA_BACKOFF_SECONDS[
+            min(strikes, len(self.RECAPTCHA_BACKOFF_SECONDS)) - 1
+        ]
+        until = now + timedelta(seconds=seconds)
+        self._recaptcha_cd[token_id] = (until, strikes)
+        try:
+            await self.db.upsert_recaptcha_cooldown(token_id, until, strikes)
+        except Exception as e:
+            debug_logger.op_warning(f"[RECAPTCHA_CD] could not persist cooldown: {e}")
+        debug_logger.event(
+            f"[RECAPTCHA_CD] token={token_id} strike={strikes} paused {seconds}s "
+            f"(reCAPTCHA/unusual_activity — whole account cooling down)"
+        )
+
+    def is_recaptcha_cooldown(self, token_id: int) -> bool:
+        """True while this account is inside its reCAPTCHA cooldown window.
+
+        Does NOT pop an expired entry (unlike quota): the strike count is retained so a
+        repeat failure escalates instead of restarting at strike 1. It is cleared only by
+        clear_recaptcha_cooldown (on success) or decayed inside mark_recaptcha_failure.
+        """
+        entry = self._recaptcha_cd.get(token_id)
+        if not entry:
+            return False
+        return datetime.now(timezone.utc) < entry[0]
+
+    async def clear_recaptcha_cooldown(self, token_id: int) -> None:
+        """Reset a token's reCAPTCHA strike/cooldown (called on a successful generation)."""
+        if self._recaptcha_cd.pop(token_id, None) is not None:
+            try:
+                await self.db.delete_recaptcha_cooldown(token_id)
+            except Exception as e:
+                debug_logger.op_warning(f"[RECAPTCHA_CD] could not clear cooldown: {e}")
 
     async def _get_token_lock(
         self,
@@ -957,9 +1038,14 @@ class TokenManager:
         (often paid) token after a burst of transient reCAPTCHA rejections.
         """
         if _is_environmental_token_error(error_message):
+            # Anti-bot/reCAPTCHA rejection: don't count it toward auto-disable (it's IP/
+            # fingerprint reputation, not token health) BUT apply a progressive per-account
+            # cooldown so the load balancer stops re-picking this account and racking up
+            # more "unusual activity" flags. See mark_recaptcha_failure.
+            await self.mark_recaptcha_failure(token_id)
             debug_logger.log_info(
-                f"[TOKEN] Token {token_id} hit an environmental/captcha error; "
-                f"not counting toward auto-disable: {str(error_message)[:120]}"
+                f"[TOKEN] Token {token_id} hit an environmental/captcha error; cooling the "
+                f"account (not counting toward auto-disable): {str(error_message)[:120]}"
             )
             return
 
@@ -998,6 +1084,9 @@ class TokenManager:
         Note: today_error_count and historical statistics are NOT reset.
         """
         await self.db.reset_error_count(token_id)
+        # A success proves the account's reCAPTCHA/IP reputation is healthy again — reset
+        # any progressive anti-bot cooldown so it isn't held back on the next request.
+        await self.clear_recaptcha_cooldown(token_id)
 
     async def ban_token_for_429(self, token_id: int):
         """因429错误立即禁用token

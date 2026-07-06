@@ -3,7 +3,7 @@ import asyncio
 import aiosqlite
 import json
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
@@ -876,6 +876,18 @@ class Database:
                 )
             """)
 
+            # Per-account reCAPTCHA / "unusual activity" progressive cooldown. Unlike quota
+            # (per-model), an anti-bot rejection is account/IP-level, so the WHOLE token is
+            # paused. Persisted (with the escalating strike count) so a redeploy doesn't
+            # forget and re-hammer a flagged account.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS recaptcha_cooldowns (
+                    token_id INTEGER PRIMARY KEY,
+                    until TIMESTAMP NOT NULL,
+                    strikes INTEGER NOT NULL DEFAULT 1
+                )
+            """)
+
             await db.commit()
 
     async def _migrate_request_logs(self, db):
@@ -1133,6 +1145,33 @@ class Database:
                 (now_iso,),
             )
             return [tuple(row) for row in await cursor.fetchall()]
+
+    # ---- Per-account reCAPTCHA / anti-bot progressive cooldown persistence ----
+    async def upsert_recaptcha_cooldown(self, token_id: int, until: datetime, strikes: int):
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "INSERT INTO recaptcha_cooldowns (token_id, until, strikes) VALUES (?, ?, ?) "
+                "ON CONFLICT(token_id) DO UPDATE SET until = excluded.until, strikes = excluded.strikes",
+                (token_id, until.isoformat(), int(strikes)),
+            )
+            await db.commit()
+
+    async def get_active_recaptcha_cooldowns(self) -> List[tuple]:
+        """Return recent (token_id, until_iso, strikes) rows — still cooling OR expired
+        within the last hour, so the escalating strike count survives a restart within the
+        decay window. Older rows are ignored (a later failure starts fresh at strike 1)."""
+        cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT token_id, until, strikes FROM recaptcha_cooldowns WHERE until > ?",
+                (cutoff_iso,),
+            )
+            return [tuple(row) for row in await cursor.fetchall()]
+
+    async def delete_recaptcha_cooldown(self, token_id: int):
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM recaptcha_cooldowns WHERE token_id = ?", (token_id,))
+            await db.commit()
 
     async def delete_token(self, token_id: int):
         """Delete token and related data"""

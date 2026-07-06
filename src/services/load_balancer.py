@@ -207,6 +207,12 @@ class LoadBalancer:
         required_tier = get_required_paygate_tier_for_model(model)
 
         for token in active_tokens:
+            # Per-account reCAPTCHA / anti-bot cooldown (whole token, ALL models): a
+            # flagged account is rested so we don't re-trigger more "unusual activity"
+            # failures. Progressive backoff lives in TokenManager.mark_recaptcha_failure.
+            if self.token_manager.is_recaptcha_cooldown(token.id):
+                filtered_reasons[token.id] = "reCAPTCHA 冷却中（账号级）"
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             # Image generation is exempt from paygate-tier gating (free accounts
             # can generate images on Flow); only video enforces account tier.
@@ -375,6 +381,16 @@ class LoadBalancer:
         if model and not supported_tokens:
             tier_label = get_paygate_tier_label(required_tier)
             return f"This model requires a {tier_label} account, but no {tier_label} account is available: {model}"
+
+        # All otherwise-usable accounts are resting on a reCAPTCHA / anti-bot cooldown
+        # (account-level, so it applies to every model). Report it clearly.
+        if supported_tokens and all(
+            self.token_manager.is_recaptcha_cooldown(t.id) for t in supported_tokens
+        ):
+            return (
+                "All accounts are briefly cooling down after reCAPTCHA / unusual-activity "
+                "checks; they auto-recover shortly (progressive backoff)."
+            )
 
         # All otherwise-usable tokens have exhausted THIS model's quota (other
         # models still work on them). Report it as a model-quota cooldown.
