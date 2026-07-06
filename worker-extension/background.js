@@ -84,11 +84,11 @@ let connecting = false;
 function getSettings() {
   return new Promise((resolve) => {
     chrome.storage.local.get(DEFAULT_SETTINGS, (stored) => {
-      resolve({
+      const build = (routeKey) => resolve({
         serverBase: (stored.serverBase || DEFAULT_SETTINGS.serverBase).trim().replace(/\/+$/, ""),
         apiKey: (stored.apiKey || "").trim(),
         connectionToken: (stored.connectionToken || "").trim(),
-        routeKey: (stored.routeKey || "").trim(),
+        routeKey,
         clientLabel: (stored.clientLabel || "").trim(),
         refreshIntervalMinutes: Math.max(5, parseInt(stored.refreshIntervalMinutes, 10) || 60),
         tabMode: stored.tabMode === "ephemeral" ? "ephemeral" : "persistent",
@@ -98,6 +98,19 @@ function getSettings() {
         // profile stuck on "direct egress" would break reCAPTCHA alignment. Not toggleable.
         proxyAuto: true,
         proxyUrl: (stored.proxyUrl || "").trim()
+      });
+      const explicit = (stored.routeKey || "").trim();
+      if (explicit) return build(explicit);
+      // No explicit route key → use a STABLE auto per-profile key. The backend binds
+      // THIS account's token to it, so captcha minting for the account routes back to
+      // THIS device — mint and redeem then share the same residential IP (reCAPTCHA
+      // consistency). Persisted so it never changes for this profile.
+      chrome.storage.local.get(["autoRouteKey"], ({ autoRouteKey }) => {
+        if (autoRouteKey) return build(autoRouteKey);
+        autoRouteKey = "auto-" + ((self.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : (Date.now() + "-" + Math.random().toString(36).slice(2)));
+        chrome.storage.local.set({ autoRouteKey }, () => build(autoRouteKey));
       });
     });
   });
@@ -987,6 +1000,9 @@ async function refreshSession(token_id = null) {
     if (token_id != null) pushBody.token_id = token_id;
     if (effProxy) pushBody.proxy_url = effProxy;
     try { if (navigator && navigator.userAgent) pushBody.user_agent = navigator.userAgent; } catch (_) {}
+    // Bind this account to THIS device so its captcha minting routes back here (same
+    // residential IP as the redeem). Uses the stable per-profile route key.
+    if (settings.routeKey) pushBody.route_key = settings.routeKey;
 
     const resp = await fetch(updateUrl, {
       method: "POST",

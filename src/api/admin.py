@@ -2459,6 +2459,11 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     # per-account; only accepted if they look sane (defensive — never trust blindly).
     reported_proxy_url = _sanitize_reported_proxy(request.get("proxy_url"))
     reported_user_agent = _sanitize_reported_ua(request.get("user_agent"))
+    # #1 per-account routing: the device's stable route key. Binding the account's token
+    # to it makes captcha minting for the account route back to THIS device (same IP as
+    # the redeem). Only auto-bind an empty or previously-auto ('auto-…') key — never
+    # clobber an explicit admin-set Route Key.
+    reported_route_key = (request.get("route_key") or "").strip() or None
 
     # Step 1: Convert ST to AT to get user info (including email)
     try:
@@ -2524,11 +2529,16 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 _redeem_updates["redeem_proxy_url"] = reported_proxy_url
             if reported_user_agent is not None:
                 _redeem_updates["browser_user_agent"] = reported_user_agent
+            if reported_route_key:
+                _cur_rk = (existing_token.extension_route_key or "").strip()
+                if not _cur_rk or _cur_rk.startswith("auto-"):
+                    _redeem_updates["extension_route_key"] = reported_route_key
             if _redeem_updates:
                 await db.update_token(existing_token.id, **_redeem_updates)
                 debug_logger.event(
                     f"[REDEEM_REPORT] token={existing_token.id} "
-                    f"proxy={mask_proxy_url(reported_proxy_url)} ua_set={reported_user_agent is not None}"
+                    f"proxy={mask_proxy_url(reported_proxy_url)} ua_set={reported_user_agent is not None} "
+                    f"route_key={_redeem_updates.get('extension_route_key', '(kept)')}"
                 )
 
             # Auto-recover a disabled account. A fresh session push means the credential
@@ -2564,12 +2574,15 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 remark="Added by Chrome Extension"
             )
 
-            # Slice B: persist the reported residential proxy + real browser UA.
+            # Slice B + #1: persist the reported residential proxy, real browser UA, and
+            # bind the account to this device via its route key.
             _redeem_updates = {}
             if reported_proxy_url is not None:
                 _redeem_updates["redeem_proxy_url"] = reported_proxy_url
             if reported_user_agent is not None:
                 _redeem_updates["browser_user_agent"] = reported_user_agent
+            if reported_route_key:
+                _redeem_updates["extension_route_key"] = reported_route_key
             if _redeem_updates:
                 await db.update_token(new_token.id, **_redeem_updates)
 

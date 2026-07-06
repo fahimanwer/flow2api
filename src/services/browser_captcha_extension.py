@@ -67,25 +67,34 @@ class ExtensionCaptchaService:
                 return conn
         return None
 
-    def _select_connection(self, route_key: str) -> Optional[ExtensionConnection]:
+    def _select_connection(
+        self, route_key: str, strict: bool = False
+    ) -> Optional[ExtensionConnection]:
+        """Pick the browser to serve a request for `route_key`.
+
+        Preferred: the browser bound to this account's route key (so captcha MINTING
+        happens on the same device — hence same residential IP — that the backend REDEEMS
+        through). If that device is offline:
+          - strict=True  (session refresh): return None. We must NEVER read another
+            account's cookie, so refuse rather than pick a different device.
+          - strict=False (captcha minting): fall back to ANY online browser. reCAPTCHA
+            tokens are site-level, so a valid token from another IP beats a hard failure
+            (it just may score lower if it doesn't match the redeem IP).
+        """
         normalized_key = (route_key or "").strip()
         if normalized_key:
             for conn in self.active_connections:
                 if conn.route_key == normalized_key:
                     return conn
+            if strict:
+                return None
+            # else fall through to the any-browser fallback below
+        # Round-robin across ALL connected browsers (spreads minting load; each IP stays
+        # under Google's per-IP rate limit).
+        if not self.active_connections:
             return None
-        # Empty token routes are only allowed to use an empty extension route.
-        # A keyed route such as "9223" belongs to a specific browser/account
-        # and must never be borrowed by another token just because it is the
-        # only extension online.
-        # Round-robin across ALL connected empty-route browsers so reCAPTCHA
-        # minting load is spread across them (each browser/IP stays under
-        # Google's rate limit) instead of hammering a single one.
-        empty_conns = [c for c in self.active_connections if not c.route_key]
-        if not empty_conns:
-            return None
-        self._rr_index = (self._rr_index + 1) % len(empty_conns)
-        return empty_conns[self._rr_index % len(empty_conns)]
+        self._rr_index = (self._rr_index + 1) % len(self.active_connections)
+        return self.active_connections[self._rr_index]
 
     def _describe_routes(self) -> str:
         labels = []
@@ -269,7 +278,7 @@ class ExtensionCaptchaService:
 
         route_key = await self._resolve_route_key(token_id)
         if route_key:
-            conn = self._select_connection(route_key)
+            conn = self._select_connection(route_key, strict=True)
             if conn is None:
                 return {
                     "status": "no_browser",
