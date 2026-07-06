@@ -1109,6 +1109,36 @@ async def refresh_session_via_extension(
         raise HTTPException(status_code=500, detail=f"会话刷新失败: {str(e)}")
 
 
+def _sanitize_reported_proxy(value) -> Optional[str]:
+    """Validate a proxy URL reported by the worker extension. Returns the normalized
+    string, or None to mean 'not reported / invalid — leave the stored value unchanged'.
+    Accepts only scheme://[creds@]host:port to avoid persisting garbage or SSRF-y values.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or len(raw) > 500:
+        return None
+    if not re.match(r"^(https?|socks5h?|socks4)://", raw, re.IGNORECASE):
+        return None
+    host_part = raw.split("://", 1)[1].rsplit("@", 1)[-1]
+    if ":" not in host_part or not host_part.rsplit(":", 1)[-1].split("/")[0].isdigit():
+        return None
+    return raw
+
+
+def _sanitize_reported_ua(value) -> Optional[str]:
+    """Validate a browser User-Agent reported by the extension. None = leave unchanged."""
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or len(raw) > 500:
+        return None
+    if not any(tok in raw for tok in ("Mozilla", "Chrome", "Safari", "AppleWebKit")):
+        return None
+    return raw
+
+
 async def _probe_egress_ip(label: str, proxy_url: Optional[str], timeout: float = 10.0) -> dict:
     """Fetch this server's PUBLIC egress IP as seen through `proxy_url` (or direct).
 
@@ -1176,11 +1206,27 @@ async def ip_debug(token: str = Depends(verify_admin_token)):
 
     probes = await asyncio.gather(*tasks)
 
+    # Per-account redeem alignment (Slice B): what residential proxy/UA each account
+    # reported, which the generate call now redeems through. Creds masked.
+    accounts = []
+    try:
+        for t in (await db.get_all_tokens() if db else []):
+            accounts.append({
+                "id": t.id,
+                "email": t.email,
+                "is_active": t.is_active,
+                "redeem_proxy": mask_proxy_url(getattr(t, "redeem_proxy_url", None)),
+                "redeem_ua_set": bool(getattr(t, "browser_user_agent", None)),
+            })
+    except Exception:
+        pass
+
     method = getattr(config, "captcha_method", None)
     return {
         "success": True,
         "captcha_method": method,
         "probes": probes,
+        "accounts": accounts,
         "note": (
             "Compare 'request_proxy' (where the image request exits) against the reCAPTCHA "
             "MINT IP. In 'extension' mode the mint IP is the extension's own egress and is not "
@@ -2408,6 +2454,12 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     # absent (autonomous extension pushes), we fall back to email matching below.
     token_id_override = request.get("token_id")
 
+    # Slice B: the extension reports the residential proxy it minted through + its real
+    # browser UA, so the server can redeem the generate call from the SAME IP/UA. Stored
+    # per-account; only accepted if they look sane (defensive — never trust blindly).
+    reported_proxy_url = _sanitize_reported_proxy(request.get("proxy_url"))
+    reported_user_agent = _sanitize_reported_ua(request.get("user_agent"))
+
     # Step 1: Convert ST to AT to get user info (including email)
     try:
         result = await token_manager.flow_client.st_to_at(session_token)
@@ -2464,6 +2516,21 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 at_expires=at_expires
             )
 
+            # Slice B: persist the reported residential proxy + real browser UA so the
+            # generate (redeem) request aligns with the reCAPTCHA mint. Written via the DB
+            # layer directly (token_manager.update_token has an explicit signature).
+            _redeem_updates = {}
+            if reported_proxy_url is not None:
+                _redeem_updates["redeem_proxy_url"] = reported_proxy_url
+            if reported_user_agent is not None:
+                _redeem_updates["browser_user_agent"] = reported_user_agent
+            if _redeem_updates:
+                await db.update_token(existing_token.id, **_redeem_updates)
+                debug_logger.event(
+                    f"[REDEEM_REPORT] token={existing_token.id} "
+                    f"proxy={mask_proxy_url(reported_proxy_url)} ua_set={reported_user_agent is not None}"
+                )
+
             # Check if auto-enable is enabled and token is disabled
             if plugin_config.auto_enable_on_update and not existing_token.is_active:
                 await token_manager.enable_token(existing_token.id)
@@ -2488,6 +2555,15 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 st=session_token,
                 remark="Added by Chrome Extension"
             )
+
+            # Slice B: persist the reported residential proxy + real browser UA.
+            _redeem_updates = {}
+            if reported_proxy_url is not None:
+                _redeem_updates["redeem_proxy_url"] = reported_proxy_url
+            if reported_user_agent is not None:
+                _redeem_updates["browser_user_agent"] = reported_user_agent
+            if _redeem_updates:
+                await db.update_token(new_token.id, **_redeem_updates)
 
             return {
                 "success": True,

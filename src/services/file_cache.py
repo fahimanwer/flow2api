@@ -64,7 +64,11 @@ class FileCache:
         """根据媒体类型解析下载代理地址。"""
         if isinstance(fingerprint, dict):
             fingerprint_proxy = str(fingerprint.get("proxy_url") or "").strip()
-            if fingerprint_proxy:
+            # Slice B: image/video DOWNLOADS must NOT ride the fingerprint proxy — in
+            # extension mode that is now the account's residential (metered) IP, reserved
+            # for the small reCAPTCHA-gated generate call. Media downloads use the cheap
+            # dedicated media proxy instead. Non-media downloads keep fingerprint affinity.
+            if fingerprint_proxy and media_type not in ("image", "video"):
                 return fingerprint_proxy
 
         if not self.proxy_manager:

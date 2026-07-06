@@ -975,10 +975,20 @@ async function refreshSession(token_id = null) {
       }
     }
 
+    // Slice B: report the residential proxy this profile mints through + this browser's
+    // real User-Agent, so the backend can REDEEM the generate call from the SAME IP + UA
+    // (fixes reCAPTCHA "unusual activity" caused by residential-mint vs datacenter-redeem).
+    let effProxy = "";
+    try { effProxy = await resolveProxyUrl(settings); } catch (_) {}
+    const pushBody = { session_token: cookie.value };
+    if (token_id != null) pushBody.token_id = token_id;
+    if (effProxy) pushBody.proxy_url = effProxy;
+    try { if (navigator && navigator.userAgent) pushBody.user_agent = navigator.userAgent; } catch (_) {}
+
     const resp = await fetch(updateUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.connectionToken}` },
-      body: JSON.stringify(token_id != null ? { session_token: cookie.value, token_id } : { session_token: cookie.value })
+      body: JSON.stringify(pushBody)
     });
     if (!resp.ok) {
       const txt = await resp.text();

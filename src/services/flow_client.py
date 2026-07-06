@@ -193,7 +193,10 @@ class FlowClient:
         # 通用请求头 - 优先使用打码浏览器指纹中的 UA
         fingerprint_user_agent = None
         if isinstance(fingerprint, dict):
-            debug_logger.log_info(f"[FINGERPRINT] 当前请求链路绑定的浏览器指纹: {fingerprint}")
+            _fp_log = dict(fingerprint)
+            if "proxy_url" in _fp_log:
+                _fp_log["proxy_url"] = mask_proxy_url(_fp_log.get("proxy_url"))
+            debug_logger.log_info(f"[FINGERPRINT] 当前请求链路绑定的浏览器指纹: {_fp_log}")
             fingerprint_user_agent = fingerprint.get("user_agent")
         elif getattr(config, "captcha_method", "") == "personal":
             debug_logger.log_info("[FINGERPRINT] captcha_method=personal，尝试从内置浏览器获取真实浏览器指纹作为请求头")
@@ -254,16 +257,15 @@ class FlowClient:
         # Log request
         if config.debug_enabled:
             if isinstance(fingerprint, dict):
-                proxy_for_log = proxy_url if proxy_url else "direct"
                 debug_logger.log_info(
-                    f"[FINGERPRINT] 使用打码浏览器指纹提交请求: UA={headers.get('User-Agent', '')[:120]}, proxy={proxy_for_log}"
+                    f"[FINGERPRINT] 使用打码浏览器指纹提交请求: UA={headers.get('User-Agent', '')[:120]}, proxy={mask_proxy_url(proxy_url)}"
                 )
             debug_logger.log_request(
                 method=method,
                 url=url,
                 headers=headers,
                 body=json_data,
-                proxy=proxy_url
+                proxy=mask_proxy_url(proxy_url)
             )
 
         start_time = time.time()
@@ -3116,6 +3118,31 @@ class FlowClient:
         target_timeout = 45 if action_name == "VIDEO_GENERATION" else 35
         return max(12, min(base_timeout, target_timeout))
 
+    async def _build_extension_redeem_fingerprint(
+        self, token_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """Slice B: build the redeem fingerprint (residential proxy + real browser UA)
+        for this account from what its worker extension reported. Returns None when the
+        account has reported nothing yet, so the caller falls back to the global proxy
+        (no regression). _make_request consumes fingerprint['proxy_url'] and ['user_agent'].
+        """
+        if not token_id or not self.db:
+            return None
+        try:
+            token = await self.db.get_token(token_id)
+        except Exception:
+            return None
+        if not token:
+            return None
+        fp: Dict[str, Any] = {}
+        proxy = (getattr(token, "redeem_proxy_url", None) or "").strip()
+        ua = (getattr(token, "browser_user_agent", None) or "").strip()
+        if proxy:
+            fp["proxy_url"] = proxy
+        if ua:
+            fp["user_agent"] = ua
+        return fp or None
+
     async def _get_recaptcha_token(
         self,
         project_id: str,
@@ -3151,7 +3178,17 @@ class FlowClient:
                     timeout=extension_timeout,
                     token_id=token_id
                 )
-                self._set_request_fingerprint(None)
+                # Slice B — align REDEEM with MINT: make the generate request exit the SAME
+                # residential IP + use the SAME browser UA that the extension used to mint the
+                # reCAPTCHA. If the account hasn't reported them, this is None and the redeem
+                # falls back to the global request proxy (WARP) exactly as before (no regression).
+                redeem_fp = await self._build_extension_redeem_fingerprint(token_id) if token else None
+                self._set_request_fingerprint(redeem_fp)
+                if redeem_fp:
+                    debug_logger.event(
+                        f"[REDEEM_ALIGN] token={token_id} egress={mask_proxy_url(redeem_fp.get('proxy_url'))} "
+                        f"ua_set={bool(redeem_fp.get('user_agent'))}"
+                    )
                 return token, None
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {str(e)}")

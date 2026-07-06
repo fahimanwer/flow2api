@@ -475,6 +475,8 @@ class Database:
                     ("extension_route_key", "TEXT"),  # extension 模式路由键
                     ("ban_reason", "TEXT"),  # 禁用原因
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
+                    ("redeem_proxy_url", "TEXT"),  # Slice B: per-account residential redeem proxy
+                    ("browser_user_agent", "TEXT"),  # Slice B: extension browser real UA
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -636,7 +638,9 @@ class Database:
                     captcha_proxy_url TEXT,
                     extension_route_key TEXT,
                     ban_reason TEXT,
-                    banned_at TIMESTAMP
+                    banned_at TIMESTAMP,
+                    redeem_proxy_url TEXT,
+                    browser_user_agent TEXT
                 )
             """)
 

@@ -44,6 +44,12 @@ class Token(BaseModel):
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
 
+    # Slice B — mint/redeem consistency. Reported by the worker extension so the
+    # generate (redeem) request exits the SAME residential IP + uses the SAME browser
+    # UA that minted the reCAPTCHA. When unset, redeem falls back to the global proxy.
+    redeem_proxy_url: Optional[str] = None  # per-account residential proxy for the generate call
+    browser_user_agent: Optional[str] = None  # the extension browser's real User-Agent
+
     # 429禁用相关
     ban_reason: Optional[str] = None  # 禁用原因: "429_rate_limit" 或 None
     banned_at: Optional[datetime] = None  # 禁用时间

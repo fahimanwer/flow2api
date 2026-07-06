@@ -190,9 +190,9 @@ class DebugLogger:
                 except (AttributeError, TypeError):
                     self.logger.info("  <binary file data>")
 
-            # Proxy
+            # Proxy (mask credentials — proxy URLs may carry Oxylabs user:pass)
             if proxy:
-                self.logger.info(f"\n🌐 Proxy: {proxy}")
+                self.logger.info(f"\n🌐 Proxy: {mask_proxy_url(proxy)}")
 
             self._write_separator()
             self.logger.info("")  # Empty line
