@@ -75,6 +75,24 @@ def _is_quota_error(error_message: Optional[str]) -> bool:
     return any(marker in lowered for marker in _QUOTA_ERROR_MARKERS)
 
 
+# Fragments that specifically mean the DAILY per-model allowance is spent (resets at
+# midnight Pacific). These get cooled until the PT reset — not just a few minutes — so
+# we stop re-probing an exhausted model all day (repeated 429s look like abuse). Generic
+# resource_exhausted (which can also be a short rate-limit) keeps the shorter cooldown.
+_DAILY_QUOTA_MARKERS = (
+    "per_model_daily_quota",
+    "daily_quota_reached",
+    "daily_quota",
+)
+
+
+def _is_daily_quota_error(error_message: Optional[str]) -> bool:
+    if not error_message:
+        return False
+    lowered = error_message.lower()
+    return any(marker in lowered for marker in _DAILY_QUOTA_MARKERS)
+
+
 # Aspect-ratio / resolution suffixes stripped to get a model's quota family.
 _MODEL_VARIANT_SUFFIXES = (
     "-4k", "-2k", "_4k", "_2k", "_1080p",
@@ -116,19 +134,48 @@ class TokenManager:
         # model is paused here (in memory; cleared on restart). See [[per-model quota]].
         self._model_quota_until: dict[tuple, datetime] = {}
 
-    # How long a single model stays paused on a token after a quota hit before retry.
+    # Short cooldown for a generic/ambiguous rate-limit (could be transient).
     MODEL_QUOTA_COOLDOWN_MINUTES = 30
 
-    def mark_model_quota_exhausted(self, token_id: int, model: Optional[str]):
-        """Pause ONLY this model for this token after a per-model quota error."""
+    def _next_pt_daily_reset(self) -> datetime:
+        """Next Google-Flow daily-quota reset = next midnight America/Los_Angeles (PT),
+        returned as UTC with a small margin so we retry AFTER the reset lands."""
+        try:
+            from zoneinfo import ZoneInfo
+            pt = ZoneInfo("America/Los_Angeles")
+            now_pt = datetime.now(pt)
+            next_midnight_pt = (now_pt + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            return next_midnight_pt.astimezone(timezone.utc) + timedelta(minutes=2)
+        except Exception:
+            # tz data unavailable — fall back to a long cooldown (worst case ~24h to PT
+            # midnight; 12h avoids all-day re-probing without over-holding a false positive).
+            return datetime.now(timezone.utc) + timedelta(hours=12)
+
+    def mark_model_quota_exhausted(
+        self, token_id: int, model: Optional[str], error_message: Optional[str] = None
+    ):
+        """Pause ONLY this model for this token after a per-model quota error.
+
+        A DAILY quota hit is paused until the next Pacific-time reset (so we don't keep
+        probing an exhausted model every 30 min all day and rack up 429s that look like
+        abusive traffic). Anything ambiguous keeps the short cooldown.
+        """
         key = model_quota_key(model)
         if not key:
             return
-        until = datetime.now(timezone.utc) + timedelta(minutes=self.MODEL_QUOTA_COOLDOWN_MINUTES)
+        if _is_daily_quota_error(error_message):
+            until = self._next_pt_daily_reset()
+            hrs = max(0.0, (until - datetime.now(timezone.utc)).total_seconds() / 3600)
+            scope = f"until daily reset (~{hrs:.1f}h, midnight PT)"
+        else:
+            until = datetime.now(timezone.utc) + timedelta(minutes=self.MODEL_QUOTA_COOLDOWN_MINUTES)
+            scope = f"{self.MODEL_QUOTA_COOLDOWN_MINUTES}m"
         self._model_quota_until[(token_id, key)] = until
-        debug_logger.log_warning(
-            f"[MODEL_QUOTA] Token {token_id} model '{key}' quota exhausted; pausing only "
-            f"this model for {self.MODEL_QUOTA_COOLDOWN_MINUTES}m (other models stay active)"
+        debug_logger.event(
+            f"[MODEL_QUOTA] token={token_id} model='{key}' quota exhausted; paused {scope} "
+            f"(other models stay active)"
         )
 
     def is_model_quota_exhausted(self, token_id: int, model: Optional[str]) -> bool:
@@ -880,8 +927,9 @@ class TokenManager:
         if _is_quota_error(error_message):
             # Quota is PER MODEL — pause ONLY this model for this token. The token
             # stays active and keeps serving every other model (which have their own
-            # separate daily quotas). Do NOT disable the whole token.
-            self.mark_model_quota_exhausted(token_id, model)
+            # separate daily quotas). Do NOT disable the whole token. Daily quota is
+            # paused until the PT reset (see mark_model_quota_exhausted).
+            self.mark_model_quota_exhausted(token_id, model, error_message)
             return
 
         await self.db.increment_token_stats(token_id, "error")
