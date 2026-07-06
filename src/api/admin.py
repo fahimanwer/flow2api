@@ -2395,9 +2395,23 @@ async def get_plugin_config(request: Request, token: str = Depends(verify_admin_
         "config": {
             "connection_token": plugin_config.connection_token,
             "connection_url": connection_url,
-            "auto_enable_on_update": plugin_config.auto_enable_on_update
+            "auto_enable_on_update": plugin_config.auto_enable_on_update,
+            "ext_proxy_pool": _parse_ext_proxy_pool(plugin_config.ext_proxy_pool),
         }
     }
+
+
+def _parse_ext_proxy_pool(raw: Optional[str]) -> Optional[dict]:
+    """Parse the stored residential proxy pool JSON ({host,user,pass,ports:[...]}); None if unset/invalid."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and data.get("ports"):
+            return data
+    except Exception:
+        pass
+    return None
 
 
 @router.post("/api/plugin/config")
@@ -2413,17 +2427,51 @@ async def update_plugin_config(
     if not connection_token:
         connection_token = secrets.token_urlsafe(32)
 
+    # #2 residential proxy pool: accept a dict {host,user,pass,ports} or a JSON string.
+    # Absent => leave unchanged. Ports may be pasted as "8006, 8007" or a list.
+    ext_proxy_pool = None
+    if "ext_proxy_pool" in request:
+        _pp = request.get("ext_proxy_pool")
+        if isinstance(_pp, dict):
+            ports = _pp.get("ports")
+            if isinstance(ports, str):
+                ports = [int(p) for p in re.findall(r"\d+", ports)]
+            _pp = {
+                "host": (_pp.get("host") or "").strip(),
+                "user": (_pp.get("user") or "").strip(),
+                "pass": (_pp.get("pass") or ""),
+                "ports": sorted(set(int(p) for p in (ports or []))),
+            }
+            ext_proxy_pool = json.dumps(_pp) if _pp["ports"] and _pp["host"] else ""
+        elif isinstance(_pp, str):
+            ext_proxy_pool = _pp.strip()
+
     await db.update_plugin_config(
         connection_token=connection_token,
-        auto_enable_on_update=auto_enable_on_update
+        auto_enable_on_update=auto_enable_on_update,
+        ext_proxy_pool=ext_proxy_pool,
     )
 
     return {
         "success": True,
         "message": "插件配置更新成功",
         "connection_token": connection_token,
-        "auto_enable_on_update": auto_enable_on_update
+        "auto_enable_on_update": auto_enable_on_update,
+        "ext_proxy_pool": _parse_ext_proxy_pool(ext_proxy_pool),
     }
+
+
+@router.get("/api/plugin/proxy-pool")
+async def plugin_proxy_pool(authorization: Optional[str] = Header(None)):
+    """The worker extension fetches its residential proxy pool from here (connection-token
+    authed, like /update-token). Returns {host,user,pass,ports:[...]} or {} if unset, so
+    new IPs added in the admin UI are picked up WITHOUT redistributing the extension."""
+    plugin_config = await db.get_plugin_config()
+    provided = authorization[7:] if (authorization or "").startswith("Bearer ") else (authorization or "")
+    if not plugin_config.connection_token or provided != plugin_config.connection_token:
+        raise HTTPException(status_code=401, detail="Invalid connection token")
+    pool = _parse_ext_proxy_pool(plugin_config.ext_proxy_pool)
+    return {"success": True, "pool": pool or {}}
 
 
 @router.post("/api/plugin/update-token")

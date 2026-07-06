@@ -220,6 +220,9 @@ class PluginConfig(BaseModel):
     id: int = 1
     connection_token: str = ""  # 插件连接token
     auto_enable_on_update: bool = True  # 更新token时自动启用（默认开启）
+    # #2 residential proxy pool the extension fetches (JSON: {host,user,pass,ports:[...]})
+    # so more IPs can be added from the admin UI without redistributing the extension.
+    ext_proxy_pool: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

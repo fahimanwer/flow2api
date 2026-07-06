@@ -435,6 +435,7 @@ class Database:
                         id INTEGER PRIMARY KEY DEFAULT 1,
                         connection_token TEXT DEFAULT '',
                         auto_enable_on_update BOOLEAN DEFAULT 1,
+                        ext_proxy_pool TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
@@ -574,6 +575,7 @@ class Database:
             if await self._table_exists(db, "plugin_config"):
                 plugin_columns_to_add = [
                     ("auto_enable_on_update", "BOOLEAN DEFAULT 1"),  # 默认开启
+                    ("ext_proxy_pool", "TEXT"),  # #2 extension residential proxy pool (JSON)
                 ]
 
                 for col_name, col_type in plugin_columns_to_add:
@@ -825,6 +827,7 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     connection_token TEXT DEFAULT '',
                     auto_enable_on_update BOOLEAN DEFAULT 1,
+                    ext_proxy_pool TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -2127,23 +2130,32 @@ class Database:
                 return PluginConfig(**dict(row))
             return PluginConfig()
 
-    async def update_plugin_config(self, connection_token: str, auto_enable_on_update: bool = True):
-        """Update plugin configuration"""
+    async def update_plugin_config(self, connection_token: str, auto_enable_on_update: bool = True,
+                                   ext_proxy_pool: Optional[str] = None):
+        """Update plugin configuration. ext_proxy_pool=None leaves the pool unchanged."""
         async with self._connect(write=True) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM plugin_config WHERE id = 1")
             row = await cursor.fetchone()
 
             if row:
-                await db.execute("""
-                    UPDATE plugin_config
-                    SET connection_token = ?, auto_enable_on_update = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = 1
-                """, (connection_token, auto_enable_on_update))
+                if ext_proxy_pool is not None:
+                    await db.execute("""
+                        UPDATE plugin_config
+                        SET connection_token = ?, auto_enable_on_update = ?, ext_proxy_pool = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = 1
+                    """, (connection_token, auto_enable_on_update, ext_proxy_pool))
+                else:
+                    await db.execute("""
+                        UPDATE plugin_config
+                        SET connection_token = ?, auto_enable_on_update = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = 1
+                    """, (connection_token, auto_enable_on_update))
             else:
                 await db.execute("""
-                    INSERT INTO plugin_config (id, connection_token, auto_enable_on_update)
-                    VALUES (1, ?, ?)
-                """, (connection_token, auto_enable_on_update))
+                    INSERT INTO plugin_config (id, connection_token, auto_enable_on_update, ext_proxy_pool)
+                    VALUES (1, ?, ?, ?)
+                """, (connection_token, auto_enable_on_update, ext_proxy_pool))
 
             await db.commit()

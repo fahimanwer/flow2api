@@ -154,13 +154,43 @@ const PROXY_BASE = {
   ports: [8001, 8002, 8003, 8004, 8005]
 };
 
-// Get-or-create this profile's port (one of the 5 static IPs), persisted so the
+// #2 server-managed proxy pool (fetched from /api/plugin/proxy-pool). When the admin adds
+// IPs in the UI, new profiles pick them up here WITHOUT redistributing the extension.
+// Falls back to the baked-in PROXY_BASE if the server hasn't set a pool / is unreachable.
+let extProxyPool = null;
+
+function activeProxyBase() {
+  if (extProxyPool && extProxyPool.host && Array.isArray(extProxyPool.ports) && extProxyPool.ports.length) {
+    return {
+      host: extProxyPool.host,
+      user: extProxyPool.user || PROXY_BASE.user,
+      pass: extProxyPool.pass || PROXY_BASE.pass,
+      ports: extProxyPool.ports
+    };
+  }
+  return PROXY_BASE;
+}
+
+async function fetchProxyPool(settings) {
+  try {
+    if (!settings.serverBase || !settings.connectionToken) return;
+    const base = new URL(settings.serverBase);
+    const url = `${base.protocol}//${base.host}/api/plugin/proxy-pool`;
+    const resp = await fetch(url, { headers: { "Authorization": `Bearer ${settings.connectionToken}` } });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data && data.pool && Array.isArray(data.pool.ports) && data.pool.ports.length && data.pool.host) {
+      extProxyPool = data.pool;
+    }
+  } catch (_) { /* keep the baked-in fallback */ }
+}
+
+// Get-or-create this profile's port (one static IP from the ACTIVE pool), persisted so the
 // profile keeps the SAME IP across SW restarts (a flapping IP triggers Google's
-// "verify it's you"). Random pick; with <=5 profiles this usually gives distinct
-// IPs — for guaranteed-distinct, set a specific :port via the proxy override.
+// "verify it's you"). Random pick; for guaranteed-distinct, set a specific :port override.
 async function getProxyPort() {
   let { proxyPort } = await chrome.storage.local.get(["proxyPort"]);
-  const ports = PROXY_BASE.ports;
+  const ports = activeProxyBase().ports;
   if (!proxyPort || !ports.includes(proxyPort)) {
     proxyPort = ports[Math.floor(Math.random() * ports.length)];
     await chrome.storage.local.set({ proxyPort });
@@ -168,12 +198,12 @@ async function getProxyPort() {
   return proxyPort;
 }
 
-// Effective proxy URL: manual proxyUrl overrides; else proxyAuto builds the
-// Oxylabs URL from PROXY_BASE + this profile's port; else "" (direct).
+// Effective proxy URL: manual proxyUrl overrides; else proxyAuto builds the Oxylabs URL
+// from the ACTIVE proxy base (server pool if set, else baked-in) + this profile's port.
 async function resolveProxyUrl(settings) {
   if (settings.proxyUrl) return settings.proxyUrl;
   if (!settings.proxyAuto) return "";
-  const b = PROXY_BASE;
+  const b = activeProxyBase();
   const port = await getProxyPort();
   return `http://${b.user}:${b.pass}@${b.host}:${port}`;
 }
@@ -207,6 +237,7 @@ function pacProxyToken(p) {
 // Flow2API backend go DIRECT. This stops the proxy from hijacking the whole
 // profile while still making reCAPTCHA mint from the per-profile residential IP.
 async function applyProxy(settings) {
+  await fetchProxyPool(settings);   // #2: pick up any server-managed pool (added IPs)
   const p = parseProxyUrl(await resolveProxyUrl(settings));
   if (!p) { await clearProxy(); return; }
   proxyCreds = { username: p.username, password: p.password };
