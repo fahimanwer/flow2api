@@ -251,19 +251,39 @@ class TokenManager:
     async def mark_recaptcha_failure(self, token_id: int) -> None:
         """Progressive per-account cooldown after a reCAPTCHA / unusual-activity failure.
 
-        Escalates with each consecutive strike (RECAPTCHA_BACKOFF_SECONDS) and pauses the
-        WHOLE token across every model (anti-bot reputation is account/IP-level, not
-        per-model). Strikes only keep climbing within a recent burst; a gap longer than
-        RECAPTCHA_STRIKE_DECAY since the last cooldown resets to strike 1. Persisted so a
-        redeploy doesn't forget and re-hammer a flagged account. Cleared on success.
+        One strike per FAILURE ROUND, not per failed request. Escalates the pause with
+        each consecutive round (RECAPTCHA_BACKOFF_SECONDS) and pauses the WHOLE token
+        across every model (anti-bot reputation is account/IP-level, not per-model).
+
+        Concurrency-safe: N requests that land on one account at once and all fail together
+        are the SAME reputation event — they'd otherwise stack strikes 1→N and jump straight
+        to the cap. Any failure that arrives while the account is ALREADY cooling (now <
+        prev_until) is treated as an in-flight straggler of the current round and does NOT
+        escalate. Escalation happens only on a genuine RETRY that fails again after the
+        cooldown lapsed (still within RECAPTCHA_STRIKE_DECAY); a long quiet gap resets to
+        strike 1. The read→write below has no await, so asyncio can't interleave it — the
+        first failure's strike is committed before any concurrent sibling is scheduled.
+        Persisted so a redeploy doesn't forget and re-hammer a flagged account. Cleared on
+        success.
         """
         now = datetime.now(timezone.utc)
-        strikes = 0
         prev = self._recaptcha_cd.get(token_id)
         if prev:
             prev_until, prev_strikes = prev
-            if now < prev_until + self.RECAPTCHA_STRIKE_DECAY:
-                strikes = prev_strikes
+            if now < prev_until:
+                # Still cooling from a strike set moments ago → concurrent/in-flight
+                # straggler for the SAME round. Count the burst as one strike: no escalate,
+                # no shortening of the window.
+                debug_logger.log_info(
+                    f"[RECAPTCHA_CD] token={token_id} concurrent failure inside active "
+                    f"cooldown; strike stays {prev_strikes} (not escalating)"
+                )
+                return
+            # Cooldown already lapsed: escalate only if it retried and failed again within
+            # the recent-burst window; a long quiet gap resets to strike 1.
+            strikes = prev_strikes if now < prev_until + self.RECAPTCHA_STRIKE_DECAY else 0
+        else:
+            strikes = 0
         strikes += 1
         seconds = self.RECAPTCHA_BACKOFF_SECONDS[
             min(strikes, len(self.RECAPTCHA_BACKOFF_SECONDS)) - 1
