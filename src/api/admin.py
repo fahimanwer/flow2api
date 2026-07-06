@@ -17,6 +17,7 @@ from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha_task_type
 from ..core.monitoring import build_public_health_snapshot
+from ..core.logger import mask_proxy_url
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
@@ -1078,12 +1079,10 @@ async def refresh_session_via_extension(
         ),
     }
 
-    route_key = (target.extension_route_key or "").strip()
-    if not route_key:
-        debug_logger.log_info(f"[API] 会话刷新被拒绝(not_bound): token_id={token_id}")
-        return {"success": False, "reason": "not_bound",
-                "detail": reason_messages["not_bound"], "token": _tok(target)}
-
+    # NOTE: no longer refuse an empty route_key here. request_session_refresh now
+    # safely fans out over the shared browser pool (email-guarded push), so the button
+    # works whether or not a per-account Route Key is bound. A bound Route Key still
+    # targets exactly one browser.
     try:
         service = await ExtensionCaptchaService.get_instance(db=db)
         result = await service.request_session_refresh(token_id, timeout=30)
@@ -1108,6 +1107,86 @@ async def refresh_session_via_extension(
     except Exception as e:
         debug_logger.log_error(f"[API] 会话刷新异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"会话刷新失败: {str(e)}")
+
+
+async def _probe_egress_ip(label: str, proxy_url: Optional[str], timeout: float = 10.0) -> dict:
+    """Fetch this server's PUBLIC egress IP as seen through `proxy_url` (or direct).
+
+    Read-only diagnostic: shows which IP each leg of the pipeline exits from, so a
+    residential-mint vs datacenter-redeem mismatch is visible at a glance. Proxy
+    credentials are masked in the response.
+    """
+    entry = {"label": label, "egress": mask_proxy_url(proxy_url), "ip": None, "error": None}
+    try:
+        async with AsyncSession(trust_env=False) as session:
+            resp = await session.get(
+                "https://api.ipify.org?format=json",
+                proxy=proxy_url,
+                timeout=timeout,
+                impersonate="chrome124",
+            )
+            if resp.status_code == 200:
+                try:
+                    entry["ip"] = resp.json().get("ip")
+                except Exception:
+                    entry["ip"] = (resp.text or "").strip()[:64]
+            else:
+                entry["error"] = f"HTTP {resp.status_code}"
+    except Exception as e:
+        entry["error"] = str(e)[:200]
+    return entry
+
+
+@router.get("/api/admin/ip-debug")
+async def ip_debug(token: str = Depends(verify_admin_token)):
+    """Show the public egress IP for every server-side leg (direct / request proxy /
+    media proxy / each captcha-browser proxy). Use it to confirm whether the image
+    request (redeem) exits the SAME IP that mints the reCAPTCHA.
+
+    NOTE: in `extension` captcha mode the reСAPTCHA is minted inside the operator's
+    Chrome extension, which egresses from ITS OWN proxy — the server cannot observe
+    that IP here; the extension must report it (see the worker extension). This probes
+    only the server-controlled legs.
+    """
+    probes: list = []
+    request_proxy = None
+    media_proxy = None
+    if proxy_manager:
+        try:
+            request_proxy = await proxy_manager.get_request_proxy_url()
+            media_proxy = await proxy_manager.get_media_proxy_url()
+        except Exception:
+            pass
+
+    tasks = [
+        _probe_egress_ip("direct (no proxy)", None),
+        _probe_egress_ip("request_proxy (redeem/generate)", request_proxy),
+        _probe_egress_ip("media_proxy (image up/download)", media_proxy),
+    ]
+
+    # Server-side captcha-browser proxies (used by built-in browser/personal modes,
+    # NOT the extension). Comma-separated list in captcha_config.browser_proxy_url.
+    try:
+        cap = await db.get_captcha_config() if db else None
+        raw = (getattr(cap, "browser_proxy_url", "") or "").strip() if cap else ""
+        for i, part in enumerate([p.strip() for p in raw.split(",") if p.strip()]):
+            tasks.append(_probe_egress_ip(f"captcha_browser_proxy[{i}]", part))
+    except Exception:
+        pass
+
+    probes = await asyncio.gather(*tasks)
+
+    method = getattr(config, "captcha_method", None)
+    return {
+        "success": True,
+        "captcha_method": method,
+        "probes": probes,
+        "note": (
+            "Compare 'request_proxy' (where the image request exits) against the reCAPTCHA "
+            "MINT IP. In 'extension' mode the mint IP is the extension's own egress and is not "
+            "visible here — it must be reported by the worker extension."
+        ),
+    }
 
 
 @router.post("/api/tokens/st2at")

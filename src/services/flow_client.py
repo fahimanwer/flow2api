@@ -12,7 +12,7 @@ from urllib.parse import quote
 import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
-from ..core.logger import debug_logger
+from ..core.logger import debug_logger, mask_proxy_url
 from ..core.config import config, get_yescaptcha_min_score
 
 try:
@@ -326,6 +326,24 @@ class FlowClient:
                     debug_logger.log_error(f"[API FAILED] URL: {url}")
                     debug_logger.log_error(f"[API FAILED] Request Body: {json_data}")
                     debug_logger.log_error(f"[API FAILED] Response: {response.text}")
+
+                    # Always-on operational signal: classify anti-bot failures and
+                    # expose the egress used, so reCAPTCHA/quota/auth failures are
+                    # visible in `docker logs` WITHOUT the gated firehose. The redeem
+                    # IP printed here is what to compare against the mint IP.
+                    _low = f"{error_reason} {response.text[:300]}".lower()
+                    if any(m in _low for m in ("recaptcha", "captcha", "evaluation failed", "unusual_activity")):
+                        _cls = "RECAPTCHA"
+                    elif any(m in _low for m in ("resource_exhausted", "resource has been exhausted", "quota")):
+                        _cls = "QUOTA"
+                    elif response.status_code == 401 or "unauthenticated" in _low:
+                        _cls = "AUTH/ST_EXPIRED"
+                    else:
+                        _cls = "HTTP"
+                    debug_logger.op_warning(
+                        f"[FLOW_FAIL] class={_cls} http={response.status_code} "
+                        f"egress={mask_proxy_url(proxy_url)} reason={error_reason[:160]}"
+                    )
 
                     raise FlowAPIError(response.status_code, error_reason, parsed_reason)
 

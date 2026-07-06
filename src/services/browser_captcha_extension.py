@@ -222,52 +222,96 @@ class ExtensionCaptchaService:
         finally:
             self.pending_requests.pop(req_id, None)
 
-    async def request_session_refresh(self, token_id: Optional[int], timeout: int = 30) -> dict:
-        """Tell the worker browser BOUND to this token to refresh its Google Labs
-        session NOW (read the live cookie, push a fresh ST), and return the result.
+    async def _dispatch_session_refresh_to(
+        self, conn: "ExtensionConnection", token_id: Optional[int], timeout: int
+    ) -> dict:
+        """Send one refresh_session command to a specific browser and await its ack.
 
-        Targets only the extension whose route_key matches the token's
-        extension_route_key. Refuses to act on an empty route_key: an empty key
-        would round-robin to a RANDOM shared-pool browser (_select_connection)
-        and read the WRONG account's cookie — so we return ``not_bound`` instead.
-        Only works while that browser is still logged in; a logged-out session
-        surfaces as ``logged_out`` (no command can recover it).
+        The extension reads its LIVE Google Labs cookie and pushes it to
+        /api/plugin/update-token WITH this token_id; that endpoint is email-guarded
+        (409 => account_mismatch) so pushing to the wrong account is a safe no-op.
         """
-        route_key = await self._resolve_route_key(token_id)
-        if not route_key:
-            return {"status": "not_bound", "token_id": token_id}
-        conn = self._select_connection(route_key)
-        if conn is None:
-            return {
-                "status": "no_browser",
-                "route_key": route_key,
-                "available": self._describe_routes() or "none",
-            }
-
         req_id = f"refresh_{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
         self.pending_requests[req_id] = future
         try:
-            debug_logger.log_info(
-                f"[Extension Captcha] Dispatching session refresh via route_key={route_key}, "
-                f"label={conn.client_label or '-'}, token_id={token_id}, req_id={req_id}"
-            )
             await conn.websocket.send_text(json.dumps({
                 "type": "refresh_session",
                 "req_id": req_id,
-                "route_key": route_key,
+                "route_key": conn.route_key or "",
                 "token_id": token_id,
             }))
             result = await asyncio.wait_for(future, timeout=timeout)
             return result if isinstance(result, dict) else {"status": "error", "error": "malformed ack"}
         except asyncio.TimeoutError:
-            debug_logger.log_error(f"[Extension Captcha] Timeout waiting for session refresh (req_id: {req_id})")
-            return {"status": "timeout", "req_id": req_id, "route_key": route_key}
+            return {"status": "timeout", "req_id": req_id}
         except Exception as e:
-            debug_logger.log_error(f"[Extension Captcha] Session refresh communication error: {e}")
             return {"status": "error", "error": str(e)}
         finally:
             self.pending_requests.pop(req_id, None)
+
+    async def request_session_refresh(self, token_id: Optional[int], timeout: int = 30) -> dict:
+        """Tell the worker browser holding this account's Google Labs session to
+        refresh it NOW (read the live cookie, push a fresh ST), and return the result.
+
+        Two modes:
+        - BOUND (token has an extension_route_key): dispatch only to that browser.
+        - SHARED POOL (empty route_key): the correct browser is identified by ACCOUNT,
+          not route_key. We fan out SERIALLY over connected browsers; the email guard on
+          /api/plugin/update-token makes a wrong-account push a safe no-op (account_mismatch),
+          so we stop on the first ``refreshed`` and continue past mismatches. This lets the
+          refresh work in a shared-pool deployment without per-account route keys.
+        Only works while that browser is still logged in; a logged-out session surfaces as
+        ``logged_out`` (no command can recover it — a human must re-login there).
+        """
+        if not self.active_connections:
+            return {"status": "no_browser", "token_id": token_id}
+
+        route_key = await self._resolve_route_key(token_id)
+        if route_key:
+            conn = self._select_connection(route_key)
+            if conn is None:
+                return {
+                    "status": "no_browser",
+                    "route_key": route_key,
+                    "available": self._describe_routes() or "none",
+                }
+            debug_logger.event(f"[EXT_REFRESH] token={token_id} route_key={route_key} (bound)")
+            return await self._dispatch_session_refresh_to(conn, token_id, timeout)
+
+        # Shared pool: bound each attempt so a stack of offline/busy browsers can't
+        # blow the caller's overall timeout. Serialize to avoid multi-tab reload storms.
+        conns = list(self.active_connections)
+        per_conn_timeout = max(8, min(timeout, 15))
+        debug_logger.event(
+            f"[EXT_REFRESH] token={token_id} shared-pool fan-out over {len(conns)} browser(s)"
+        )
+        last: dict = {"status": "no_browser", "token_id": token_id}
+        saw_mismatch = False
+        saw_logged_out = False
+        for conn in conns:
+            result = await self._dispatch_session_refresh_to(conn, token_id, per_conn_timeout)
+            status = (result or {}).get("status")
+            if status == "refreshed":
+                debug_logger.event(
+                    f"[EXT_REFRESH] token={token_id} refreshed via label={conn.client_label or '-'}"
+                )
+                return result
+            if status == "account_mismatch":
+                saw_mismatch = True
+            elif status == "logged_out":
+                saw_logged_out = True
+            last = result
+        # Nobody refreshed. Prefer the most actionable reason for the operator.
+        if saw_mismatch:
+            debug_logger.op_warning(
+                f"[EXT_REFRESH] token={token_id} no browser is logged into this account "
+                f"(account_mismatch on all)"
+            )
+            return {"status": "account_mismatch", "token_id": token_id}
+        if saw_logged_out:
+            return {"status": "logged_out", "token_id": token_id}
+        return last
 
     async def report_flow_error(self, project_id: str, error_reason: str, error_message: str = ""):
         _ = project_id, error_message

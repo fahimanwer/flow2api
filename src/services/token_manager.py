@@ -732,6 +732,10 @@ class TokenManager:
         try:
             from ..core.config import config
 
+            # Extension mode: command the logged-in worker browser to push a fresh ST.
+            if config.captcha_method == "extension":
+                return await self._try_refresh_st_via_extension(token_id, token)
+
             # 仅在 personal 模式下支持 ST 自动刷新
             if config.captcha_method != "personal":
                 debug_logger.log_info(f"[ST_REFRESH] 非 personal 模式，跳过 ST 自动刷新")
@@ -775,6 +779,44 @@ class TokenManager:
 
         except Exception as e:
             debug_logger.log_error(f"[ST_REFRESH] Token {token_id}: 刷新 ST 失败 - {str(e)}")
+            record_token_refresh("st", "failure")
+            return None
+
+    async def _try_refresh_st_via_extension(self, token_id: int, token) -> Optional[str]:
+        """Extension mode ST auto-refresh: command the logged-in worker browser to
+        read its live Google Labs cookie and push a fresh ST to /api/plugin/update-token
+        (which writes token.st). On success we re-read the token and return the fresh ST
+        so ``_refresh_at_inner`` can retry the AT. Works with OR without a bound Route Key
+        (the shared-pool fan-out is email-guarded, so it never touches the wrong account).
+        """
+        try:
+            from .browser_captcha_extension import ExtensionCaptchaService
+
+            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 通过扩展刷新 ST...")
+            service = await ExtensionCaptchaService.get_instance(self.db)
+            result = await service.request_session_refresh(token_id, timeout=30)
+            status = (result or {}).get("status")
+
+            if status == "refreshed":
+                updated = await self.db.get_token(token_id)
+                new_st = updated.st if updated else None
+                if new_st and new_st != token.st:
+                    debug_logger.event(f"[ST_REFRESH] token={token_id} ST refreshed via extension")
+                    record_token_refresh("st", "success")
+                    return new_st
+                debug_logger.op_warning(
+                    f"[ST_REFRESH] token={token_id} extension reported refreshed but ST unchanged"
+                )
+                record_token_refresh("st", "failure")
+                return None
+
+            debug_logger.op_warning(
+                f"[ST_REFRESH] token={token_id} extension refresh not successful (status={status})"
+            )
+            record_token_refresh("st", "failure")
+            return None
+        except Exception as e:
+            debug_logger.op_error(f"[ST_REFRESH] token={token_id} extension refresh error: {e}")
             record_token_refresh("st", "failure")
             return None
 

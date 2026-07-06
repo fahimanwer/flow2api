@@ -331,7 +331,11 @@ class LoadBalancer:
         """给出更明确的“无可用账号”原因，优先用于分辨率/tier 档位提示。"""
         active_tokens = await self.token_manager.get_active_tokens()
         if not active_tokens:
-            return None
+            return (
+                "No active account is available — every account is currently disabled, "
+                "cooling down, or has an expired session. Re-enable at least one account "
+                "(or refresh its session) in the admin UI."
+            )
 
         required_tier = get_required_paygate_tier_for_model(model)
         supported_tokens = []

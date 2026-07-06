@@ -1,6 +1,7 @@
 """Debug logger module for detailed API request/response logging"""
 import json
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -12,6 +13,7 @@ class DebugLogger:
     def __init__(self):
         self.log_file = Path("logs.txt")
         self._setup_logger()
+        self._setup_ops_logger()
 
     def _setup_logger(self):
         """Setup file logger"""
@@ -42,6 +44,45 @@ class DebugLogger:
 
         # Prevent propagation to root logger
         self.logger.propagate = False
+
+    def _setup_ops_logger(self):
+        """Always-on OPERATIONAL logger -> stdout (captured by `docker logs`).
+
+        Deliberately NOT gated behind `config.debug_enabled`: these are the concise,
+        low-volume, high-signal lines an operator needs to see in production (which
+        token served a request, the egress proxy used, the reCAPTCHA/quota outcome,
+        the final result). The verbose request/response *firehose* stays gated and
+        file-only (see log_request/log_response) so the disk never blows up.
+        """
+        self.ops = logging.getLogger("flow2api.ops")
+        self.ops.setLevel(logging.INFO)
+        self.ops.handlers.clear()
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        self.ops.addHandler(handler)
+        self.ops.propagate = False
+
+    def event(self, message: str):
+        """Always-on operational INFO event (stdout). Keep it a single concise line."""
+        try:
+            self.ops.info(f"ℹ️  [{self._format_timestamp()}] {message}")
+        except Exception:
+            pass
+
+    def op_warning(self, message: str):
+        """Always-on operational WARNING (stdout)."""
+        try:
+            self.ops.warning(f"⚠️  [{self._format_timestamp()}] {message}")
+        except Exception:
+            pass
+
+    def op_error(self, message: str):
+        """Always-on operational ERROR (stdout). Unlike log_error, never gated."""
+        try:
+            self.ops.error(f"🔴 [{self._format_timestamp()}] {message}")
+        except Exception:
+            pass
 
     def _mask_token(self, token: str) -> str:
         """Mask token for logging (show first 6 and last 6 characters)"""
@@ -277,6 +318,30 @@ class DebugLogger:
             self.logger.warning(f"⚠️  [{self._format_timestamp()}] {message}")
         except Exception as e:
             self.logger.error(f"Error logging warning: {e}")
+
+def mask_proxy_url(proxy_url: Optional[str]) -> str:
+    """Redact credentials from a proxy URL for safe logging.
+
+    `socks5://user:pass@host:port` -> `socks5://user:***@host:port`.
+    Non-proxy / empty values render as `direct`. Never raises.
+    """
+    if not proxy_url:
+        return "direct"
+    try:
+        raw = str(proxy_url).strip()
+        if "@" not in raw:
+            return raw
+        scheme = ""
+        rest = raw
+        if "://" in raw:
+            scheme, rest = raw.split("://", 1)
+            scheme += "://"
+        creds, host = rest.rsplit("@", 1)
+        user = creds.split(":", 1)[0] if ":" in creds else creds
+        return f"{scheme}{user}:***@{host}"
+    except Exception:
+        return "***"
+
 
 # Global debug logger instance
 debug_logger = DebugLogger()

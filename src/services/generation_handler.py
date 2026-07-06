@@ -1265,6 +1265,7 @@ class GenerationHandler:
             if not error_msg:
                 error_msg = self._get_no_token_error_message(generation_type)
             debug_logger.log_error(f"[GENERATION] {error_msg}")
+            debug_logger.op_warning(f"[GEN] req={request_id} model={model} type={generation_type} NO_TOKEN: {error_msg}")
             record_generation_result(generation_type, "no_token", time.time() - start_time)
             await self._log_request(
                 token_id=None,
@@ -1283,6 +1284,7 @@ class GenerationHandler:
             return
 
         debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
+        debug_logger.event(f"[GEN] req={request_id} token={token.id}({token.email}) model={model} type={generation_type}")
         pending_token_state["active"] = True
         await self._update_request_log_progress(
             request_log_state,
@@ -1416,6 +1418,10 @@ class GenerationHandler:
             # 7. 记录成功日志
             duration = time.time() - start_time
             record_generation_result(generation_type, "success", duration)
+            debug_logger.event(
+                f"[GEN] req={request_id} token={token.id}({token.email}) model={model} "
+                f"type={generation_type} RESULT=success {int(duration * 1000)}ms"
+            )
             perf_trace["status"] = "success"
             perf_trace["total_ms"] = int(duration * 1000)
             # 日志中保留更完整的 prompt，避免管理页只看到过短内容
