@@ -17,7 +17,7 @@ from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha_task_type
 from ..core.monitoring import build_public_health_snapshot
-from ..core.logger import mask_proxy_url
+from ..core.logger import debug_logger, mask_proxy_url
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
