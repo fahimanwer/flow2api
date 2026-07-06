@@ -149,7 +149,7 @@ class TokenManager:
     # escalates the pause (seconds, capped at the last value); a success resets it. Backing
     # off — instead of re-picking a flagged account every few seconds and racking up more
     # rejections — is what lets Google's reCAPTCHA score recover and stops the spiral.
-    RECAPTCHA_BACKOFF_SECONDS = (60, 180, 300, 600, 900, 1800)  # strike 1..6+, capped
+    RECAPTCHA_BACKOFF_SECONDS = (60, 180, 300, 600, 900, 1800, 3600, 7200)  # strike 1..8+, capped at 2h
     # If the previous cooldown ended more than this ago, the next failure is treated as a
     # fresh strike-1 (an occasional blip) rather than a continuation of an old burst.
     RECAPTCHA_STRIKE_DECAY = timedelta(minutes=30)
