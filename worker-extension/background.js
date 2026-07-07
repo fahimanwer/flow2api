@@ -158,6 +158,9 @@ const PROXY_BASE = {
 // IPs in the UI, new profiles pick them up here WITHOUT redistributing the extension.
 // Falls back to the baked-in PROXY_BASE if the server hasn't set a pool / is unreachable.
 let extProxyPool = null;
+// Server-assigned port for THIS device (coordinated least-loaded balancing across all
+// devices, so each account gets its own IP while ports are free, then spreads evenly).
+let extAssignedPort = null;
 
 function activeProxyBase() {
   if (extProxyPool && extProxyPool.host && Array.isArray(extProxyPool.ports) && extProxyPool.ports.length) {
@@ -175,12 +178,18 @@ async function fetchProxyPool(settings) {
   try {
     if (!settings.serverBase || !settings.connectionToken) return;
     const base = new URL(settings.serverBase);
-    const url = `${base.protocol}//${base.host}/api/plugin/proxy-pool`;
+    // Send our route_key so the server can assign THIS device a distinct, least-loaded IP.
+    const rk = (settings.routeKey || "").trim();
+    const url = `${base.protocol}//${base.host}/api/plugin/proxy-pool`
+      + (rk ? `?route_key=${encodeURIComponent(rk)}` : "");
     const resp = await fetch(url, { headers: { "Authorization": `Bearer ${settings.connectionToken}` } });
     if (!resp.ok) return;
     const data = await resp.json();
     if (data && data.pool && Array.isArray(data.pool.ports) && data.pool.ports.length && data.pool.host) {
       extProxyPool = data.pool;
+    }
+    if (data && Number.isInteger(data.assigned_port)) {
+      extAssignedPort = data.assigned_port;
     }
   } catch (_) { /* keep the baked-in fallback */ }
 }
@@ -189,8 +198,17 @@ async function fetchProxyPool(settings) {
 // profile keeps the SAME IP across SW restarts (a flapping IP triggers Google's
 // "verify it's you"). Random pick; for guaranteed-distinct, set a specific :port override.
 async function getProxyPort() {
-  let { proxyPort } = await chrome.storage.local.get(["proxyPort"]);
   const ports = activeProxyBase().ports;
+  // Prefer the SERVER-ASSIGNED port (coordinated least-loaded balancing across every
+  // device). Adopting it overrides any stale random pick, so adding IPs and reconnecting
+  // auto-resolves collisions. Persist it for stability across service-worker restarts.
+  if (extAssignedPort && ports.includes(extAssignedPort)) {
+    const cur = await chrome.storage.local.get(["proxyPort"]);
+    if (cur.proxyPort !== extAssignedPort) await chrome.storage.local.set({ proxyPort: extAssignedPort });
+    return extAssignedPort;
+  }
+  // Fallback (old server / offline / no route_key): keep a persisted port, else random.
+  let { proxyPort } = await chrome.storage.local.get(["proxyPort"]);
   if (!proxyPort || !ports.includes(proxyPort)) {
     proxyPort = ports[Math.floor(Math.random() * ports.length)];
     await chrome.storage.local.set({ proxyPort });

@@ -888,6 +888,17 @@ class Database:
                 )
             """)
 
+            # Coordinated residential-IP balancing: which pool port (= which IP) each
+            # device (route_key) is assigned. Server hands out the least-loaded port so
+            # each account gets its own IP while IPs are free, then spreads evenly.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS device_port_assignments (
+                    route_key TEXT PRIMARY KEY,
+                    port INTEGER NOT NULL,
+                    assigned_at TIMESTAMP
+                )
+            """)
+
             await db.commit()
 
     async def _migrate_request_logs(self, db):
@@ -1172,6 +1183,46 @@ class Database:
         async with self._connect(write=True) as db:
             await db.execute("DELETE FROM recaptcha_cooldowns WHERE token_id = ?", (token_id,))
             await db.commit()
+
+    # ---- Coordinated residential-IP (proxy-port) assignment per device ----
+    async def assign_device_port(self, route_key: str, pool_ports: list) -> Optional[int]:
+        """Assign THIS device (route_key) a residential proxy port using LEAST-LOADED
+        balancing: each account lands on its own IP while ports are free, and once
+        accounts exceed ports they spread evenly (2/IP, then 3/IP…). Sticky — an existing
+        assignment to a port still in the pool is kept unchanged. Atomic within one write
+        transaction (SQLite serializes writers) so concurrent devices never collide onto
+        the same port."""
+        if not route_key or not pool_ports:
+            return None
+        pool = [int(p) for p in pool_ports]
+        async with self._connect(write=True) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT port FROM device_port_assignments WHERE route_key = ?", (route_key,)
+            )
+            row = await cur.fetchone()
+            if row and int(row["port"]) in pool:
+                return int(row["port"])  # keep a valid existing assignment (stable IP)
+            # Count devices per pool port, excluding this route_key (so a reassignment
+            # doesn't count its own old row).
+            counts = {p: 0 for p in pool}
+            cur = await db.execute(
+                "SELECT port, COUNT(*) AS c FROM device_port_assignments "
+                "WHERE route_key != ? GROUP BY port",
+                (route_key,),
+            )
+            for r in await cur.fetchall():
+                p = int(r["port"])
+                if p in counts:
+                    counts[p] = int(r["c"])
+            chosen = min(pool, key=lambda p: (counts[p], p))  # least-used, tie → lowest port
+            await db.execute(
+                "INSERT INTO device_port_assignments (route_key, port, assigned_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(route_key) DO UPDATE SET port = excluded.port, assigned_at = excluded.assigned_at",
+                (route_key, chosen, datetime.now(timezone.utc).isoformat()),
+            )
+            await db.commit()
+            return chosen
 
     async def delete_token(self, token_id: int):
         """Delete token and related data"""

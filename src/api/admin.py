@@ -2462,16 +2462,28 @@ async def update_plugin_config(
 
 
 @router.get("/api/plugin/proxy-pool")
-async def plugin_proxy_pool(authorization: Optional[str] = Header(None)):
+async def plugin_proxy_pool(
+    route_key: Optional[str] = None, authorization: Optional[str] = Header(None)
+):
     """The worker extension fetches its residential proxy pool from here (connection-token
     authed, like /update-token). Returns {host,user,pass,ports:[...]} or {} if unset, so
-    new IPs added in the admin UI are picked up WITHOUT redistributing the extension."""
+    new IPs added in the admin UI are picked up WITHOUT redistributing the extension.
+
+    When the device sends its route_key, we also COORDINATE its IP: `assigned_port` is a
+    least-loaded pick, so each account gets its own IP while ports are free and they spread
+    evenly once accounts exceed IPs. The extension mints+redeems through that port."""
     plugin_config = await db.get_plugin_config()
     provided = authorization[7:] if (authorization or "").startswith("Bearer ") else (authorization or "")
     if not plugin_config.connection_token or provided != plugin_config.connection_token:
         raise HTTPException(status_code=401, detail="Invalid connection token")
     pool = _parse_ext_proxy_pool(plugin_config.ext_proxy_pool)
-    return {"success": True, "pool": pool or {}}
+    assigned_port = None
+    if pool and route_key:
+        try:
+            assigned_port = await db.assign_device_port((route_key or "").strip(), pool.get("ports") or [])
+        except Exception as e:
+            debug_logger.op_warning(f"[PROXY_POOL] could not assign port for route_key: {e}")
+    return {"success": True, "pool": pool or {}, "assigned_port": assigned_port}
 
 
 @router.post("/api/plugin/update-token")
