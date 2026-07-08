@@ -132,6 +132,30 @@ class ExtensionCaptchaService:
         route_key = await self._resolve_route_key(token_id)
         return self._has_connection_for_route_key(route_key), route_key
 
+    async def _apply_pool_mode(self, route_key: str, pool_mode) -> None:
+        """Persist the device-reported pool for every account bound to `route_key`.
+
+        The Failed-image switch is a DEVICE-level setting: a profile can have pushed
+        more than one account (account switches keep the same route key), and all of
+        them follow the device's pool. Absent/invalid pool_mode (pre-v3.1.0 extensions)
+        changes nothing; unchanged values are not rewritten.
+        """
+        if pool_mode not in ("auto", "failed_image") or not route_key or not self.db:
+            return
+        try:
+            tokens = await self.db.get_all_tokens()
+            for token in tokens:
+                bound_key = (token.extension_route_key or "").strip()
+                current = getattr(token, "pool_mode", None) or "auto"
+                if bound_key == route_key and current != pool_mode:
+                    await self.db.update_token(token.id, pool_mode=pool_mode)
+                    debug_logger.event(
+                        f"[POOL] token={token.id} ({token.email}) {current} -> {pool_mode} "
+                        f"(register, route_key={route_key})"
+                    )
+        except Exception as e:
+            debug_logger.op_warning(f"[POOL] failed to apply pool_mode from register: {e}")
+
     async def handle_message(self, websocket: WebSocket, data: str):
         try:
             payload = json.loads(data)
@@ -146,6 +170,11 @@ class ExtensionCaptchaService:
                         f"[Extension Captcha] Client registered route_key={conn.route_key or '-'}, "
                         f"label={conn.client_label or '-'}"
                     )
+                    # Two-pool routing: register is the device's authoritative pool report.
+                    # Persisting it here makes the Failed-image switch take effect on every
+                    # tick/Reconnect (socket re-register), independent of the session push —
+                    # which is fire-and-forget and has silently failed in the field.
+                    await self._apply_pool_mode(conn.route_key, payload.get("pool_mode"))
                     await self._send_ack(
                         websocket,
                         {

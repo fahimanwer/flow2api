@@ -1002,7 +1002,11 @@ async def captcha_websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    service = await ExtensionCaptchaService.get_instance()
+    # Pass the db so register-time pool_mode persistence works even when no
+    # admin call has seeded the singleton yet (e.g. right after a restart).
+    service = await ExtensionCaptchaService.get_instance(
+        db=generation_handler.db if generation_handler else None
+    )
     await service.connect(websocket)
     try:
         while True:
