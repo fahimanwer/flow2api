@@ -166,9 +166,12 @@ class ExtensionCaptchaService:
                 if conn:
                     conn.route_key = (payload.get("route_key") or conn.route_key or "").strip()
                     conn.client_label = (payload.get("client_label") or conn.client_label or "").strip()
-                    debug_logger.log_info(
-                        f"[Extension Captcha] Client registered route_key={conn.route_key or '-'}, "
-                        f"label={conn.client_label or '-'}"
+                    # Always-on so we can SEE what the extension actually reports on every
+                    # register — distinguishes "sent pool=auto" (no-op) from "sent nothing"
+                    # (old extension). Without this a no-op flip is invisible.
+                    debug_logger.event(
+                        f"[REGISTER] route_key={conn.route_key or '-'} "
+                        f"label={conn.client_label or '-'} pool_mode={payload.get('pool_mode')!r}"
                     )
                     # Two-pool routing: register is the device's authoritative pool report.
                     # Persisting it here makes the Failed-image switch take effect on every
