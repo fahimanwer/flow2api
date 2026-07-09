@@ -54,6 +54,10 @@ class Token(BaseModel):
     # failed-image regeneration). Reported by the extension's "Failed-image mode" switch.
     pool_mode: Optional[str] = "auto"
 
+    # worker-extension version this device last reported (on session push). Lets the
+    # admin see which devices are still on an old build after an update ships.
+    ext_version: Optional[str] = None
+
     # 429禁用相关
     ban_reason: Optional[str] = None  # 禁用原因: "429_rate_limit" 或 None
     banned_at: Optional[datetime] = None  # 禁用时间

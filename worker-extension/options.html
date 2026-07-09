@@ -18,6 +18,12 @@
     .switchhint { font-size: 11px; color: #9aa0a6; margin: 6px 2px 0; line-height: 1.4; }
     #failedModeState { font-weight: 600; }
     #failedModeState.on { color: #f0b562; }
+    #updateBanner { display: none; margin-bottom: 14px; padding: 12px; border-radius: 10px; background: #1a1607; border: 1px solid #4a3a1f; text-align: left; }
+    #updateBanner .ub-title { font-size: 13px; font-weight: 700; color: #f0b562; }
+    #updateBanner .ub-sub { font-size: 11px; color: #cbb892; margin-top: 3px; line-height: 1.45; }
+    #updateBanner a.ub-btn { display: block; margin-top: 10px; padding: 8px; border-radius: 7px; background: #f0b562; color: #241d10; font-size: 12px; font-weight: 700; text-decoration: none; text-align: center; }
+    #updateBanner .ub-steps { font-size: 10.5px; color: #9aa0a6; margin-top: 8px; line-height: 1.5; }
+    #verLine { font-size: 10px; color: #6b7280; margin-top: 12px; }
     button { margin-top: 16px; width: 100%; padding: 10px; border-radius: 8px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; background: #3b6cf6; color: #fff; }
     details { margin-top: 16px; text-align: left; }
     summary { font-size: 11px; color: #6b7280; cursor: pointer; outline: none; }
@@ -27,6 +33,13 @@
 </head>
 <body>
   <h1>Flow2API Worker</h1>
+
+  <div id="updateBanner">
+    <div class="ub-title">⬆︎ Update available: <span id="ubVersion"></span></div>
+    <div class="ub-sub">A newer version of the worker is ready. Update to keep everything working.</div>
+    <a class="ub-btn" id="ubDownload" href="#" target="_blank" rel="noopener">Download update</a>
+    <div class="ub-steps">Then open <b>chrome://extensions</b>, unzip it over the old folder (or load the new folder), and click the extension's <b>reload</b> ↻.</div>
+  </div>
 
   <div id="statusBig" class="checking">Checking…</div>
 
@@ -39,6 +52,8 @@
   <p class="switchhint">Turn ON while you fix failed images — this account is then used <b>only</b> for failed images and kept out of the automatic article generation.</p>
 
   <button id="reconnectBtn">Reconnect</button>
+
+  <div id="verLine"></div>
 
   <details>
     <summary>Details (for support)</summary>

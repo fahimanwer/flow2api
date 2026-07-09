@@ -32,6 +32,22 @@ function refreshStatus() {
   });
 }
 
+function loadUpdateInfo() {
+  chrome.runtime.sendMessage({ action: "getUpdateInfo" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+    const info = resp.updateInfo || {};
+    if (info.current) $("verLine").textContent = "v" + info.current;
+    const banner = $("updateBanner");
+    if (info.updateAvailable && info.downloadUrl) {
+      $("ubVersion").textContent = "v" + info.latest;
+      $("ubDownload").href = info.downloadUrl;
+      banner.style.display = "block";
+    } else {
+      banner.style.display = "none";
+    }
+  });
+}
+
 function loadFailedMode() {
   chrome.storage.local.get(["failedImageMode"], ({ failedImageMode }) => {
     const on = failedImageMode === true;
@@ -46,6 +62,7 @@ document.addEventListener("DOMContentLoaded", () => {
   refreshStatus();
   renderLogs();
   loadFailedMode();
+  loadUpdateInfo();
 
   $("failedImageMode").addEventListener("change", (e) => {
     const on = e.target.checked;

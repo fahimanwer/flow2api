@@ -479,6 +479,7 @@ class Database:
                     ("redeem_proxy_url", "TEXT"),  # Slice B: per-account residential redeem proxy
                     ("browser_user_agent", "TEXT"),  # Slice B: extension browser real UA
                     ("pool_mode", "TEXT DEFAULT 'auto'"),  # 'auto' | 'failed_image' (two-pool routing)
+                    ("ext_version", "TEXT"),  # worker-extension version this device last reported
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -644,7 +645,8 @@ class Database:
                     banned_at TIMESTAMP,
                     redeem_proxy_url TEXT,
                     browser_user_agent TEXT,
-                    pool_mode TEXT DEFAULT 'auto'
+                    pool_mode TEXT DEFAULT 'auto',
+                    ext_version TEXT
                 )
             """)
 

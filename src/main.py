@@ -15,7 +15,7 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
-from .api import routes, admin
+from .api import routes, admin, ext_update
 
 
 @asynccontextmanager
@@ -173,14 +173,14 @@ async def lifespan(app: FastAPI):
 
     log_cleanup_task_handle = asyncio.create_task(log_cleanup_task())
 
-    print(f"✓ Database initialized")
+    print("✓ Database initialized")
     print(f"✓ Total tokens: {len(tokens)}")
     print(f"✓ Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
     if cache_cleanup_enabled:
         print("✓ File cache cleanup task started")
     else:
         print("✓ File cache cleanup task disabled (timeout <= 0)")
-    print(f"✓ Token auto-recovery task started (runs every 5 min)")
+    print("✓ Token auto-recovery task started (runs every 5 min)")
     log_cleanup_cfg = await db.get_log_cleanup_config()
     if log_cleanup_cfg.enabled:
         print(
@@ -240,6 +240,7 @@ generation_handler = GenerationHandler(
 # Set dependencies
 routes.set_generation_handler(generation_handler)
 admin.set_dependencies(token_manager, proxy_manager, db, concurrency_manager)
+ext_update.set_dependencies(db, admin.verify_admin_token)
 
 # Create FastAPI app
 app = FastAPI(
@@ -261,6 +262,7 @@ app.add_middleware(
 # Include routers
 app.include_router(routes.router)
 app.include_router(admin.router)
+app.include_router(ext_update.router)
 
 # Static files - serve tmp directory for cached files
 tmp_dir = Path(__file__).parent.parent / "tmp"
@@ -305,6 +307,15 @@ async def test_page():
     if test_file.exists():
         return FileResponse(str(test_file))
     return HTMLResponse(content="<h1>Test Page Not Found</h1>", status_code=404)
+
+
+@app.get("/ext-upload", response_class=HTMLResponse)
+async def ext_upload_page():
+    """Admin 'Publish extension' page (reuses the console's admin session)."""
+    ext_file = static_path / "ext.html"
+    if ext_file.exists():
+        return FileResponse(str(ext_file))
+    return HTMLResponse(content="<h1>Publish page not found</h1>", status_code=404)
 
 
 @app.get("/metrics")

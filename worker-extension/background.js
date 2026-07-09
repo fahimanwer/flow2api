@@ -130,8 +130,58 @@ function deriveUrls(settings) {
   const base = new URL(settings.serverBase);
   const wsScheme = base.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = `${wsScheme}//${base.host}/captcha_ws`;
-  const updateUrl = `${base.protocol}//${base.host}/api/plugin/update-token`;
-  return { wsUrl, updateUrl };
+  const origin = `${base.protocol}//${base.host}`;
+  const updateUrl = `${origin}/api/plugin/update-token`;
+  const versionUrl = `${origin}/api/plugin/ext-version`;
+  const downloadUrl = `${origin}/download/worker-latest.zip?token=${encodeURIComponent(settings.connectionToken || "")}`;
+  return { wsUrl, updateUrl, versionUrl, downloadUrl };
+}
+
+// This build's own version, from the manifest — reported to the backend and
+// compared against the latest published package for the update banner.
+function extVersion() {
+  try { return chrome.runtime.getManifest().version || ""; } catch (_) { return ""; }
+}
+
+// Numeric dotted-version compare: >0 if a>b, <0 if a<b, 0 if equal. "3.3.10" > "3.3.9".
+function cmpVersion(a, b) {
+  const pa = String(a || "").split("."), pb = String(b || "").split(".");
+  const n = Math.max(pa.length, pb.length);
+  for (let i = 0; i < n; i++) {
+    const x = parseInt(pa[i] || "0", 10) || 0, y = parseInt(pb[i] || "0", 10) || 0;
+    if (x !== y) return x - y;
+  }
+  return 0;
+}
+
+// Ask the backend for the latest published version and cache an updateInfo blob
+// the popup reads. DIRECT egress (the PAC only proxies Google), so this never
+// burns residential bandwidth. Silent-soft on any error — never blocks the worker.
+async function checkForUpdate(settings) {
+  settings = settings || (await getSettings());
+  if (!settings.serverBase || !settings.connectionToken) return null;
+  try {
+    const { versionUrl, downloadUrl } = deriveUrls(settings);
+    const resp = await fetch(versionUrl, {
+      headers: { "Authorization": `Bearer ${settings.connectionToken}` },
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const latest = (data && data.version) ? String(data.version) : "";
+    const current = extVersion();
+    const info = {
+      current,
+      latest,
+      updateAvailable: !!latest && cmpVersion(latest, current) > 0,
+      downloadUrl,
+      checkedAt: Date.now(),
+    };
+    await chrome.storage.local.set({ updateInfo: info });
+    if (info.updateAvailable) await log("INFO", `Extension update available: v${latest} (you have v${current})`);
+    return info;
+  } catch (e) {
+    return null;
+  }
 }
 
 /* ------------------------------- proxy ------------------------------- */
@@ -844,7 +894,7 @@ async function connectWS() {
     if (ws !== socket) { try { socket.close(); } catch (_) {} return; }
     connecting = false;
     log("SUCCESS", "Captcha WebSocket connected", { routeKey: settings.routeKey || "(empty)" });
-    sendWS({ type: "register", route_key: settings.routeKey, client_label: settings.clientLabel, pool_mode: settings.failedImageMode ? "failed_image" : "auto" }, socket);
+    sendWS({ type: "register", route_key: settings.routeKey, client_label: settings.clientLabel, pool_mode: settings.failedImageMode ? "failed_image" : "auto", ext_version: extVersion() }, socket);
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(() => sendWS({ type: "ping" }, socket), HEARTBEAT_MS);
     // Warm the persistent tab so the first real request is fast (login-aware).
@@ -1064,6 +1114,8 @@ async function refreshSession(token_id = null) {
     if (settings.routeKey) pushBody.route_key = settings.routeKey;
     // Two-pool routing: report this profile's pool from the "Failed-image mode" switch.
     pushBody.pool_mode = settings.failedImageMode ? "failed_image" : "auto";
+    // Version visibility: report this build's version so the admin can see who's outdated.
+    pushBody.ext_version = extVersion();
 
     const resp = await fetch(updateUrl, {
       method: "POST",
@@ -1121,6 +1173,7 @@ async function setupAlarms() {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_SESSION) {
     await refreshSession();
+    checkForUpdate();   // piggyback the hourly session cycle to refresh the update banner
   } else if (alarm.name === ALARM_KEEPALIVE) {
     connectWS();
     // Only ensure a tab when we actually have an OPEN socket — never spin up
@@ -1184,7 +1237,7 @@ chrome.runtime.onStartup.addListener(async () => {
   connectWS();
 });
 
-chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   if (req.action === "testCaptchaConnection") {
     closeSocket(); connectWS();
     sendResponse({ ok: true });
@@ -1216,6 +1269,15 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     sendResponse({ connected: !!(ws && ws.readyState === WebSocket.OPEN) });
     return true;
   }
+  if (req.action === "getUpdateInfo") {
+    // Return the cached banner state immediately, and kick a fresh check so the
+    // next popup open reflects a just-published version.
+    chrome.storage.local.get(["updateInfo"]).then(({ updateInfo }) => {
+      sendResponse({ updateInfo: updateInfo || { current: extVersion(), updateAvailable: false } });
+    });
+    checkForUpdate();
+    return true;
+  }
   if (req.action === "getLogs") {
     chrome.storage.local.get(["logs"]).then(({ logs = [] }) => sendResponse({ logs }));
     return true;
@@ -1232,4 +1294,5 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   await setupAlarms();
   await reconcileTabsOnBoot();
   connectWS();
+  checkForUpdate();   // fire-and-forget: refresh the update banner state on boot
 })();

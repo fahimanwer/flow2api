@@ -3,7 +3,6 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import secrets
@@ -729,6 +728,8 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "current_project_name": row.get("current_project_name"),  # 🆕 项目名称
         "captcha_proxy_url": row.get("captcha_proxy_url") or "",
         "extension_route_key": row.get("extension_route_key") or "",
+        "pool_mode": row.get("pool_mode") or "auto",
+        "ext_version": row.get("ext_version") or "",
         "image_enabled": bool(row.get("image_enabled")),
         "video_enabled": bool(row.get("video_enabled")),
         "image_concurrency": row.get("image_concurrency"),
@@ -1814,7 +1815,7 @@ async def get_cache_config(token: str = Depends(verify_admin_token)):
     cache_config = await db.get_cache_config()
 
     # Calculate effective base URL
-    effective_base_url = cache_config.cache_base_url if cache_config.cache_base_url else f"http://127.0.0.1:8000"
+    effective_base_url = cache_config.cache_base_url if cache_config.cache_base_url else "http://127.0.0.1:8000"
 
     return {
         "success": True,
@@ -2033,7 +2034,7 @@ async def test_captcha_score(
     _token: str = Depends(verify_admin_token)
 ):
     """使用当前打码方式获取 token，并提交到 antcpt 校验分数。"""
-    req = request or CaptchaScoreTestRequest()
+    req = _request or CaptchaScoreTestRequest()
     website_url = (req.website_url or "https://antcpt.com/score_detector/").strip()
     website_key = (req.website_key or "6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf").strip()
     action = (req.action or "homepage").strip()
@@ -2528,6 +2529,10 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     # this account for staff-driven failed-image regeneration (excluded from the auto pool).
     _pm = request.get("pool_mode")
     reported_pool_mode = _pm if _pm in ("auto", "failed_image") else None
+    # Version visibility: the extension reports its own manifest version so the admin can
+    # see which devices are still on an old build after an update ships.
+    _ev = request.get("ext_version")
+    reported_ext_version = str(_ev).strip()[:20] if isinstance(_ev, str) and _ev.strip() else None
 
     # Step 1: Convert ST to AT to get user info (including email)
     try:
@@ -2599,6 +2604,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                     _redeem_updates["extension_route_key"] = reported_route_key
             if reported_pool_mode is not None:
                 _redeem_updates["pool_mode"] = reported_pool_mode
+            if reported_ext_version is not None:
+                _redeem_updates["ext_version"] = reported_ext_version
             if _redeem_updates:
                 await db.update_token(existing_token.id, **_redeem_updates)
                 debug_logger.event(
@@ -2651,6 +2658,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 _redeem_updates["extension_route_key"] = reported_route_key
             if reported_pool_mode is not None:
                 _redeem_updates["pool_mode"] = reported_pool_mode
+            if reported_ext_version is not None:
+                _redeem_updates["ext_version"] = reported_ext_version
             if _redeem_updates:
                 await db.update_token(new_token.id, **_redeem_updates)
 

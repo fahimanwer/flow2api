@@ -171,7 +171,8 @@ class ExtensionCaptchaService:
                     # (old extension). Without this a no-op flip is invisible.
                     debug_logger.event(
                         f"[REGISTER] route_key={conn.route_key or '-'} "
-                        f"label={conn.client_label or '-'} pool_mode={payload.get('pool_mode')!r}"
+                        f"label={conn.client_label or '-'} pool_mode={payload.get('pool_mode')!r} "
+                        f"ext_version={payload.get('ext_version')!r}"
                     )
                     # Two-pool routing: register is the device's authoritative pool report.
                     # Persisting it here makes the Failed-image switch take effect on every
