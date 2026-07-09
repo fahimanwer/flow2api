@@ -64,7 +64,13 @@ const DEFAULT_SETTINGS = {
   // set, overrides the auto URL (form: http://USER:PASS@HOST:PORT). proxyAuto
   // false + empty proxyUrl = direct (no proxy).
   proxyAuto: true,
-  proxyUrl: ""
+  proxyUrl: "",
+  // "Failed-image mode" switch. MUST be listed here: getSettings() reads via
+  // chrome.storage.local.get(DEFAULT_SETTINGS), and that form returns ONLY the keys
+  // present in this object — a key absent here reads back undefined no matter what the
+  // options popup saved, so the register/session-push would always report pool=auto and
+  // the reserve-my-account toggle silently never took effect. Default OFF (auto pool).
+  failedImageMode: false
 };
 
 let ws = null;
