@@ -91,4 +91,5 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   setInterval(() => { refreshStatus(); renderLogs(); }, 4000);
+  setInterval(loadUpdateInfo, 12000);   // re-check so the banner appears even if the popup is left open
 });

@@ -18,7 +18,8 @@
     .switchhint { font-size: 11px; color: #9aa0a6; margin: 6px 2px 0; line-height: 1.4; }
     #failedModeState { font-weight: 600; }
     #failedModeState.on { color: #f0b562; }
-    #updateBanner { display: none; margin-bottom: 14px; padding: 12px; border-radius: 10px; background: #1a1607; border: 1px solid #4a3a1f; text-align: left; }
+    #updateBanner { display: none; margin-bottom: 14px; padding: 13px; border-radius: 10px; background: #2a2109; border: 1px solid #f0b562; text-align: left; animation: ubpulse 1.8s ease-in-out infinite; }
+    @keyframes ubpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(240,181,98,0); } 50% { box-shadow: 0 0 0 4px rgba(240,181,98,.28); } }
     #updateBanner .ub-title { font-size: 13px; font-weight: 700; color: #f0b562; }
     #updateBanner .ub-sub { font-size: 11px; color: #cbb892; margin-top: 3px; line-height: 1.45; }
     #updateBanner a.ub-btn { display: block; margin-top: 10px; padding: 8px; border-radius: 7px; background: #f0b562; color: #241d10; font-size: 12px; font-weight: 700; text-decoration: none; text-align: center; }

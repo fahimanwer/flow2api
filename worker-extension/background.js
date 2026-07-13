@@ -177,7 +177,17 @@ async function checkForUpdate(settings) {
       checkedAt: Date.now(),
     };
     await chrome.storage.local.set({ updateInfo: info });
-    if (info.updateAvailable) await log("INFO", `Extension update available: v${latest} (you have v${current})`);
+    if (info.updateAvailable) {
+      await log("INFO", `Extension update available: v${latest} (you have v${current})`);
+      // Notify ONCE per new version (not on every hourly re-check) so it grabs attention
+      // without becoming noise; the toolbar badge is the persistent reminder after that.
+      const { notifiedUpdateVersion } = await chrome.storage.local.get(["notifiedUpdateVersion"]);
+      if (notifiedUpdateVersion !== latest) {
+        await chrome.storage.local.set({ notifiedUpdateVersion: latest });
+        notifyUpdate(latest);
+      }
+    }
+    await refreshBadge();   // raise (or clear, once updated) the blue ↑ on the toolbar icon
     return info;
   } catch (e) {
     return null;
@@ -395,20 +405,37 @@ async function log(level, message, details) {
 
 /* ------------------------------ user signal -------------------------- */
 
-// The toolbar badge is the reliable, always-visible "login required" signal —
-// it survives the user being away (lid closed) and needs no icon asset.
-function setBadge(state) {
+// The toolbar badge is the reliable, always-visible signal — it survives the user
+// being away (lid closed) and needs no icon asset. Two states share it, by priority:
+//   login_required (red "!")  — urgent, must re-sign-in; ALWAYS outranks an update.
+//   update_available (blue ↑) — a newer ext version is published; shown when login is ok
+//                               so staff notice WITHOUT opening the popup.
+async function setBadge(state) {
   try {
     if (!chrome.action) return;
     if (state === "login_required") {
       chrome.action.setBadgeText({ text: "!" });
       chrome.action.setBadgeBackgroundColor({ color: "#f06262" });
       chrome.action.setTitle({ title: "Flow2API Worker — Google Labs login required" });
-    } else {
-      chrome.action.setBadgeText({ text: "" });
-      chrome.action.setTitle({ title: "Flow2API Worker" });
+      return;
     }
+    // Login is fine — surface an available update on the icon (blue ↑) so it can't be missed.
+    const { updateInfo } = await chrome.storage.local.get(["updateInfo"]);
+    if (updateInfo && updateInfo.updateAvailable) {
+      chrome.action.setBadgeText({ text: "↑" });
+      chrome.action.setBadgeBackgroundColor({ color: "#3b6cf6" });
+      chrome.action.setTitle({ title: `Flow2API Worker — update available (v${updateInfo.latest || ""}). Open me to update.` });
+      return;
+    }
+    chrome.action.setBadgeText({ text: "" });
+    chrome.action.setTitle({ title: "Flow2API Worker" });
   } catch (_) {}
+}
+
+// Recompute the badge from the CURRENT auth + update state (login always wins). Call after
+// either changes so the icon stays truthful without every caller knowing both signals.
+async function refreshBadge() {
+  setBadge((await getAuthState()).state);
 }
 
 async function notifyLogin() {
@@ -425,6 +452,33 @@ async function notifyLogin() {
     });
   } catch (_) {}
 }
+
+// One desktop notification when a NEW version is first detected (badge is the persistent
+// signal; this is the attention-grab). Clicking it starts the download — see onClicked below.
+async function notifyUpdate(latest) {
+  try {
+    await chrome.notifications.create("flow2api_update_" + latest, {
+      type: "basic",
+      iconUrl: "data:image/svg+xml;base64," + btoa(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" rx="18" fill="#3b6cf6"/><text x="48" y="70" font-size="60" text-anchor="middle" fill="#fff" font-family="sans-serif">↑</text></svg>'
+      ),
+      title: "Flow2API Worker — update available",
+      message: `Version ${latest} is ready. Click here to download it, then reload the extension (chrome://extensions ↻).`,
+      priority: 2
+    });
+  } catch (_) {}
+}
+
+// Click the update notification -> open the download URL so the new zip starts downloading.
+chrome.notifications.onClicked.addListener((id) => {
+  if (!id || !id.startsWith("flow2api_update_")) return;
+  (async () => {
+    try {
+      const { downloadUrl } = deriveUrls(await getSettings());
+      await chrome.tabs.create({ url: downloadUrl });
+    } catch (_) {}
+  })();
+});
 
 /* ------------------------------ auth state --------------------------- */
 
@@ -1290,12 +1344,16 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
     return true;
   }
   if (req.action === "getUpdateInfo") {
-    // Return the cached banner state immediately, and kick a fresh check so the
-    // next popup open reflects a just-published version.
-    chrome.storage.local.get(["updateInfo"]).then(({ updateInfo }) => {
-      sendResponse({ updateInfo: updateInfo || { current: extVersion(), updateAvailable: false } });
-    });
-    checkForUpdate();
+    // Return a FRESH result (not the stale cache) so the banner is correct on the popup's
+    // first render — fixes the notice getting stranded in the log right after a publish.
+    // Falls back to cache if the check fails/offline.
+    (async () => {
+      const fresh = await checkForUpdate().catch(() => null);
+      const info = fresh
+        || (await chrome.storage.local.get(["updateInfo"])).updateInfo
+        || { current: extVersion(), updateAvailable: false };
+      sendResponse({ updateInfo: info });
+    })();
     return true;
   }
   if (req.action === "getLogs") {
