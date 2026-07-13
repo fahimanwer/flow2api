@@ -179,6 +179,22 @@ class ExtensionCaptchaService:
                     # tick/Reconnect (socket re-register), independent of the session push —
                     # which is fire-and-forget and has silently failed in the field.
                     await self._apply_pool_mode(conn.route_key, payload.get("pool_mode"))
+                    # Refresh IP-balancing liveness so an active device keeps its assigned IP,
+                    # and ghost route_keys (which never re-register) age out of the load counts.
+                    if conn.route_key:
+                        try:
+                            await self.db.touch_device_seen(conn.route_key)
+                        except Exception:
+                            pass
+                        # Housekeeping (throttled hourly): drop rows for long-dead devices so
+                        # the assignment table self-cleans without a dedicated cron.
+                        try:
+                            import time as _t
+                            if _t.time() - getattr(self, "_last_device_prune", 0) > 3600:
+                                self._last_device_prune = _t.time()
+                                await self.db.prune_stale_device_assignments()
+                        except Exception:
+                            pass
                     await self._send_ack(
                         websocket,
                         {

@@ -13,6 +13,13 @@ from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfi
 class Database:
     """SQLite database manager"""
 
+    # Residential-IP balancing: a device counts toward a port's load only if seen within this
+    # window; ghosts (reinstalled/retired route_keys) age out of the count after it. Generous
+    # enough that a device merely off for a bit keeps its sticky IP reserved.
+    DEVICE_ACTIVE_WINDOW_MIN = 90
+    # Hard-delete assignment rows for devices not seen in this many days (housekeeping).
+    DEVICE_PRUNE_DAYS = 7
+
     def __init__(self, db_path: str = None):
         if db_path is None:
             # Store database in data directory
@@ -604,6 +611,20 @@ class Database:
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
 
+            # Check and add missing columns to device_port_assignments table.
+            # last_seen powers ghost-eviction: only devices seen recently count toward the
+            # per-IP load balancing, and long-dead route_keys (from reinstalls) get pruned.
+            if await self._table_exists(db, "device_port_assignments"):
+                if not await self._column_exists(db, "device_port_assignments", "last_seen"):
+                    try:
+                        await db.execute("ALTER TABLE device_port_assignments ADD COLUMN last_seen TIMESTAMP")
+                        # Backfill from assigned_at so existing rows have a starting point; a live
+                        # device refreshes it within minutes on its next fetch/register, a ghost never does.
+                        await db.execute("UPDATE device_port_assignments SET last_seen = assigned_at WHERE last_seen IS NULL")
+                        print("  ✓ Added column 'last_seen' to device_port_assignments table")
+                    except Exception as e:
+                        print(f"  ✗ Failed to add column 'last_seen': {e}")
+
             # ========== Step 3: Ensure all config tables have default rows ==========
             # Note: This will NOT overwrite existing config rows
             # It only ensures missing rows are created with default values from setting.toml
@@ -897,7 +918,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS device_port_assignments (
                     route_key TEXT PRIMARY KEY,
                     port INTEGER NOT NULL,
-                    assigned_at TIMESTAMP
+                    assigned_at TIMESTAMP,
+                    last_seen TIMESTAMP   -- refreshed on every proxy-pool fetch / WS register; drives ghost-eviction
                 )
             """)
 
@@ -1197,21 +1219,35 @@ class Database:
         if not route_key or not pool_ports:
             return None
         pool = [int(p) for p in pool_ports]
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        # Only devices seen within this window count toward per-IP load. A live device refreshes
+        # last_seen on every proxy-pool fetch and WS register (the 1-min keepalive guarantees
+        # frequent check-ins), so a ghost route_key (reinstalled/retired) stops inflating the
+        # counts after DEVICE_ACTIVE_WINDOW_MIN of silence — no manual cleanup needed.
+        recent_cutoff = (now - timedelta(minutes=self.DEVICE_ACTIVE_WINDOW_MIN)).isoformat()
         async with self._connect(write=True) as db:
             db.row_factory = aiosqlite.Row
+            # Refresh THIS device's liveness first (before the sticky early-return) so it always
+            # counts as present for concurrent siblings and can't be evicted while it's active.
+            await db.execute(
+                "UPDATE device_port_assignments SET last_seen = ? WHERE route_key = ?",
+                (now_iso, route_key),
+            )
             cur = await db.execute(
                 "SELECT port FROM device_port_assignments WHERE route_key = ?", (route_key,)
             )
             row = await cur.fetchone()
             if row and int(row["port"]) in pool:
+                await db.commit()
                 return int(row["port"])  # keep a valid existing assignment (stable IP)
-            # Count devices per pool port, excluding this route_key (so a reassignment
-            # doesn't count its own old row).
+            # Count only RECENTLY-SEEN devices per port, excluding this route_key's own row (so a
+            # reassignment doesn't count itself, and dead ghosts don't reserve an IP forever).
             counts = {p: 0 for p in pool}
             cur = await db.execute(
                 "SELECT port, COUNT(*) AS c FROM device_port_assignments "
-                "WHERE route_key != ? GROUP BY port",
-                (route_key,),
+                "WHERE route_key != ? AND last_seen >= ? GROUP BY port",
+                (route_key, recent_cutoff),
             )
             for r in await cur.fetchall():
                 p = int(r["port"])
@@ -1219,12 +1255,39 @@ class Database:
                     counts[p] = int(r["c"])
             chosen = min(pool, key=lambda p: (counts[p], p))  # least-used, tie → lowest port
             await db.execute(
-                "INSERT INTO device_port_assignments (route_key, port, assigned_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(route_key) DO UPDATE SET port = excluded.port, assigned_at = excluded.assigned_at",
-                (route_key, chosen, datetime.now(timezone.utc).isoformat()),
+                "INSERT INTO device_port_assignments (route_key, port, assigned_at, last_seen) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(route_key) DO UPDATE SET port = excluded.port, assigned_at = excluded.assigned_at, last_seen = excluded.last_seen",
+                (route_key, chosen, now_iso, now_iso),
             )
             await db.commit()
             return chosen
+
+    async def touch_device_seen(self, route_key: str) -> None:
+        """Mark a device alive right now (called on WS register). Keeps a connected-but-idle
+        device counting toward IP balancing between proxy-pool fetches, so its IP stays
+        reserved; a ghost that never registers again ages out of the active window on its own."""
+        if not route_key:
+            return
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "UPDATE device_port_assignments SET last_seen = ? WHERE route_key = ?",
+                (datetime.now(timezone.utc).isoformat(), route_key),
+            )
+            await db.commit()
+
+    async def prune_stale_device_assignments(self, days: Optional[int] = None) -> int:
+        """Delete port assignments for devices not seen in `days` (reinstalled/retired machines).
+        Safe: a returning device just gets a fresh least-loaded assignment. Kept generous so a
+        device merely powered off for a while keeps its sticky IP. Returns rows deleted."""
+        days = self.DEVICE_PRUNE_DAYS if days is None else days
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        async with self._connect(write=True) as db:
+            cur = await db.execute(
+                "DELETE FROM device_port_assignments WHERE last_seen IS NOT NULL AND last_seen < ?",
+                (cutoff,),
+            )
+            await db.commit()
+            return cur.rowcount if cur.rowcount is not None else 0
 
     async def delete_token(self, token_id: int):
         """Delete token and related data"""
