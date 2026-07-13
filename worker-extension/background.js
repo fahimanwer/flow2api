@@ -315,6 +315,11 @@ async function applyProxy(settings) {
   const p = parseProxyUrl(await resolveProxyUrl(settings));
   if (!p) { await clearProxy(); return; }
   proxyCreds = { username: p.username, password: p.password };
+  // Persist creds BEFORE the PAC goes live so a proxy 407 ALWAYS has creds to answer with —
+  // even if this ephemeral MV3 worker is later torn down (in-memory proxyCreds lost) and then
+  // resurrected by a proxied request. onAuthRequired rehydrates from here, so Chrome's native
+  // "sign in to the proxy" dialog can never appear after an extension update / worker restart.
+  try { await chrome.storage.local.set({ proxyCreds }); } catch (_) {}
   const P = pacProxyToken(p);
   const pac = [
     "function FindProxyForURL(url, host) {",
@@ -337,6 +342,7 @@ async function applyProxy(settings) {
 async function clearProxy() {
   proxyCreds = null;
   answeredAuthReqs.clear();
+  try { await chrome.storage.local.remove("proxyCreds"); } catch (_) {}   // no persisted creds while direct
   try { await chrome.proxy.settings.clear({ scope: "regular" }); } catch (_) {}
   await log("INFO", "Per-profile proxy cleared (direct egress)");
 }
@@ -345,15 +351,29 @@ async function clearProxy() {
 // never for origin (Google) 401s, so the Google session login is untouched.
 // requestId de-dup avoids an infinite 407 loop when creds are wrong.
 chrome.webRequest.onAuthRequired.addListener(
-  (details, asyncCallback) => {
-    if (!details.isProxy || !proxyCreds) { asyncCallback({}); return; }
-    if (answeredAuthReqs.has(details.requestId)) {     // already tried -> creds bad
+  async (details, asyncCallback) => {
+    if (!details.isProxy) { asyncCallback({}); return; }
+    // The MV3 worker is ephemeral: it can be torn down (extension update, idle) while the PAC
+    // proxy setting persists at profile scope. When a proxied request RESURRECTS the worker,
+    // in-memory proxyCreds starts null and applyProxy's network fetch hasn't repopulated it
+    // yet — which used to fall through to asyncCallback({}) and pop Chrome's native proxy
+    // sign-in dialog. Rehydrate from storage (persisted by applyProxy) so we ALWAYS answer the
+    // 407 ourselves. Empty storage => proxy is genuinely off => let Chrome decide (no hijack).
+    let creds = proxyCreds;
+    if (!creds || !creds.username) {
+      try {
+        const s = await chrome.storage.local.get(["proxyCreds"]);
+        if (s.proxyCreds && s.proxyCreds.username) { creds = s.proxyCreds; proxyCreds = creds; }
+      } catch (_) {}
+    }
+    if (!creds || !creds.username) { asyncCallback({}); return; }
+    if (answeredAuthReqs.has(details.requestId)) {     // already tried -> creds bad, stop the loop
       answeredAuthReqs.delete(details.requestId);
       asyncCallback({ cancel: true });
       return;
     }
     answeredAuthReqs.add(details.requestId);
-    asyncCallback({ authCredentials: { username: proxyCreds.username, password: proxyCreds.password } });
+    asyncCallback({ authCredentials: { username: creds.username, password: creds.password } });
   },
   { urls: ["<all_urls>"] },
   ["asyncBlocking"]        // permitted in MV3 because of "webRequestAuthProvider"
