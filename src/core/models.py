@@ -58,6 +58,18 @@ class Token(BaseModel):
     # admin see which devices are still on an old build after an update ships.
     ext_version: Optional[str] = None
 
+    # 协议刷新 Session Token (upstream protocol-login: refresh ST via Google login
+    # instead of a browser session cookie)
+    protocol_mode: str = "session"  # session/protocol
+    google_cookies: str = ""
+    login_account: str = ""
+    login_password: str = ""
+    proxy_url: str = ""
+    auto_refresh_enabled: bool = True
+    refresh_interval_minutes: int = 120
+    last_st_refresh_at: Optional[datetime] = None
+    last_st_refresh_result: str = ""
+
     # 429禁用相关
     ban_reason: Optional[str] = None  # 禁用原因: "429_rate_limit" 或 None
     banned_at: Optional[datetime] = None  # 禁用时间
@@ -195,7 +207,7 @@ class CaptchaConfig(BaseModel):
     captcha_method: str = "browser"  # yescaptcha/capmonster/ezcaptcha/capsolver/browser/personal/remote_browser
     yescaptcha_api_key: str = ""
     yescaptcha_base_url: str = "https://api.yescaptcha.com"
-    yescaptcha_task_type: str = "RecaptchaV3TaskProxylessM1"
+    yescaptcha_task_type: str = "RecaptchaV3TaskProxylessM1S9"
     capmonster_api_key: str = ""
     capmonster_base_url: str = "https://api.capmonster.cloud"
     ezcaptcha_api_key: str = ""
@@ -242,6 +254,15 @@ class LogCleanupConfig(BaseModel):
     last_run_at: Optional[datetime] = None
     last_deleted_count: int = 0
     created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class TokenRefreshConfig(BaseModel):
+    """Protocol ST refresh configuration"""
+
+    id: int = 1
+    enabled: bool = True
+    refresh_interval_minutes: int = 120
     updated_at: Optional[datetime] = None
 
 

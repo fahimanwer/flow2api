@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, LogCleanupConfig
+from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, LogCleanupConfig, TokenRefreshConfig
 
 
 class Database:
@@ -342,6 +342,15 @@ class Database:
                 ) VALUES (1, ?, ?, ?, ?)
             """, (cleanup_enabled, retention_hours, interval_minutes, vacuum_after_cleanup))
 
+        # Ensure token_refresh_config has a row (upstream protocol-login ST refresh)
+        cursor = await db.execute("SELECT COUNT(*) FROM token_refresh_config")
+        count = await cursor.fetchone()
+        if count[0] == 0:
+            await db.execute("""
+                INSERT INTO token_refresh_config (id, enabled, refresh_interval_minutes)
+                VALUES (1, 1, 120)
+            """)
+
     async def check_and_migrate_db(self, config_dict: dict = None):
         """Check database integrity and perform migrations if needed
 
@@ -410,7 +419,7 @@ class Database:
                         captcha_method TEXT DEFAULT 'browser',
                         yescaptcha_api_key TEXT DEFAULT '',
                         yescaptcha_base_url TEXT DEFAULT 'https://api.yescaptcha.com',
-                        yescaptcha_task_type TEXT DEFAULT 'RecaptchaV3TaskProxylessM1',
+                        yescaptcha_task_type TEXT DEFAULT 'RecaptchaV3TaskProxylessM1S9',
                         capmonster_api_key TEXT DEFAULT '',
                         capmonster_base_url TEXT DEFAULT 'https://api.capmonster.cloud',
                         ezcaptcha_api_key TEXT DEFAULT '',
@@ -465,6 +474,17 @@ class Database:
                     )
                 """)
 
+            if not await self._table_exists(db, "token_refresh_config"):
+                print("  ✓ Creating missing table: token_refresh_config")
+                await db.execute("""
+                    CREATE TABLE token_refresh_config (
+                        id INTEGER PRIMARY KEY DEFAULT 1,
+                        enabled BOOLEAN DEFAULT 1,
+                        refresh_interval_minutes INTEGER DEFAULT 120,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
             # ========== Step 2: Add missing columns to existing tables ==========
             # Check and add missing columns to tokens table
             if await self._table_exists(db, "tokens"):
@@ -481,6 +501,15 @@ class Database:
                     ("video_concurrency", "INTEGER DEFAULT -1"),
                     ("captcha_proxy_url", "TEXT"),  # token级打码代理
                     ("extension_route_key", "TEXT"),  # extension 模式路由键
+                    ("protocol_mode", "TEXT DEFAULT 'session'"),  # ST 刷新模式
+                    ("google_cookies", "TEXT DEFAULT ''"),  # 协议登录 Google Cookies
+                    ("login_account", "TEXT DEFAULT ''"),  # 协议登录账号提示
+                    ("login_password", "TEXT DEFAULT ''"),  # 预留
+                    ("proxy_url", "TEXT DEFAULT ''"),  # 协议刷新代理
+                    ("auto_refresh_enabled", "BOOLEAN DEFAULT 1"),
+                    ("refresh_interval_minutes", "INTEGER DEFAULT 120"),
+                    ("last_st_refresh_at", "TIMESTAMP"),
+                    ("last_st_refresh_result", "TEXT DEFAULT ''"),
                     ("ban_reason", "TEXT"),  # 禁用原因
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
                     ("redeem_proxy_url", "TEXT"),  # Slice B: per-account residential redeem proxy
@@ -540,7 +569,7 @@ class Database:
                 captcha_columns_to_add = [
                     ("browser_proxy_enabled", "BOOLEAN DEFAULT 0"),
                     ("browser_proxy_url", "TEXT"),
-                    ("yescaptcha_task_type", "TEXT DEFAULT 'RecaptchaV3TaskProxylessM1'"),
+                    ("yescaptcha_task_type", "TEXT DEFAULT 'RecaptchaV3TaskProxylessM1S9'"),
                     ("capmonster_api_key", "TEXT DEFAULT ''"),
                     ("capmonster_base_url", "TEXT DEFAULT 'https://api.capmonster.cloud'"),
                     ("ezcaptcha_api_key", "TEXT DEFAULT ''"),
@@ -591,6 +620,21 @@ class Database:
                         try:
                             await db.execute(f"ALTER TABLE plugin_config ADD COLUMN {col_name} {col_type}")
                             print(f"  ✓ Added column '{col_name}' to plugin_config table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+            if await self._table_exists(db, "token_refresh_config"):
+                token_refresh_columns_to_add = [
+                    ("enabled", "BOOLEAN DEFAULT 1"),
+                    ("refresh_interval_minutes", "INTEGER DEFAULT 120"),
+                    ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+                ]
+
+                for col_name, col_type in token_refresh_columns_to_add:
+                    if not await self._column_exists(db, "token_refresh_config", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE token_refresh_config ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to token_refresh_config table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
 
@@ -662,6 +706,15 @@ class Database:
                     video_concurrency INTEGER DEFAULT -1,
                     captcha_proxy_url TEXT,
                     extension_route_key TEXT,
+                    protocol_mode TEXT DEFAULT 'session',
+                    google_cookies TEXT DEFAULT '',
+                    login_account TEXT DEFAULT '',
+                    login_password TEXT DEFAULT '',
+                    proxy_url TEXT DEFAULT '',
+                    auto_refresh_enabled BOOLEAN DEFAULT 1,
+                    refresh_interval_minutes INTEGER DEFAULT 120,
+                    last_st_refresh_at TIMESTAMP,
+                    last_st_refresh_result TEXT DEFAULT '',
                     ban_reason TEXT,
                     banned_at TIMESTAMP,
                     redeem_proxy_url TEXT,
@@ -819,7 +872,7 @@ class Database:
                     captcha_method TEXT DEFAULT 'browser',
                     yescaptcha_api_key TEXT DEFAULT '',
                     yescaptcha_base_url TEXT DEFAULT 'https://api.yescaptcha.com',
-                    yescaptcha_task_type TEXT DEFAULT 'RecaptchaV3TaskProxylessM1',
+                    yescaptcha_task_type TEXT DEFAULT 'RecaptchaV3TaskProxylessM1S9',
                     capmonster_api_key TEXT DEFAULT '',
                     capmonster_base_url TEXT DEFAULT 'https://api.capmonster.cloud',
                     ezcaptcha_api_key TEXT DEFAULT '',
@@ -867,6 +920,15 @@ class Database:
                     last_run_at TIMESTAMP,
                     last_deleted_count INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS token_refresh_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    enabled BOOLEAN DEFAULT 1,
+                    refresh_interval_minutes INTEGER DEFAULT 120,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -998,14 +1060,21 @@ class Database:
                 INSERT INTO tokens (st, at, at_expires, email, name, remark, is_active,
                                    credits, user_paygate_tier, current_project_id, current_project_name,
                                    image_enabled, video_enabled, image_concurrency, video_concurrency,
-                                   captcha_proxy_url, extension_route_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   captcha_proxy_url, extension_route_key,
+                                   protocol_mode, google_cookies, login_account, login_password,
+                                   proxy_url, auto_refresh_enabled, refresh_interval_minutes,
+                                   last_st_refresh_at, last_st_refresh_result)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.st, token.at, token.at_expires, token.email, token.name, token.remark,
                   token.is_active, token.credits, token.user_paygate_tier,
                   token.current_project_id, token.current_project_name,
                   token.image_enabled, token.video_enabled,
                   token.image_concurrency, token.video_concurrency,
-                  token.captcha_proxy_url, token.extension_route_key))
+                  token.captcha_proxy_url, token.extension_route_key,
+                  token.protocol_mode, token.google_cookies, token.login_account,
+                  token.login_password, token.proxy_url, token.auto_refresh_enabled,
+                  token.refresh_interval_minutes, token.last_st_refresh_at,
+                  token.last_st_refresh_result))
             await db.commit()
             token_id = cursor.lastrowid
 
@@ -2314,3 +2383,50 @@ class Database:
                 """, (connection_token, auto_enable_on_update, ext_proxy_pool))
 
             await db.commit()
+
+    async def get_token_refresh_config(self) -> TokenRefreshConfig:
+        """Get protocol ST refresh configuration"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM token_refresh_config WHERE id = 1")
+            row = await cursor.fetchone()
+            if row:
+                return TokenRefreshConfig(**dict(row))
+            return TokenRefreshConfig()
+
+    async def update_token_refresh_config(
+        self,
+        enabled: Optional[bool] = None,
+        refresh_interval_minutes: Optional[int] = None,
+    ) -> TokenRefreshConfig:
+        """Update protocol ST refresh configuration."""
+        async with self._connect(write=True) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM token_refresh_config WHERE id = 1")
+            row = await cursor.fetchone()
+            current = dict(row) if row else {}
+            new_enabled = enabled if enabled is not None else bool(current.get("enabled", True))
+            try:
+                new_interval = int(
+                    refresh_interval_minutes
+                    if refresh_interval_minutes is not None
+                    else current.get("refresh_interval_minutes", 120)
+                )
+            except Exception:
+                new_interval = 120
+            new_interval = max(1, new_interval)
+
+            if row:
+                await db.execute("""
+                    UPDATE token_refresh_config
+                    SET enabled = ?, refresh_interval_minutes = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (new_enabled, new_interval))
+            else:
+                await db.execute("""
+                    INSERT INTO token_refresh_config (id, enabled, refresh_interval_minutes)
+                    VALUES (1, ?, ?)
+                """, (new_enabled, new_interval))
+            await db.commit()
+
+        return await self.get_token_refresh_config()

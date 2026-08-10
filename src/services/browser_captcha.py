@@ -14,12 +14,21 @@ import time
 import re
 import random
 import uuid
+import hashlib
+import json
+from copy import deepcopy
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 from urllib.parse import urlparse, unquote, parse_qs
 
 from ..core.logger import debug_logger
+from ..core.browser_runtime_status import (
+    fail_runtime_prepare,
+    finish_runtime_prepare,
+    progress_runtime_prepare,
+)
 from ..core.config import config
+from .browser_cookie_utils import build_cookie_signature
 
 
 # ==================== Docker 环境检测 ====================
@@ -57,6 +66,8 @@ ALLOW_DOCKER_HEADED = (
 )
 DOCKER_HEADED_BLOCKED = IS_DOCKER and not ALLOW_DOCKER_HEADED
 
+BROWSER_ENVIRONMENT_PATCH_MARKER = "__flow2apiBrowserEnvironmentPatchInstalled__"
+
 
 # ==================== playwright 自动安装 ====================
 def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
@@ -67,6 +78,7 @@ def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     
     try:
         debug_logger.log_info(f"[BrowserCaptcha] 正在安装 {package}...")
+        progress_runtime_prepare("browser", f"[BrowserCaptcha] 正在安装 {package}...")
         print(f"[BrowserCaptcha] 正在安装 {package}...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0:
@@ -75,9 +87,11 @@ def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
             return True
         else:
             debug_logger.log_warning(f"[BrowserCaptcha] {package} 安装失败: {result.stderr[:200]}")
+            fail_runtime_prepare("browser", f"{package} 安装失败，请检查网络或 Python 环境。")
             return False
     except Exception as e:
         debug_logger.log_warning(f"[BrowserCaptcha] {package} 安装异常: {e}")
+        fail_runtime_prepare("browser", f"{package} 安装异常: {e}")
         return False
 
 
@@ -92,17 +106,21 @@ def _run_playwright_install(use_mirror: bool = False) -> bool:
     
     try:
         debug_logger.log_info("[BrowserCaptcha] 正在安装 chromium 浏览器...")
+        progress_runtime_prepare("browser", "正在安装 chromium 浏览器，请稍候...")
         print("[BrowserCaptcha] 正在安装 chromium 浏览器...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
         if result.returncode == 0:
             debug_logger.log_info("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
+            progress_runtime_prepare("browser", "chromium 浏览器安装成功，正在完成收尾检查...")
             print("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
             return True
         else:
             debug_logger.log_warning(f"[BrowserCaptcha] chromium 安装失败: {result.stderr[:200]}")
+            fail_runtime_prepare("browser", "chromium 浏览器安装失败，请稍后重试或手动安装。")
             return False
     except Exception as e:
         debug_logger.log_warning(f"[BrowserCaptcha] chromium 安装异常: {e}")
+        fail_runtime_prepare("browser", f"chromium 浏览器安装异常: {e}")
         return False
 
 
@@ -116,6 +134,7 @@ def _ensure_playwright_installed() -> bool:
         pass
     
     debug_logger.log_info("[BrowserCaptcha] playwright 未安装，开始自动安装...")
+    progress_runtime_prepare("browser", "[BrowserCaptcha] playwright 未安装，开始自动安装...")
     print("[BrowserCaptcha] playwright 未安装，开始自动安装...")
     
     # 先尝试官方源
@@ -124,11 +143,13 @@ def _ensure_playwright_installed() -> bool:
     
     # 官方源失败，尝试国内镜像
     debug_logger.log_info("[BrowserCaptcha] 官方源安装失败，尝试国内镜像...")
+    progress_runtime_prepare("browser", "[BrowserCaptcha] 官方源安装失败，尝试国内镜像...")
     print("[BrowserCaptcha] 官方源安装失败，尝试国内镜像...")
     if _run_pip_install('playwright', use_mirror=True):
         return True
     
     debug_logger.log_error("[BrowserCaptcha] ❌ playwright 自动安装失败，请手动安装: pip install playwright")
+    fail_runtime_prepare("browser", "[BrowserCaptcha] ❌ playwright 自动安装失败，请手动安装: pip install playwright")
     print("[BrowserCaptcha] ❌ playwright 自动安装失败，请手动安装: pip install playwright")
     return False
 
@@ -154,11 +175,13 @@ def _ensure_browser_installed() -> bool:
         browser_path = browser_path[-1].strip() if browser_path else ""
         if result.returncode == 0 and browser_path and os.path.exists(browser_path):
             debug_logger.log_info(f"[BrowserCaptcha] chromium 浏览器已安装: {browser_path}")
+            finish_runtime_prepare("browser", "检测到 chromium 浏览器已安装，正在准备实例...")
             return True
     except Exception as e:
         debug_logger.log_info(f"[BrowserCaptcha] 检测浏览器时出错: {e}")
     
     debug_logger.log_info("[BrowserCaptcha] chromium 浏览器未安装，开始自动安装...")
+    progress_runtime_prepare("browser", "[BrowserCaptcha] chromium 浏览器未安装，开始自动安装...")
     print("[BrowserCaptcha] chromium 浏览器未安装，开始自动安装...")
     
     # 先尝试官方源
@@ -167,11 +190,13 @@ def _ensure_browser_installed() -> bool:
     
     # 官方源失败，尝试国内镜像
     debug_logger.log_info("[BrowserCaptcha] 官方源安装失败，尝试国内镜像...")
+    progress_runtime_prepare("browser", "[BrowserCaptcha] 官方源安装失败，尝试国内镜像...")
     print("[BrowserCaptcha] 官方源安装失败，尝试国内镜像...")
     if _run_playwright_install(use_mirror=True):
         return True
     
     debug_logger.log_error("[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请手动安装: python -m playwright install chromium")
+    fail_runtime_prepare("browser", "[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请手动安装: python -m playwright install chromium")
     print("[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请手动安装: python -m playwright install chromium")
     return False
 
@@ -208,6 +233,11 @@ else:
 
 # 配置
 LABS_URL = "https://labs.google/fx/tools/flow"
+BROWSER_SESSION_COOKIE_TARGET_URLS = (
+    "https://labs.google/",
+    "https://www.google.com/",
+    "https://www.recaptcha.net/",
+)
 
 # ==========================================
 # 代理解析工具函数
@@ -418,6 +448,8 @@ class TokenBrowser:
         self._shared_context = None
         self._shared_keepalive_page = None
         self._shared_browser_pid: Optional[int] = None
+        self._shared_bound_token_id: Optional[int] = None
+        self._shared_bound_cookie_signature: Optional[str] = None
         self._pid_dir = os.path.join(os.getcwd(), "tmp", "browser_pids")
         self._pid_file = os.path.join(self._pid_dir, f"slot_{self.token_id}.pid")
         os.makedirs(self._pid_dir, exist_ok=True)
@@ -437,6 +469,440 @@ class TokenBrowser:
             "width": base_w,
             "height": base_h - random.randint(0, 80),
         }
+        self._profile_env_seed = hashlib.sha256(
+            f"{self.token_id}:{time.time_ns()}:{uuid.uuid4().hex}".encode("utf-8")
+        ).hexdigest()
+        self._profile_hardware_concurrency = random.choice([4, 6, 8, 8, 12, 16])
+        self._profile_device_memory = random.choice([4, 8, 8, 16])
+        self._profile_gpu = random.choice([
+            {
+                "vendor": "Google Inc. (Intel)",
+                "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                "unmaskedVendor": "Intel Inc.",
+                "unmaskedRenderer": "Intel(R) UHD Graphics 620",
+            },
+            {
+                "vendor": "Google Inc. (NVIDIA)",
+                "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                "unmaskedVendor": "NVIDIA Corporation",
+                "unmaskedRenderer": "NVIDIA GeForce GTX 1650",
+            },
+            {
+                "vendor": "Google Inc. (AMD)",
+                "renderer": "ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                "unmaskedVendor": "ATI Technologies Inc.",
+                "unmaskedRenderer": "AMD Radeon(TM) Graphics",
+            },
+        ])
+
+    def _build_browser_environment_patch_config(self) -> Dict[str, Any]:
+        viewport = dict(self._profile_viewport or {})
+        width = int(viewport.get("width") or 1366)
+        height = int(viewport.get("height") or 768)
+        seed = str(getattr(self, "_profile_env_seed", "") or "")
+        if not seed:
+            seed = hashlib.sha256(f"{self.token_id}:{width}:{height}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(seed.encode("utf-8")).digest()
+
+        return {
+            "seed": seed[:16],
+            "navigator": {
+                "language": "en-US",
+                "languages": ["en-US", "en"],
+                "hardwareConcurrency": int(getattr(self, "_profile_hardware_concurrency", 8) or 8),
+                "deviceMemory": int(getattr(self, "_profile_device_memory", 8) or 8),
+                "maxTouchPoints": 0,
+                "pdfViewerEnabled": True,
+                "webdriver": False,
+            },
+            "screen": {
+                "width": width,
+                "height": height,
+                "availWidth": width,
+                "availHeight": max(640, height - 40),
+                "colorDepth": 24,
+                "pixelDepth": 24,
+            },
+            "window": {
+                "innerWidth": width,
+                "innerHeight": height,
+                "outerWidth": min(width + 16, width),
+                "outerHeight": height + 88,
+                "devicePixelRatio": 1,
+            },
+            "network": {
+                "type": "wifi",
+                "effectiveType": "4g",
+                "rtt": 45 + int(digest[0] % 75),
+                "downlink": round(6.0 + (int(digest[1] % 95) / 10.0), 1),
+                "saveData": False,
+            },
+            "permissions": {
+                "geolocation": "prompt",
+                "notifications": "denied",
+                "camera": "denied",
+                "microphone": "denied",
+                "display-capture": "denied",
+            },
+            "graphics": dict(getattr(self, "_profile_gpu", {}) or {}),
+            "storage": {
+                "quota": 120000000000 + int(digest[2] % 20) * 1000000000,
+                "usage": 8000000 + int(digest[3] % 20) * 250000,
+                "persisted": False,
+            },
+            "canvas": {
+                "rgba": [
+                    (int(digest[4]) % 5) - 2 or 1,
+                    (int(digest[5]) % 5) - 2 or 1,
+                    (int(digest[6]) % 5) - 2 or 1,
+                    0,
+                ],
+                "pixelStep": 13 + (int(digest[7]) % 11),
+            },
+            "audio": {
+                "floatDelta": round(((int(digest[8]) / 255.0) * 2.0 - 1.0) * 0.00003, 8),
+                "byteDelta": (int(digest[9]) % 5) - 2 or 1,
+                "stride": 17 + (int(digest[10]) % 13),
+            },
+            "mediaDevices": {
+                "devices": [
+                    {"kind": "audioinput", "deviceId": f"aid-{seed[:12]}", "groupId": f"grp-{seed[12:20]}", "label": ""},
+                    {"kind": "videoinput", "deviceId": f"vid-{seed[20:32]}", "groupId": f"grp-{seed[12:20]}", "label": ""},
+                    {"kind": "audiooutput", "deviceId": f"aod-{seed[32:44]}", "groupId": f"grp-{seed[44:52]}", "label": "Default Audio Output"},
+                ],
+            },
+            "plugins": [
+                {"name": "PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format", "mimeTypes": ["application/pdf", "text/pdf"]},
+                {"name": "Chrome PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format", "mimeTypes": ["application/pdf", "text/pdf"]},
+                {"name": "Chromium PDF Viewer", "filename": "internal-pdf-viewer", "description": "Portable Document Format", "mimeTypes": ["application/pdf", "text/pdf"]},
+            ],
+            "mimeTypes": [
+                {"type": "application/pdf", "suffixes": "pdf", "description": "Portable Document Format", "pluginName": "PDF Viewer"},
+                {"type": "text/pdf", "suffixes": "pdf", "description": "Portable Document Format", "pluginName": "PDF Viewer"},
+            ],
+        }
+
+    def _build_browser_environment_patch_source(self) -> str:
+        config_json = json.dumps(
+            self._build_browser_environment_patch_config(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return (
+            r"""
+(() => {
+    const marker = __MARKER_JSON__;
+    if (window[marker]) {
+        return;
+    }
+    const config = __CONFIG_JSON__;
+    window[marker] = config.seed || true;
+
+    const defineGetter = (target, key, getter, enumerable = true) => {
+        if (!target) return;
+        try {
+            Object.defineProperty(target, key, { configurable: true, enumerable, get: getter });
+        } catch (e) {}
+    };
+    const defineValue = (target, key, value, enumerable = false) => {
+        if (!target) return;
+        try {
+            Object.defineProperty(target, key, { configurable: true, enumerable, writable: true, value });
+        } catch (e) {
+            try { target[key] = value; } catch (err) {}
+        }
+    };
+    const makeNative = (fn, name) => {
+        try {
+            defineValue(fn, "name", name || fn.name || "");
+            defineValue(fn, "toString", () => `function ${name || fn.name || ""}() { [native code] }`);
+        } catch (e) {}
+        return fn;
+    };
+    const clone = (value) => {
+        try { return JSON.parse(JSON.stringify(value)); } catch (e) { return value; }
+    };
+
+    const nav = config.navigator || {};
+    const navProto = Navigator.prototype;
+    defineGetter(navProto, "webdriver", () => undefined);
+    defineGetter(navigator, "webdriver", () => undefined);
+    defineGetter(navProto, "language", () => nav.language || "en-US");
+    defineGetter(navigator, "language", () => nav.language || "en-US");
+    defineGetter(navProto, "languages", () => clone(nav.languages || ["en-US", "en"]));
+    defineGetter(navigator, "languages", () => clone(nav.languages || ["en-US", "en"]));
+    defineGetter(navProto, "hardwareConcurrency", () => Number(nav.hardwareConcurrency || 8));
+    defineGetter(navigator, "hardwareConcurrency", () => Number(nav.hardwareConcurrency || 8));
+    defineGetter(navProto, "deviceMemory", () => Number(nav.deviceMemory || 8));
+    defineGetter(navigator, "deviceMemory", () => Number(nav.deviceMemory || 8));
+    defineGetter(navProto, "maxTouchPoints", () => Number(nav.maxTouchPoints || 0));
+    defineGetter(navigator, "maxTouchPoints", () => Number(nav.maxTouchPoints || 0));
+    defineGetter(navProto, "pdfViewerEnabled", () => nav.pdfViewerEnabled !== false);
+    defineGetter(navigator, "pdfViewerEnabled", () => nav.pdfViewerEnabled !== false);
+    defineGetter(navProto, "cookieEnabled", () => true);
+    defineGetter(navigator, "cookieEnabled", () => true);
+    defineGetter(navProto, "onLine", () => true);
+    defineGetter(navigator, "onLine", () => true);
+
+    const screenProfile = config.screen || {};
+    for (const key of ["width", "height", "availWidth", "availHeight", "colorDepth", "pixelDepth"]) {
+        if (screenProfile[key] !== undefined) {
+            defineGetter(Screen.prototype, key, () => Number(screenProfile[key]));
+            defineGetter(screen, key, () => Number(screenProfile[key]));
+        }
+    }
+    const win = config.window || {};
+    for (const key of ["innerWidth", "innerHeight", "outerWidth", "outerHeight", "devicePixelRatio"]) {
+        if (win[key] !== undefined) {
+            defineGetter(window, key, () => Number(win[key]));
+        }
+    }
+
+    defineGetter(Document.prototype, "visibilityState", () => "visible");
+    defineGetter(document, "visibilityState", () => "visible");
+    defineGetter(Document.prototype, "webkitVisibilityState", () => "visible");
+    defineGetter(document, "webkitVisibilityState", () => "visible");
+    defineGetter(Document.prototype, "hidden", () => false);
+    defineGetter(document, "hidden", () => false);
+    defineGetter(Document.prototype, "webkitHidden", () => false);
+    defineGetter(document, "webkitHidden", () => false);
+    try { document.hasFocus = makeNative(() => true, "hasFocus"); } catch (e) {}
+    try { if (typeof window.focus === "function") window.focus(); } catch (e) {}
+
+    const makeArrayLike = (items, namedKey) => {
+        const arr = [];
+        for (const item of items || []) {
+            arr.push(item);
+        }
+        defineValue(arr, "item", makeNative((index) => arr[Number(index)] || null, "item"));
+        defineValue(arr, "namedItem", makeNative((name) => arr.find((item) => item && item[namedKey] === name) || null, "namedItem"));
+        defineValue(arr, "refresh", makeNative(() => undefined, "refresh"));
+        for (const item of arr) {
+            if (item && item[namedKey]) {
+                try { Object.defineProperty(arr, item[namedKey], { configurable: true, enumerable: false, value: item }); } catch (e) {}
+            }
+        }
+        return arr;
+    };
+
+    const mimeTypes = makeArrayLike((config.mimeTypes || []).map((item) => ({
+        type: item.type,
+        suffixes: item.suffixes || "",
+        description: item.description || "",
+        enabledPlugin: null,
+    })), "type");
+    const plugins = makeArrayLike((config.plugins || []).map((item) => {
+        const plugin = {
+            name: item.name,
+            filename: item.filename || "",
+            description: item.description || "",
+            length: (item.mimeTypes || []).length,
+        };
+        (item.mimeTypes || []).forEach((type, index) => {
+            const mt = mimeTypes.namedItem(type);
+            if (mt) {
+                mt.enabledPlugin = plugin;
+                plugin[index] = mt;
+                try { Object.defineProperty(plugin, type, { configurable: true, enumerable: false, value: mt }); } catch (e) {}
+            }
+        });
+        plugin.item = makeNative((index) => plugin[Number(index)] || null, "item");
+        plugin.namedItem = makeNative((name) => plugin[name] || null, "namedItem");
+        return plugin;
+    }), "name");
+    defineGetter(navProto, "plugins", () => plugins);
+    defineGetter(navigator, "plugins", () => plugins);
+    defineGetter(navProto, "mimeTypes", () => mimeTypes);
+    defineGetter(navigator, "mimeTypes", () => mimeTypes);
+
+    const chromeObject = window.chrome || {};
+    chromeObject.runtime = chromeObject.runtime || {
+        PlatformOs: { MAC: "mac", WIN: "win", ANDROID: "android", CROS: "cros", LINUX: "linux", OPENBSD: "openbsd" },
+        PlatformArch: { ARM: "arm", ARM64: "arm64", X86_32: "x86-32", X86_64: "x86-64" },
+        PlatformNaclArch: { ARM: "arm", X86_32: "x86-32", X86_64: "x86-64" },
+        RequestUpdateCheckStatus: { THROTTLED: "throttled", NO_UPDATE: "no_update", UPDATE_AVAILABLE: "update_available" },
+        OnInstalledReason: { INSTALL: "install", UPDATE: "update", CHROME_UPDATE: "chrome_update", SHARED_MODULE_UPDATE: "shared_module_update" },
+    };
+    chromeObject.app = chromeObject.app || { isInstalled: false };
+    chromeObject.csi = chromeObject.csi || makeNative(() => ({ startE: Date.now(), onloadT: Date.now(), pageT: 1, tran: 15 }), "csi");
+    chromeObject.loadTimes = chromeObject.loadTimes || makeNative(() => ({
+        requestTime: Date.now() / 1000,
+        startLoadTime: Date.now() / 1000,
+        commitLoadTime: Date.now() / 1000,
+        finishDocumentLoadTime: Date.now() / 1000,
+        finishLoadTime: Date.now() / 1000,
+        firstPaintTime: Date.now() / 1000,
+        firstPaintAfterLoadTime: 0,
+        navigationType: "Other",
+        wasFetchedViaSpdy: true,
+        wasNpnNegotiated: true,
+        npnNegotiatedProtocol: "h2",
+        connectionInfo: "h2",
+    }), "loadTimes");
+    defineValue(window, "chrome", chromeObject, true);
+
+    const permissions = config.permissions || {};
+    if (navigator.permissions && typeof navigator.permissions.query === "function") {
+        const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+        defineValue(navigator.permissions, "query", makeNative((descriptor) => {
+            const name = descriptor && descriptor.name ? String(descriptor.name) : "";
+            if (Object.prototype.hasOwnProperty.call(permissions, name)) {
+                const status = {
+                    name,
+                    state: permissions[name],
+                    onchange: null,
+                    addEventListener: makeNative(() => undefined, "addEventListener"),
+                    removeEventListener: makeNative(() => undefined, "removeEventListener"),
+                    dispatchEvent: makeNative(() => true, "dispatchEvent"),
+                };
+                return Promise.resolve(status);
+            }
+            return originalQuery(descriptor);
+        }, "query"));
+    }
+    try {
+        if (window.Notification) {
+            defineGetter(Notification, "permission", () => permissions.notifications || "denied");
+            defineValue(Notification, "requestPermission", makeNative((callback) => {
+                const value = permissions.notifications || "denied";
+                if (typeof callback === "function") callback(value);
+                return Promise.resolve(value);
+            }, "requestPermission"));
+        }
+    } catch (e) {}
+
+    const connectionProfile = config.network || {};
+    const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection || {};
+    for (const [key, value] of Object.entries(connectionProfile)) {
+        defineGetter(connection, key, () => value);
+    }
+    if (!connection.addEventListener) defineValue(connection, "addEventListener", makeNative(() => undefined, "addEventListener"));
+    if (!connection.removeEventListener) defineValue(connection, "removeEventListener", makeNative(() => undefined, "removeEventListener"));
+    defineGetter(navProto, "connection", () => connection);
+    defineGetter(navigator, "connection", () => connection);
+
+    const mediaDevicesProfile = config.mediaDevices || {};
+    const mediaDevices = navigator.mediaDevices || {};
+    if (!mediaDevices.enumerateDevices) {
+        defineValue(mediaDevices, "enumerateDevices", makeNative(() => Promise.resolve(clone(mediaDevicesProfile.devices || [])), "enumerateDevices"));
+    }
+    if (!mediaDevices.addEventListener) defineValue(mediaDevices, "addEventListener", makeNative(() => undefined, "addEventListener"));
+    if (!mediaDevices.removeEventListener) defineValue(mediaDevices, "removeEventListener", makeNative(() => undefined, "removeEventListener"));
+    defineGetter(navProto, "mediaDevices", () => mediaDevices);
+    defineGetter(navigator, "mediaDevices", () => mediaDevices);
+
+    const storageProfile = config.storage || {};
+    if (navigator.storage) {
+        if (typeof navigator.storage.estimate !== "function") {
+            defineValue(navigator.storage, "estimate", makeNative(() => Promise.resolve({
+                quota: Number(storageProfile.quota || 120000000000),
+                usage: Number(storageProfile.usage || 8000000),
+            }), "estimate"));
+        }
+        if (typeof navigator.storage.persisted !== "function") {
+            defineValue(navigator.storage, "persisted", makeNative(() => Promise.resolve(!!storageProfile.persisted), "persisted"));
+        }
+    }
+
+    const graphics = config.graphics || {};
+    const patchWebGL = (proto) => {
+        if (!proto || typeof proto.getParameter !== "function") return;
+        const originalGetParameter = proto.getParameter;
+        proto.getParameter = function(parameter) {
+            try {
+                const debugInfo = this.getExtension && this.getExtension("WEBGL_debug_renderer_info");
+                if (debugInfo) {
+                    if (parameter === debugInfo.UNMASKED_VENDOR_WEBGL) return graphics.unmaskedVendor || graphics.vendor || "Intel Inc.";
+                    if (parameter === debugInfo.UNMASKED_RENDERER_WEBGL) return graphics.unmaskedRenderer || graphics.renderer || "Intel(R) UHD Graphics";
+                }
+                if (parameter === 37445) return graphics.unmaskedVendor || graphics.vendor || "Intel Inc.";
+                if (parameter === 37446) return graphics.unmaskedRenderer || graphics.renderer || "Intel(R) UHD Graphics";
+                if (parameter === 7936) return graphics.vendor || "Google Inc. (Intel)";
+                if (parameter === 7937) return graphics.renderer || "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)";
+            } catch (e) {}
+            return originalGetParameter.apply(this, arguments);
+        };
+        makeNative(proto.getParameter, "getParameter");
+    };
+    try {
+        patchWebGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+        patchWebGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+    } catch (e) {}
+
+    try {
+        if (window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype) {
+            const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+            if (typeof originalGetImageData === "function") {
+                CanvasRenderingContext2D.prototype.getImageData = function(...args) {
+                    const imageData = originalGetImageData.apply(this, args);
+                    try {
+                        const data = imageData && imageData.data;
+                        const rgba = config.canvas && config.canvas.rgba || [1, -1, 1, 0];
+                        const step = Math.max(4, Number(config.canvas && config.canvas.pixelStep || 17) * 4);
+                        for (let i = 0; data && i < data.length; i += step) {
+                            data[i] = Math.max(0, Math.min(255, data[i] + rgba[0]));
+                            data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + rgba[1]));
+                            data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + rgba[2]));
+                        }
+                    } catch (e) {}
+                    return imageData;
+                };
+                makeNative(CanvasRenderingContext2D.prototype.getImageData, "getImageData");
+            }
+        }
+    } catch (e) {}
+
+    try {
+        if (window.AudioBuffer && AudioBuffer.prototype && typeof AudioBuffer.prototype.getChannelData === "function") {
+            const originalGetChannelData = AudioBuffer.prototype.getChannelData;
+            AudioBuffer.prototype.getChannelData = function(...args) {
+                const channelData = originalGetChannelData.apply(this, args);
+                try {
+                    const stamp = "__flow2apiAudioPatch_" + (config.seed || "");
+                    if (channelData && channelData.length && !channelData[stamp]) {
+                        const stride = Math.max(1, Number(config.audio && config.audio.stride || 23));
+                        const delta = Number(config.audio && config.audio.floatDelta || 0);
+                        for (let i = 0; i < channelData.length; i += stride) {
+                            channelData[i] = channelData[i] + delta;
+                        }
+                        defineValue(channelData, stamp, true);
+                    }
+                } catch (e) {}
+                return channelData;
+            };
+            makeNative(AudioBuffer.prototype.getChannelData, "getChannelData");
+        }
+    } catch (e) {}
+})();
+"""
+            .replace("__MARKER_JSON__", json.dumps(BROWSER_ENVIRONMENT_PATCH_MARKER))
+            .replace("__CONFIG_JSON__", config_json)
+        )
+
+    async def _apply_browser_environment_patch(self, target, *, label: str) -> bool:
+        if target is None:
+            return False
+
+        signature = str(getattr(self, "_profile_env_seed", "") or "")
+        if getattr(target, "_flow2api_environment_patch_signature", None) == signature:
+            return True
+
+        try:
+            await target.add_init_script(self._build_browser_environment_patch_source())
+            try:
+                target._flow2api_environment_patch_signature = signature
+            except Exception:
+                pass
+            debug_logger.log_info(
+                f"[BrowserCaptcha] Token-{self.token_id} 已注入浏览器环境补齐脚本 ({label})"
+            )
+            return True
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} 注入浏览器环境补齐脚本失败 ({label}): "
+                f"{type(e).__name__}: {str(e)[:200]}"
+            )
+            return False
 
     def _get_slot_marker(self) -> str:
         return f"--flow2api-browser-slot={self.token_id}"
@@ -580,6 +1046,7 @@ class TokenBrowser:
             return None
 
         keepalive_page = await self._shared_context.new_page()
+        await self._apply_browser_environment_patch(keepalive_page, label="keepalive")
         try:
             await keepalive_page.goto("about:blank", wait_until="load", timeout=5000)
         except Exception:
@@ -589,6 +1056,209 @@ class TokenBrowser:
             f"[BrowserCaptcha] Token-{self.token_id} keepalive page created"
         )
         return keepalive_page
+
+    def _build_flow_project_url(self, project_id: Optional[str]) -> str:
+        project_id = (project_id or "").strip()
+        if project_id:
+            return f"{LABS_URL}/project/{project_id}"
+        return LABS_URL
+
+    @staticmethod
+    def _normalize_token_key(token_id: Optional[int]) -> Optional[int]:
+        try:
+            normalized = int(token_id or 0)
+        except Exception:
+            normalized = 0
+        return normalized if normalized > 0 else None
+
+    @classmethod
+    def _build_token_session_cookie_targets(cls, session_token: str) -> List[Dict[str, Any]]:
+        normalized_value = str(session_token or "").strip()
+        if not normalized_value:
+            return []
+
+        expanded: List[Dict[str, Any]] = []
+        for target_url in BROWSER_SESSION_COOKIE_TARGET_URLS:
+            expanded.append({
+                "name": "__Secure-next-auth.session-token",
+                "value": normalized_value,
+                "url": target_url,
+                "secure": True,
+                "httpOnly": True,
+                "sameSite": "None",
+            })
+        return expanded
+
+    async def _load_token_session_binding(self, token_id: Optional[int]) -> tuple[Optional[int], Optional[str], Optional[str]]:
+        token_key = self._normalize_token_key(token_id)
+        if token_key is None or not self.db:
+            return token_key, None, None
+
+        try:
+            token = await self.db.get_token(token_key)
+        except Exception as e:
+            debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} 读取 token({token_key}) Session Token 失败: {e}")
+            return token_key, None, None
+
+        session_token = str(getattr(token, "st", "") or "").strip() if token else ""
+        if not session_token:
+            return token_key, None, None
+
+        cookie_signature = build_cookie_signature(
+            f"__Secure-next-auth.session-token={session_token}"
+        ) or hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+        return token_key, session_token, cookie_signature
+
+    async def _ensure_shared_token_binding(self, context, token_id: Optional[int]) -> bool:
+        token_key, session_token, cookie_signature = await self._load_token_session_binding(token_id)
+
+        if token_key is None:
+            self._shared_bound_token_id = None
+            self._shared_bound_cookie_signature = None
+            return True
+
+        if not session_token or not cookie_signature:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} 缺少可用的 Session Token，无法绑定账号态 (token_id={token_key})"
+            )
+            return False
+
+        if (
+            self._shared_bound_token_id == token_key
+            and self._shared_bound_cookie_signature == cookie_signature
+        ):
+            return True
+
+        browser_cookies = self._build_token_session_cookie_targets(session_token)
+        if not browser_cookies:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} 构造 Session Token cookies 失败 (token_id={token_key})"
+            )
+            return False
+
+        try:
+            await context.clear_cookies()
+            await context.add_cookies(browser_cookies)
+            self._shared_bound_token_id = token_key
+            self._shared_bound_cookie_signature = cookie_signature
+            debug_logger.log_info(
+                f"[BrowserCaptcha] Token-{self.token_id} 已绑定业务 token 登录态到共享 context "
+                f"(token_id={token_key}, cookies={len(browser_cookies)})"
+            )
+            return True
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} 绑定业务 token 登录态失败 "
+                f"(token_id={token_key}): {type(e).__name__}: {str(e)[:200]}"
+            )
+            return False
+
+    async def _prepare_flow_runtime_page(
+        self,
+        page,
+        project_id: str,
+        website_key: str,
+        action: str,
+        *,
+        context_label: str = "",
+    ) -> bool:
+        """打开真实 Flow 页面并完成页面预热。"""
+        primary_host = "https://www.recaptcha.net" if self._browser_proxy_active else "https://www.google.com"
+        secondary_host = "https://www.google.com" if primary_host == "https://www.recaptcha.net" else "https://www.recaptcha.net"
+        page_urls = [self._build_flow_project_url(project_id), LABS_URL]
+        label = f"{context_label} " if context_label else ""
+
+        loaded = False
+        last_error: Optional[str] = None
+        for index, target_url in enumerate(page_urls):
+            try:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} {label}打开真实 Flow 页面: {target_url} (action={action})"
+                )
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+                loaded = True
+                break
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {str(e)[:200]}"
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] Token-{self.token_id} {label}Flow 页面打开失败[{index + 1}/{len(page_urls)}]: {last_error}"
+                )
+
+        if not loaded:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}无法打开真实 Flow 页面: {last_error or 'unknown'}"
+            )
+            return False
+
+        page_loaded = False
+        for _ in range(20):
+            try:
+                ready_state = await page.evaluate("document.readyState")
+                if ready_state == "complete":
+                    page_loaded = True
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        if not page_loaded:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}Flow 页面 readyState 未达到 complete，继续尝试预热"
+            )
+
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+
+        try:
+            await page.mouse.move(320, 220)
+            await page.mouse.move(560, 360, steps=16)
+            await page.mouse.wheel(0, 260)
+            await page.evaluate(
+                """
+                (() => {
+                    try {
+                        window.focus();
+                        window.dispatchEvent(new Event('focus'));
+                        document.dispatchEvent(new MouseEvent('mousemove', {
+                            bubbles: true,
+                            clientX: Math.max(32, Math.floor((window.innerWidth || 1280) * 0.42)),
+                            clientY: Math.max(32, Math.floor((window.innerHeight || 720) * 0.36))
+                        }));
+                        window.scrollTo(0, Math.min(320, document.body?.scrollHeight || 320));
+                    } catch (e) {}
+                })()
+                """
+            )
+        except Exception:
+            pass
+
+        warmup_seconds = float(getattr(config, "browser_flow_page_warmup_seconds", 6) or 6)
+        if warmup_seconds > 0:
+            debug_logger.log_info(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}真实页面预热 {warmup_seconds:.1f}s"
+            )
+            await asyncio.sleep(warmup_seconds)
+
+        ready = await self._wait_for_enterprise_ready(
+            page,
+            website_key,
+            primary_host,
+            secondary_host,
+            timeout_ms=15000,
+            context_label=f"{label}真实页面",
+        )
+        if not ready:
+            return False
+
+        await self._capture_page_fingerprint(page)
+        try:
+            debug_logger.log_info(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}真实页面已就绪: url={page.url[:200]}"
+            )
+        except Exception:
+            pass
+        return True
 
     async def _resolve_proxy_runtime_config(self, token_proxy_url: Optional[str] = None) -> tuple:
         """Resolve runtime proxy configuration."""
@@ -652,6 +1322,7 @@ class TokenBrowser:
                 '--disable-blink-features=AutomationControlled',
                 '--disable-quic',
                 '--disable-features=UseDnsHttpsSvcb',
+                '--lang=en-US',
                 '--no-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-setuid-sandbox',
@@ -698,6 +1369,7 @@ class TokenBrowser:
                 viewport=viewport,
                 locale="en-US",
             )
+            await self._apply_browser_environment_patch(context, label="context")
             browser_pid = self._extract_browser_pid(browser)
             if manage_slot_pid:
                 self._write_pid_file(browser_pid)
@@ -731,6 +1403,8 @@ class TokenBrowser:
         self._shared_keepalive_page = None
         self._shared_browser_pid = None
         self._shared_proxy_url = None
+        self._shared_bound_token_id = None
+        self._shared_bound_cookie_signature = None
         self._consecutive_browser_failures = 0
         self._shared_reuse_count = 0
 
@@ -748,9 +1422,14 @@ class TokenBrowser:
         async with self._shared_browser_lock:
             await self._recycle_browser_locked(reason=reason, rotate_profile=rotate_profile)
 
-    async def _get_or_create_shared_browser(self, token_proxy_url: Optional[str] = None) -> tuple:
+    async def _get_or_create_shared_browser(
+        self,
+        token_proxy_url: Optional[str] = None,
+        token_id: Optional[int] = None,
+    ) -> tuple:
         """Get or create the shared browser for this slot."""
         _, expected_proxy_url, _ = await self._resolve_proxy_runtime_config(token_proxy_url=token_proxy_url)
+        expected_token_key = self._normalize_token_key(token_id)
 
         async with self._shared_browser_lock:
             has_shared_browser = bool(self._shared_playwright and self._shared_browser and self._shared_context)
@@ -774,10 +1453,29 @@ class TokenBrowser:
                 has_shared_browser = False
 
             if has_shared_browser:
+                current_bound_token = self._shared_bound_token_id
+                token_changed = (
+                    expected_token_key != current_bound_token
+                    and not (expected_token_key is None and current_bound_token is None)
+                )
+                if token_changed:
+                    await self._recycle_browser_locked(
+                        reason=f"token_binding_changed:{current_bound_token}->{expected_token_key}",
+                        rotate_profile=False,
+                    )
+                    has_shared_browser = False
+
+            if has_shared_browser:
                 try:
                     await self._ensure_shared_keepalive_page()
                 except Exception:
                     await self._recycle_browser_locked(reason="keepalive_page_broken", rotate_profile=False)
+                    has_shared_browser = False
+
+            if has_shared_browser:
+                binding_ok = await self._ensure_shared_token_binding(self._shared_context, token_id)
+                if not binding_ok:
+                    await self._recycle_browser_locked(reason="token_binding_failed", rotate_profile=False)
                     has_shared_browser = False
 
             if has_shared_browser:
@@ -788,6 +1486,16 @@ class TokenBrowser:
                 return self._shared_playwright, self._shared_browser, self._shared_context
 
             playwright, browser, context = await self._create_browser(token_proxy_url=token_proxy_url)
+            binding_ok = await self._ensure_shared_token_binding(context, token_id)
+            if not binding_ok:
+                await self._close_browser(
+                    playwright,
+                    browser,
+                    context,
+                    browser_pid=self._extract_browser_pid(browser),
+                    clear_slot_pid=True,
+                )
+                raise RuntimeError("failed to bind token session context")
             self._shared_playwright = playwright
             self._shared_browser = browser
             self._shared_context = context
@@ -993,6 +1701,8 @@ class TokenBrowser:
             self._shared_keepalive_page = None
             self._shared_browser_pid = None
             self._shared_proxy_url = None
+            self._shared_bound_token_id = None
+            self._shared_bound_cookie_signature = None
         try:
             if context:
                 await asyncio.wait_for(context.close(), timeout=10)
@@ -1147,69 +1857,17 @@ class TokenBrowser:
         page = None
         try:
             page = await context.new_page()
+            await self._apply_browser_environment_patch(page, label="captcha_page")
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-
-            # 使用更简单的 API 地址，避免加载复杂页面
-            page_url = "https://labs.google/fx/api/auth/providers"
-            primary_host = "https://www.recaptcha.net" if self._browser_proxy_active else "https://www.google.com"
-            secondary_host = "https://www.google.com" if primary_host == "https://www.recaptcha.net" else "https://www.recaptcha.net"
-            debug_logger.log_info(
-                f"[BrowserCaptcha] Token-{self.token_id} 加载 enterprise.js: primary={primary_host}, secondary={secondary_host}"
+            ready = await self._prepare_flow_runtime_page(
+                page,
+                project_id,
+                website_key,
+                action,
+                context_label="打码",
             )
-            
-            async def handle_route(route):
-                if route.request.url.rstrip('/') == page_url.rstrip('/'):
-                    html = f"""<html><head><script>
-                    (() => {{
-                        const urls = [
-                            '{primary_host}/recaptcha/enterprise.js?render={website_key}',
-                            '{secondary_host}/recaptcha/enterprise.js?render={website_key}'
-                        ];
-                        const loadScript = (index) => {{
-                            if (index >= urls.length) return;
-                            const script = document.createElement('script');
-                            script.src = urls[index];
-                            script.async = true;
-                            script.onerror = () => loadScript(index + 1);
-                            document.head.appendChild(script);
-                        }};
-                        loadScript(0);
-                    }})();
-                    </script></head><body></body></html>"""
-                    await route.fulfill(status=200, content_type="text/html", body=html)
-                elif any(d in route.request.url for d in ["google.com", "gstatic.com", "recaptcha.net"]):
-                    await route.continue_()
-                else:
-                    await route.abort()
-
-            def handle_request_failed(request):
-                try:
-                    failed_url = request.url or ""
-                    if not any(d in failed_url for d in ["google.com", "gstatic.com", "recaptcha.net"]):
-                        return
-                    failure = request.failure or ""
-                    debug_logger.log_warning(
-                        f"[BrowserCaptcha] Token-{self.token_id} 资源加载失败: url={failed_url[:200]}, error={failure}"
-                    )
-                except Exception:
-                    pass
-            
-            await page.route("**/*", handle_route)
-            page.on("requestfailed", handle_request_failed)
-            try:
-                await page.goto(page_url, wait_until="load", timeout=15000)  # 减少到15秒
-            except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} page.goto 失败: {type(e).__name__}: {str(e)[:200]}")
+            if not ready:
                 return None
-
-            try:
-                await page.wait_for_function("typeof grecaptcha !== 'undefined'", timeout=10000)  # 减少到10秒
-            except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} grecaptcha 未就绪: {type(e).__name__}: {str(e)[:200]}")
-                return None
-
-            # 记录本次打码页面的真实 UA/客户端提示头
-            await self._capture_page_fingerprint(page)
 
             token = await asyncio.wait_for(
                 page.evaluate(f"""
@@ -1258,6 +1916,7 @@ class TokenBrowser:
         page = None
         try:
             page = await context.new_page()
+            await self._apply_browser_environment_patch(page, label="custom_captcha_page")
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
             primary_host = "https://www.recaptcha.net" if self._browser_proxy_active else "https://www.google.com"
@@ -1453,13 +2112,275 @@ class TokenBrowser:
         if not self._last_fingerprint:
             return None
         return dict(self._last_fingerprint)
+
+    async def _wait_for_enterprise_ready(
+        self,
+        page,
+        website_key: str,
+        primary_host: str,
+        secondary_host: str,
+        *,
+        timeout_ms: int = 15000,
+        context_label: str = "",
+    ) -> bool:
+        """等待 grecaptcha.enterprise 就绪，必要时补注入 enterprise.js。"""
+        wait_expression = (
+            "typeof grecaptcha !== 'undefined' && "
+            "typeof grecaptcha.enterprise !== 'undefined' && "
+            "typeof grecaptcha.enterprise.execute === 'function'"
+        )
+        label = f"{context_label} " if context_label else ""
+        try:
+            await page.wait_for_function(wait_expression, timeout=timeout_ms)
+            return True
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}grecaptcha 未就绪，尝试补注入脚本: "
+                f"{type(e).__name__}: {str(e)[:200]}"
+            )
+
+        try:
+            await page.evaluate(
+                """
+                (primaryUrl, secondaryUrl) => {
+                    const existing = Array.from(document.scripts || []).some((script) => {
+                        const src = script?.src || "";
+                        return src.includes('/recaptcha/enterprise.js');
+                    });
+                    if (existing) return;
+                    const urls = [primaryUrl, secondaryUrl];
+                    const loadScript = (index) => {
+                        if (index >= urls.length) return;
+                        const script = document.createElement('script');
+                        script.src = urls[index];
+                        script.async = true;
+                        script.onerror = () => loadScript(index + 1);
+                        document.head.appendChild(script);
+                    };
+                    loadScript(0);
+                }
+                """,
+                f"{primary_host}/recaptcha/enterprise.js?render={website_key}",
+                f"{secondary_host}/recaptcha/enterprise.js?render={website_key}",
+            )
+            await page.wait_for_function(wait_expression, timeout=timeout_ms)
+            return True
+        except Exception as inject_error:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}grecaptcha 最终未就绪: "
+                f"{type(inject_error).__name__}: {str(inject_error)[:200]}"
+            )
+            return False
+
+    @staticmethod
+    def _inject_recaptcha_token(payload: Any, token: str):
+        """递归更新 payload 内所有 reCAPTCHA token 字段。"""
+        if isinstance(payload, dict):
+            recaptcha_context = payload.get("recaptchaContext")
+            if isinstance(recaptcha_context, dict):
+                recaptcha_context["token"] = token
+                recaptcha_context.setdefault(
+                    "applicationType",
+                    "RECAPTCHA_APPLICATION_TYPE_WEB",
+                )
+            for value in payload.values():
+                TokenBrowser._inject_recaptcha_token(value, token)
+        elif isinstance(payload, list):
+            for item in payload:
+                TokenBrowser._inject_recaptcha_token(item, token)
+
+    async def submit_flow_request(
+        self,
+        project_id: str,
+        website_key: str,
+        action: str,
+        url: str,
+        at_token: str,
+        json_data: Dict[str, Any],
+        timeout: int,
+        token_proxy_url: Optional[str] = None,
+        token_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """在同一浏览器上下文中完成打码并直接提交 Flow 请求。"""
+        async with self._semaphore:
+            self._solve_inflight += 1
+            max_retries = max(3, int(getattr(config, "browser_captcha_max_retries", 5) or 5))
+
+            try:
+                for attempt in range(max_retries):
+                    page = None
+                    try:
+                        start_ts = time.time()
+                        _, _, context = await self._get_or_create_shared_browser(
+                            token_proxy_url=token_proxy_url,
+                            token_id=token_id,
+                        )
+
+                        page = await context.new_page()
+                        await self._apply_browser_environment_patch(page, label="browser_submit_page")
+                        await page.add_init_script(
+                            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                        )
+
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] Token-{self.token_id} 浏览器内提交 Flow 请求: "
+                            f"action={action}, project_id={project_id}"
+                        )
+                        ready = await self._prepare_flow_runtime_page(
+                            page,
+                            project_id,
+                            website_key,
+                            action,
+                            context_label="浏览器内提交",
+                        )
+                        if not ready:
+                            raise RuntimeError("grecaptcha.enterprise 未就绪")
+
+                        payload_for_submit = deepcopy(json_data)
+                        response_payload = await asyncio.wait_for(
+                            page.evaluate(
+                                """
+                                async ({ websiteKey, actionName, targetUrl, bearerToken, payload, timeoutMs }) => {
+                                    const solveToken = () => new Promise((resolve, reject) => {
+                                        const timer = setTimeout(() => reject(new Error('captcha_timeout')), 25000);
+                                        try {
+                                            grecaptcha.enterprise.execute(websiteKey, { action: actionName })
+                                                .then((token) => {
+                                                    clearTimeout(timer);
+                                                    resolve(token);
+                                                })
+                                                .catch((error) => {
+                                                    clearTimeout(timer);
+                                                    reject(error);
+                                                });
+                                        } catch (error) {
+                                            clearTimeout(timer);
+                                            reject(error);
+                                        }
+                                    });
+
+                                    const patchToken = (value, token) => {
+                                        if (!value) return;
+                                        if (Array.isArray(value)) {
+                                            value.forEach((item) => patchToken(item, token));
+                                            return;
+                                        }
+                                        if (typeof value !== 'object') return;
+                                        if (value.recaptchaContext && typeof value.recaptchaContext === 'object') {
+                                            value.recaptchaContext.token = token;
+                                            if (!value.recaptchaContext.applicationType) {
+                                                value.recaptchaContext.applicationType = 'RECAPTCHA_APPLICATION_TYPE_WEB';
+                                            }
+                                        }
+                                        Object.values(value).forEach((item) => patchToken(item, token));
+                                    };
+
+                                    const token = await solveToken();
+                                    const body = typeof structuredClone === 'function'
+                                        ? structuredClone(payload)
+                                        : JSON.parse(JSON.stringify(payload));
+                                    patchToken(body, token);
+
+                                    const controller = new AbortController();
+                                    const abortTimer = setTimeout(() => controller.abort('flow_fetch_timeout'), timeoutMs);
+                                    try {
+                                        const response = await fetch(targetUrl, {
+                                            method: 'POST',
+                                            headers: {
+                                                'authorization': `Bearer ${bearerToken}`,
+                                                'content-type': 'text/plain;charset=UTF-8',
+                                            },
+                                            credentials: 'include',
+                                            body: JSON.stringify(body),
+                                            signal: controller.signal,
+                                        });
+                                        const text = await response.text();
+                                        const headers = {};
+                                        response.headers.forEach((value, key) => {
+                                            headers[key] = value;
+                                        });
+                                        return {
+                                            ok: response.ok,
+                                            status: response.status,
+                                            text,
+                                            headers,
+                                            token,
+                                        };
+                                    } finally {
+                                        clearTimeout(abortTimer);
+                                    }
+                                }
+                                """,
+                                {
+                                    "websiteKey": website_key,
+                                    "actionName": action,
+                                    "targetUrl": url,
+                                    "bearerToken": at_token,
+                                    "payload": payload_for_submit,
+                                    "timeoutMs": max(5000, int(timeout * 1000)),
+                                },
+                            ),
+                            timeout=max(35, timeout + 10),
+                        )
+
+                        if not isinstance(response_payload, dict):
+                            raise RuntimeError("浏览器内提交返回格式异常")
+
+                        self._solve_count += 1
+                        self._consecutive_browser_failures = 0
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] Token-{self.token_id} 浏览器内提交完成 "
+                            f"(status={response_payload.get('status')}, "
+                            f"{(time.time() - start_ts) * 1000:.0f}ms, "
+                            f"launches={self._shared_launch_count}, reuse={self._shared_reuse_count})"
+                        )
+                        return response_payload
+                    except Exception as e:
+                        self._error_count += 1
+                        self._consecutive_browser_failures += 1
+                        error_message = f"{type(e).__name__}: {str(e)}"
+                        debug_logger.log_error(
+                            f"[BrowserCaptcha] Token-{self.token_id} 浏览器内提交失败: "
+                            f"{error_message[:240]}"
+                        )
+                        error_lower = error_message.lower()
+                        if any(
+                            keyword in error_lower
+                            for keyword in [
+                                "context or browser has been closed",
+                                "target closed",
+                                "browser has been closed",
+                                "connection closed",
+                                "crash",
+                                "closed",
+                            ]
+                        ):
+                            await self.recycle_browser(
+                                reason="browser_submit_runtime_error",
+                                rotate_profile=False,
+                            )
+                    finally:
+                        if page:
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
+
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)
+
+                raise RuntimeError("浏览器内提交 Flow 请求失败")
+            finally:
+                self._solve_inflight = max(0, self._solve_inflight - 1)
+                self.note_idle()
     
     async def get_token(
         self,
         project_id: str,
         website_key: str,
         action: str = "IMAGE_GENERATION",
-        token_proxy_url: Optional[str] = None
+        token_proxy_url: Optional[str] = None,
+        token_id: Optional[int] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         """Get a token from the shared browser unless a fatal browser error occurs."""
         async with self._semaphore:
@@ -1470,7 +2391,10 @@ class TokenBrowser:
                 for attempt in range(max_retries):
                     try:
                         start_ts = time.time()
-                        _, _, context = await self._get_or_create_shared_browser(token_proxy_url=token_proxy_url)
+                        _, _, context = await self._get_or_create_shared_browser(
+                            token_proxy_url=token_proxy_url,
+                            token_id=token_id,
+                        )
 
                         token = await self._execute_captcha(context, project_id, website_key, action)
                         if token:
@@ -1947,7 +2871,8 @@ class BrowserCaptchaService:
                         project_id,
                         self.website_key,
                         action,
-                        token_proxy_url=token_proxy_url
+                        token_proxy_url=token_proxy_url,
+                        token_id=token_id,
                     )
                 finally:
                     await self._release_slot_reservation(browser_id)
@@ -1967,7 +2892,8 @@ class BrowserCaptchaService:
                 project_id,
                 self.website_key,
                 action,
-                token_proxy_url=token_proxy_url
+                token_proxy_url=token_proxy_url,
+                token_id=token_id,
             )
         finally:
             await self._release_slot_reservation(browser_id)
@@ -2058,6 +2984,39 @@ class BrowserCaptchaService:
             if not browser:
                 return None
             return browser.get_last_fingerprint()
+
+    async def submit_flow_request(
+        self,
+        project_id: str,
+        action: str,
+        token_id: Optional[int],
+        url: str,
+        at_token: str,
+        json_data: Dict[str, Any],
+        timeout: int,
+    ) -> tuple[Dict[str, Any], Union[int, str], Optional[Dict[str, Any]]]:
+        """在 browser 模式下于同一浏览器上下文内完成打码并提交 Flow 请求。"""
+        self._check_available()
+
+        token_proxy_url = await self._resolve_token_proxy_url(token_id)
+        browser_id = await self._select_browser_id(project_id)
+        try:
+            browser = await self._get_or_create_browser(browser_id)
+            response_payload = await browser.submit_flow_request(
+                project_id=project_id,
+                website_key=self.website_key,
+                action=action,
+                url=url,
+                at_token=at_token,
+                json_data=json_data,
+                timeout=timeout,
+                token_proxy_url=token_proxy_url,
+                token_id=token_id,
+            )
+            fingerprint = browser.get_last_fingerprint()
+            return response_payload, self._compose_browser_ref(browser_id, None), fingerprint
+        finally:
+            await self._release_slot_reservation(browser_id)
 
     async def report_error(self, browser_ref: Optional[Union[int, str]] = None, error_reason: Optional[str] = None):
         """Handle upstream errors; recycle the browser only for explicit reCAPTCHA evaluation failures."""

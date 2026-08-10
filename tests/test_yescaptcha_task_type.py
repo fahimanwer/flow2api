@@ -14,10 +14,10 @@ class YesCaptchaTaskTypeTests(unittest.TestCase):
             "RecaptchaV3TaskProxylessM1S9",
         )
 
-    def test_unknown_task_type_falls_back_to_m1(self):
+    def test_unknown_task_type_falls_back_to_default(self):
         self.assertEqual(
             normalize_yescaptcha_task_type("bad-type"),
-            "RecaptchaV3TaskProxylessM1",
+            "RecaptchaV3TaskProxylessM1S9",
         )
 
     def test_s7_s9_force_expected_min_score(self):

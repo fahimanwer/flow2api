@@ -11,6 +11,37 @@
 
 </div>
 
+## ❤️赞助商
+
+<div align="center">
+
+[![FastAIToken](static/sponsors/fastaitoken-banner.png)](https://www.fastaitoken.com/register)
+
+</div>
+
+**FastAIToken** 是面向开发者的 AI API 聚合平台，支持 OpenAI、Claude、Gemini 等主流大模型，兼容 OpenAI API 协议，可无缝接入 **Claude Code、Codex、Gemini CLI、Cherry Studio、Cline、Continue** 等各类 AI 开发工具。平台采用 **充值 1:1（1 元 = 1 美元 API 额度）**，帮助开发者以更低成本、更高效率地使用全球领先的大模型服务。
+
+平台提供多个可选分组与公开状态页，开发者可根据成本、响应速度和稳定性自由选择不同渠道，并享受 **7×24 小时真人技术支持**（非机器人）。
+
+**主要做 AI 开发接入？可以试试 [FastAIToken](https://www.fastaitoken.com/register)，兼容 Codex / Claude Code / Gemini CLI 等主流工具。**
+
+---
+
+<table>
+<tr>
+<td width="180" align="center" valign="middle">
+  <a href="https://www.fastaitoken.com/register">
+    <img src="static/sponsors/fastaitoken-logo.png" alt="FastAIToken" width="150">
+  </a>
+</td>
+<td valign="top">
+  感谢 <strong>FastAIToken</strong> 赞助了本项目！FastAIToken 是面向开发者的 AI API 聚合平台，兼容 OpenAI API 协议，支持 Claude Code、Codex、Gemini CLI、Cherry Studio、Cline、Continue 等主流 AI 开发工具。<br><br>
+  当前提供 <strong>0.02x OpenAI 福利分组（限时）</strong>、<strong>0.25x OpenAI 普通分组</strong>、<strong>0.35x OpenAI 备用分组</strong>、<strong>0.45x OpenAI Pro 分组</strong>、<strong>0.7x Claude 普通分组</strong>、<strong>1.2x Claude Max 渠道</strong>；支持 <strong>1 元 = 1 美元 API 额度</strong> 的充值比例，并提供公开状态页、企业开票、<strong>99% SLA 企业级稳定号池</strong> 与 <strong>7×24 小时真人技术支持</strong>。<br><br>
+  欢迎通过<a href="https://www.fastaitoken.com/register">此链接</a>注册体验。
+</td>
+</tr>
+</table>
+
 ## ✨ 核心特性
 
 - 🎨 **文生图** / **图生图**
@@ -34,7 +65,7 @@
 
 - 由于Flow增加了额外的验证码，你可以自行选择使用浏览器打码或第三发打码：
 注册[YesCaptcha](https://yescaptcha.com/i/13Xd8K)并获取api key，将其填入系统配置页面```YesCaptcha API密钥```区域
-- YesCaptcha 支持在管理页切换 `type`：`RecaptchaV3TaskProxyless`、`RecaptchaV3TaskProxylessM1`、`RecaptchaV3TaskProxylessM1S7`、`RecaptchaV3TaskProxylessM1S9`；S7/S9 会强制提交 `minScore` 0.7/0.9。
+- YesCaptcha 支持在管理页切换 `type`：`RecaptchaV3TaskProxyless`、`RecaptchaV3TaskProxylessM1`、`RecaptchaV3TaskProxylessM1S7`、`RecaptchaV3TaskProxylessM1S9`；当前默认推荐 `M1S9`，S7/S9 会强制提交 `minScore` 0.7/0.9。
 - 默认 `docker-compose.yml` 建议搭配第三方打码（yescaptcha/capmonster/ezcaptcha/capsolver）。
 如需 Docker 内有头打码（browser/personal），请使用下方 `docker-compose.headed.yml`。
 
@@ -555,3 +586,4 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=TheSmallHanCat/flow2api&type=date&legend=top-left)](https://www.star-history.com/#TheSmallHanCat/flow2api&type=date&legend=top-left)
+

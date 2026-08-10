@@ -1,9 +1,10 @@
 """Configuration management for Flow2API"""
+import os
 import tomli
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-DEFAULT_YESCAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1"
+DEFAULT_YESCAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1S9"
 YESCAPTCHA_TASK_TYPE_OPTIONS = {
     "RecaptchaV3TaskProxyless": None,
     "RecaptchaV3TaskProxylessM1": None,
@@ -453,6 +454,24 @@ class Config:
             return 600
 
     @property
+    def browser_captcha_max_retries(self) -> int:
+        """browser 模式单次打码最大重试次数。"""
+        value = self._config.get("captcha", {}).get("browser_captcha_max_retries", 5)
+        try:
+            return max(1, min(20, int(value)))
+        except Exception:
+            return 5
+
+    @property
+    def browser_captcha_generation_retries(self) -> int:
+        """生成接口因 reCAPTCHA 评估失败时允许的总重试次数。"""
+        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 6)
+        try:
+            return max(1, min(20, int(value)))
+        except Exception:
+            return 6
+
+    @property
     def personal_max_resident_tabs(self) -> int:
         """内置浏览器打码单实例共享标签页上限"""
         value = self._config.get("captcha", {}).get("personal_max_resident_tabs", 5)
@@ -478,6 +497,14 @@ class Config:
             return max(60, int(value))
         except Exception:
             return 600
+
+    @property
+    def personal_headless(self) -> bool:
+        """personal 内置浏览器是否强制无头；默认按有头模式运行。"""
+        env_value = os.getenv("PERSONAL_BROWSER_HEADLESS")
+        if env_value is not None:
+            return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
+        return bool(self._config.get("captcha", {}).get("personal_headless", False))
 
     def set_personal_max_resident_tabs(self, value: int):
         """设置内置浏览器打码单实例共享标签页上限"""

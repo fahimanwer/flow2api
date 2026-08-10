@@ -6,9 +6,11 @@ import time
 import uuid
 import random
 import base64
+import gzip
 import ssl
+import re
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
@@ -41,6 +43,19 @@ class FlowAPIError(Exception):
 class FlowClient:
     """VideoFX API客户端"""
 
+    FLOW_PUBLIC_API_KEY = "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY"
+    FLOW_BROWSER_CHANNEL_HEADER = "stable"
+    FLOW_BROWSER_COPYRIGHT_HEADER = "Copyright 2026 Google LLC. All Rights Reserved."
+    FLOW_BROWSER_VALIDATION_HEADER = "MRCPrt/rS3JY47x2Yiz9h3ag4U8="
+    FLOW_BROWSER_YEAR_HEADER = "2026"
+    FLOW_FRONTEND_EXPERIMENT_IDS = (
+        "106184493,106256669,105798603,106281924,106259075,106262194,"
+        "105993823,106104244,105484652,1714252,105928947,106238955,"
+        "106225453,106131447,1706538,119157484,106243706,105746691,"
+        "106151974,106125249,106001691,106077941"
+    )
+    YESCAPTCHA_SLOT_BACKOFF_SECONDS = (3, 5, 8, 13, 20)
+
     def __init__(self, proxy_manager, db=None):
         self.proxy_manager = proxy_manager
         self.db = db  # Database instance for captcha config
@@ -56,18 +71,14 @@ class FlowClient:
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
 
-# Default "real browser" headers (macOS Chrome Desktop) to reduce upstream 4xx/5xx instability.
-        # These will be applied as defaults (won't override caller-provided headers).
-        # NOTE: Platform headers are auto-synced from real browser fingerprint in _make_request.
+        # Minimal browser-style headers only (what current Flow upstream still expects).
+        # UA / Accept-Language / UA-CH all come from the runtime fingerprint bound to
+        # the request chain (extension-reported real browser), not a random platform.
         self._default_client_headers = {
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"macOS\"",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
-            "x-browser-channel": "stable",
-            "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
-            "x-browser-year": "2026",
         }
         # 发车策略改为"请求到就发"：
         # 不在 flow2api 本地对提交做批次整形或排队，避免把同批请求打成阶梯。
@@ -95,10 +106,13 @@ class FlowClient:
         seed = int(hashlib.md5(account_id.encode()).hexdigest()[:8], 16)
         rng = random.Random(seed)
         
-        # Chrome 版本池 - 匹配真实 Mac mini Chrome 147 环境
-        chrome_versions = ["147.0.7727.56", "146.0.7688.92", "145.0.7649.100"]
+        # fallback 仅在没有 runtime fingerprint 时兜底，直接与当前上游 Windows Chrome 风格对齐
+        chrome_versions = ["149.0.0.0"]
         ch_version = rng.choice(chrome_versions)
-        user_agent = f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ch_version} Safari/537.36"
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{ch_version} Safari/537.36"
+        )
         
         # 缓存结果
         self._user_agent_cache[account_id] = user_agent
@@ -120,12 +134,247 @@ class FlowClient:
         """清理请求链路绑定的浏览器指纹。"""
         self._set_request_fingerprint(None)
 
+    def _get_primary_accept_language(self, fallback: str = "zh-CN,zh;q=0.9") -> str:
+        fingerprint = self.get_request_fingerprint()
+        if isinstance(fingerprint, dict):
+            accept_language = str(fingerprint.get("accept_language") or "").strip()
+            if accept_language:
+                return self._normalize_accept_language_header(accept_language, fallback=fallback)
+        return self._normalize_accept_language_header(fallback, fallback=fallback)
+
+    def _get_primary_locale_code(self, fallback: str = "en-US") -> str:
+        fingerprint = self.get_request_fingerprint()
+        if isinstance(fingerprint, dict):
+            language = str(fingerprint.get("language") or "").strip()
+            if language:
+                return language
+            accept_language = str(fingerprint.get("accept_language") or "").strip()
+            if accept_language:
+                primary = accept_language.split(",", 1)[0].strip()
+                if primary:
+                    return primary
+        return fallback
+
+    def _infer_sec_ch_ua_from_user_agent(self, user_agent: Optional[str]) -> str:
+        ua = str(user_agent or "").strip()
+        if not ua:
+            return ""
+        import re
+        match = re.search(r"(?:Chrome|Chromium)/(\d+)", ua, re.IGNORECASE)
+        major = match.group(1) if match else "124"
+        return f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not)A;Brand";v="24"'
+
+    def _normalize_sec_ch_ua_header(
+        self,
+        sec_ch_ua: Optional[str],
+        *,
+        user_agent: Optional[str] = None,
+    ) -> str:
+        raw = str(sec_ch_ua or "").strip()
+        inferred = self._infer_sec_ch_ua_from_user_agent(user_agent)
+        if not raw:
+            return inferred
+        ua_text = str(user_agent or "").lower()
+        if "chrome/" in ua_text and "google chrome" not in raw.lower():
+            return inferred
+        return raw or inferred
+
+    def _build_fingerprint_from_user_agent(
+        self,
+        user_agent: Optional[str],
+        *,
+        accept_language: Optional[str] = None,
+        proxy_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        ua = str(user_agent or "").strip()
+        if not ua:
+            return {}
+        ua_lower = ua.lower()
+        platform = '"Windows"'
+        mobile = "?0"
+        if "android" in ua_lower:
+            platform = '"Android"'
+            mobile = "?1"
+        elif "iphone" in ua_lower or "ipad" in ua_lower or "ios" in ua_lower:
+            platform = '"iOS"'
+            mobile = "?1"
+        elif "mac" in ua_lower:
+            platform = '"macOS"'
+        elif "linux" in ua_lower or "x11" in ua_lower:
+            platform = '"Linux"'
+        fingerprint: Dict[str, Any] = {
+            "user_agent": ua,
+            "sec_ch_ua": self._infer_sec_ch_ua_from_user_agent(ua),
+            "sec_ch_ua_mobile": mobile,
+            "sec_ch_ua_platform": platform,
+        }
+        normalized_accept_language = self._normalize_accept_language_header(accept_language)
+        if normalized_accept_language:
+            fingerprint["accept_language"] = normalized_accept_language
+        if proxy_url:
+            fingerprint["proxy_url"] = proxy_url
+        return fingerprint
+
+    def _normalize_accept_language_header(
+        self,
+        accept_language: Optional[str],
+        fallback: str = "zh-CN,zh;q=0.9",
+    ) -> str:
+        raw = str(accept_language or "").strip()
+        if not raw:
+            return fallback
+        if "," in raw:
+            normalized_parts: list[str] = []
+            for index, item in enumerate(raw.split(",")):
+                candidate = str(item or "").strip()
+                if not candidate:
+                    continue
+                language = candidate.split(";", 1)[0].strip()
+                if not language:
+                    continue
+                if index == 0:
+                    normalized_parts.append(language)
+                    continue
+                q_match = re.search(r";\s*q=([0-9.]+)", candidate, re.IGNORECASE)
+                q_value = q_match.group(1) if q_match else f"{max(0.1, 1 - (index * 0.1)):.1f}"
+                normalized_parts.append(f"{language};q={q_value}")
+            if normalized_parts:
+                return ",".join(normalized_parts)
+            return fallback
+        if "-" in raw:
+            primary = raw.split("-", 1)[0].strip()
+            if len(primary) == 2 and primary.isalpha():
+                return f"{raw},{primary};q=0.9"
+        return raw
+
+    def _get_effective_request_user_agent(self, account_id: Optional[str] = None) -> str:
+        fingerprint = self.get_request_fingerprint()
+        if isinstance(fingerprint, dict):
+            user_agent = str(fingerprint.get("user_agent") or "").strip()
+            if user_agent:
+                return user_agent
+        return self._generate_user_agent(account_id)
+
+    @staticmethod
+    def _should_attach_runtime_session_cookies(url: str) -> bool:
+        host = str(urlparse(str(url or "")).hostname or "").lower()
+        if not host:
+            return False
+        return any(
+            host == candidate or host.endswith(f".{candidate}")
+            for candidate in (
+                "google.com",
+                "googleapis.com",
+                "labs.google",
+                "recaptcha.net",
+            )
+        )
+
+    @staticmethod
+    def _merge_cookie_header(
+        existing_cookie_header: Optional[str],
+        extra_cookies: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        cookie_items: Dict[str, str] = {}
+        raw_existing = str(existing_cookie_header or "").strip()
+        if raw_existing:
+            for part in raw_existing.split(";"):
+                item = str(part or "").strip()
+                if not item or "=" not in item:
+                    continue
+                key, value = item.split("=", 1)
+                key = str(key or "").strip()
+                value = str(value or "").strip()
+                if key:
+                    cookie_items[key] = value
+
+        if isinstance(extra_cookies, dict):
+            for key, value in extra_cookies.items():
+                normalized_key = str(key or "").strip()
+                normalized_value = str(value or "").strip()
+                if normalized_key and normalized_value and normalized_key not in cookie_items:
+                    cookie_items[normalized_key] = normalized_value
+
+        if not cookie_items:
+            return raw_existing or None
+        return "; ".join(f"{key}={value}" for key, value in cookie_items.items())
+
+    def _build_flow_project_page_url(self, project_id: str) -> str:
+        return f"https://labs.google/fx/tools/flow/project/{project_id}"
+
+    def _build_current_flow_media_headers(
+        self,
+        *,
+        content_type: str = "application/json",
+    ) -> Dict[str, str]:
+        headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": self._get_primary_accept_language(fallback="zh-CN,zh;q=0.9"),
+            "Content-Type": content_type,
+            "Origin": "https://labs.google",
+            "Priority": "u=1, i",
+            "Referer": "https://labs.google/",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
+            "sec-fetch-storage-access": "active",
+        }
+        headers.setdefault("x-browser-channel", self.FLOW_BROWSER_CHANNEL_HEADER)
+        headers.setdefault("x-browser-copyright", self.FLOW_BROWSER_COPYRIGHT_HEADER)
+        headers.setdefault("x-browser-validation", self.FLOW_BROWSER_VALIDATION_HEADER)
+        headers.setdefault("x-browser-year", self.FLOW_BROWSER_YEAR_HEADER)
+        return headers
+
+    def _build_labs_request_context_headers(self, project_id: Optional[str]) -> Dict[str, str]:
+        return self._build_current_flow_media_headers()
+
+    def _compact_json_dumps(self, payload: Any) -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _encode_trpc_input(self, payload: Dict[str, Any]) -> str:
+        return quote(self._compact_json_dumps(payload), safe="")
+
+    @staticmethod
+    def _extract_project_id_from_request_payload(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        client_context = payload.get("clientContext")
+        if isinstance(client_context, dict):
+            project_id = str(client_context.get("projectId") or "").strip()
+            if project_id:
+                return project_id
+        requests = payload.get("requests")
+        if isinstance(requests, list):
+            for item in requests:
+                if not isinstance(item, dict):
+                    continue
+                item_client_context = item.get("clientContext")
+                if not isinstance(item_client_context, dict):
+                    continue
+                project_id = str(item_client_context.get("projectId") or "").strip()
+                if project_id:
+                    return project_id
+        return None
+
+    async def _get_token_st_by_id(self, token_id: Optional[int]) -> Optional[str]:
+        if not token_id or self.db is None or not hasattr(self.db, "get_token"):
+            return None
+        try:
+            token = await self.db.get_token(int(token_id))
+            st_value = str(getattr(token, "st", "") or "").strip() if token else ""
+            return st_value or None
+        except Exception as e:
+            debug_logger.log_warning(f"[VIDEO WARMUP] 读取 Token-{token_id} 的 ST 失败: {e}")
+            return None
+
     async def _make_request(
         self,
         method: str,
         url: str,
         headers: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
+        raw_body: Optional[Union[str, bytes]] = None,
         use_st: bool = False,
         st_token: Optional[str] = None,
         use_at: bool = False,
@@ -134,24 +383,11 @@ class FlowClient:
         use_media_proxy: bool = False,
         respect_fingerprint_proxy: bool = True,
         force_no_proxy: bool = False,
-        allow_urllib_fallback: bool = True
+        allow_urllib_fallback: bool = True,
+        apply_default_client_headers: bool = True,
+        impersonate: str = "chrome124",
     ) -> Dict[str, Any]:
-        """统一HTTP请求处理
-
-        Args:
-            method: HTTP方法 (GET/POST)
-            url: 完整URL
-            headers: 请求头
-            json_data: JSON请求体
-            use_st: 是否使用ST认证 (Cookie方式)
-            st_token: Session Token
-            use_at: 是否使用AT认证 (Bearer方式)
-            at_token: Access Token
-            timeout: 自定义超时时间(秒)，不传则使用默认值
-            use_media_proxy: 是否使用图片上传/下载代理
-            respect_fingerprint_proxy: 是否优先使用打码浏览器指纹里的代理
-            allow_urllib_fallback: curl_cffi 网络失败时是否允许 urllib 二次兜底
-        """
+        """统一HTTP请求处理"""
         fingerprint = self._request_fingerprint_ctx.get()
 
         proxy_url = None
@@ -175,22 +411,18 @@ class FlowClient:
         else:
             headers = dict(headers)
 
-        # ST认证 - 使用Cookie
         if use_st and st_token:
             headers["Cookie"] = f"__Secure-next-auth.session-token={st_token}"
 
-        # AT认证 - 使用Bearer
         if use_at and at_token:
             headers["authorization"] = f"Bearer {at_token}"
 
-        # 确定账号标识（优先使用 token 的前16个字符作为标识）
         account_id = None
         if st_token:
-            account_id = st_token[:16]  # 使用 ST 的前16个字符
+            account_id = st_token[:16]
         elif at_token:
-            account_id = at_token[:16]  # 使用 AT 的前16个字符
+            account_id = at_token[:16]
 
-        # 通用请求头 - 优先使用打码浏览器指纹中的 UA
         fingerprint_user_agent = None
         if isinstance(fingerprint, dict):
             _fp_log = dict(fingerprint)
@@ -198,63 +430,69 @@ class FlowClient:
                 _fp_log["proxy_url"] = mask_proxy_url(_fp_log.get("proxy_url"))
             debug_logger.log_info(f"[FINGERPRINT] 当前请求链路绑定的浏览器指纹: {_fp_log}")
             fingerprint_user_agent = fingerprint.get("user_agent")
-        elif getattr(config, "captcha_method", "") == "personal":
-            debug_logger.log_info("[FINGERPRINT] captcha_method=personal，尝试从内置浏览器获取真实浏览器指纹作为请求头")
-            try:
-                from .browser_captcha_personal import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
-                if service:
-                    browser_fingerprint = service.get_last_fingerprint()
-                    if isinstance(browser_fingerprint, dict) and browser_fingerprint.get("user_agent"):
-                        fingerprint = browser_fingerprint
-                        fingerprint_user_agent = fingerprint["user_agent"]
-                    else:
-                        fingerprint_user_agent = await service.get_current_user_agent()
-            except Exception as e:
-                debug_logger.log_warning(f"[FINGERPRINT] 从内置浏览器获取指纹失败: {e}")
-        else:
-            debug_logger.log_info("[FINGERPRINT] 未检测到浏览器指纹上下文，使用基于账号ID生成的固定 User-Agent 作为请求头")
-            fingerprint_user_agent = self._generate_user_agent(account_id)
-        # Fall back to a generated UA so the header is never None — otherwise the
-        # personal/cold-start path (no browser fingerprint yet) would set
-        # User-Agent=None and crash at headers.get("User-Agent", "").lower() below.
-        headers.update({
-            "Content-Type": "application/json",
-            "User-Agent": fingerprint_user_agent or self._generate_user_agent(account_id)
-        })
 
-        # 若存在打码浏览器指纹，覆盖关键客户端提示头，保证提交请求与打码时一致。
+        # UA comes from the request-chain fingerprint (real browser); generated UA is the
+        # never-None fallback. Accept-Language falls back to en-US — every worker browser
+        # in this fleet is English; a zh-CN default would contradict the minted fingerprint.
+        effective_user_agent = str(fingerprint_user_agent or self._generate_user_agent(account_id)).strip()
+        headers.setdefault("Content-Type", "application/json")
+        headers.setdefault("User-Agent", effective_user_agent)
+        headers.setdefault("Accept-Language", self._get_primary_accept_language(fallback="en-US,en;q=0.9"))
+
         if isinstance(fingerprint, dict):
             if fingerprint.get("accept_language"):
                 headers.setdefault("Accept-Language", fingerprint["accept_language"])
             if fingerprint.get("sec_ch_ua"):
-                headers["sec-ch-ua"] = fingerprint["sec_ch_ua"]
+                headers["sec-ch-ua"] = self._normalize_sec_ch_ua_header(
+                    fingerprint["sec_ch_ua"],
+                    user_agent=headers.get("User-Agent"),
+                )
             if fingerprint.get("sec_ch_ua_mobile"):
                 headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
             if fingerprint.get("sec_ch_ua_platform"):
                 headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
 
-        # Add default Chromium/Android client headers (do not override explicitly provided values).
-        for key, value in self._default_client_headers.items():
-            headers.setdefault(key, value)
+        if apply_default_client_headers:
+            for key, value in self._default_client_headers.items():
+                headers.setdefault(key, value)
 
-        # Dynamic fix for sec-ch-ua headers when fingerprint is missing to avoid UA/Platform mismatch
-        if not isinstance(fingerprint, dict) or not fingerprint.get("sec_ch_ua_platform"):
-            ua_lower = headers.get("User-Agent", "").lower()
-            if "android" in ua_lower:
-                headers["sec-ch-ua-platform"] = "\"Android\""
-                headers["sec-ch-ua-mobile"] = "?1"
-            elif "mac" in ua_lower:
-                headers["sec-ch-ua-platform"] = "\"macOS\""
-                headers["sec-ch-ua-mobile"] = "?0"
-            elif "linux" in ua_lower or "x11" in ua_lower:
-                headers["sec-ch-ua-platform"] = "\"Linux\""
-                headers["sec-ch-ua-mobile"] = "?0"
-            else:
-                headers["sec-ch-ua-platform"] = "\"Windows\""
-                headers["sec-ch-ua-mobile"] = "?0"
+        inferred_fingerprint = self._build_fingerprint_from_user_agent(
+            headers.get("User-Agent"),
+            accept_language=headers.get("Accept-Language"),
+            proxy_url=proxy_url,
+        )
+        if not headers.get("sec-ch-ua") and inferred_fingerprint.get("sec_ch_ua"):
+            headers["sec-ch-ua"] = inferred_fingerprint["sec_ch_ua"]
+        if not headers.get("sec-ch-ua-platform") and inferred_fingerprint.get("sec_ch_ua_platform"):
+            headers["sec-ch-ua-platform"] = inferred_fingerprint["sec_ch_ua_platform"]
+        if not headers.get("sec-ch-ua-mobile") and inferred_fingerprint.get("sec_ch_ua_mobile"):
+            headers["sec-ch-ua-mobile"] = inferred_fingerprint["sec_ch_ua_mobile"]
 
-        # Log request
+        if isinstance(fingerprint, dict) and self._should_attach_runtime_session_cookies(url):
+            origin = str(fingerprint.get("origin") or "").strip() or "https://labs.google"
+            referer = str(fingerprint.get("referer") or "").strip()
+            if not referer:
+                fingerprint_project_id = str(fingerprint.get("project_id") or "").strip()
+                if fingerprint_project_id:
+                    referer = self._build_flow_project_page_url(fingerprint_project_id)
+            if origin:
+                headers.setdefault("Origin", origin)
+            if referer:
+                headers.setdefault("Referer", referer)
+            merged_cookie_header = self._merge_cookie_header(
+                headers.get("Cookie"),
+                fingerprint.get("session_cookies"),
+            )
+            if merged_cookie_header:
+                headers["Cookie"] = merged_cookie_header
+
+        if self._should_attach_runtime_session_cookies(url):
+            derived_project_id = self._extract_project_id_from_request_payload(json_data)
+            headers.setdefault("Origin", "https://labs.google")
+            if derived_project_id:
+                headers.setdefault("Referer", self._build_flow_project_page_url(derived_project_id))
+
+        request_body_for_log = raw_body if raw_body is not None else json_data
         if config.debug_enabled:
             if isinstance(fingerprint, dict):
                 debug_logger.log_info(
@@ -264,7 +502,7 @@ class FlowClient:
                 method=method,
                 url=url,
                 headers=headers,
-                body=json_data,
+                body=request_body_for_log,
                 proxy=mask_proxy_url(proxy_url)
             )
 
@@ -278,21 +516,23 @@ class FlowClient:
                         headers=headers,
                         proxy=proxy_url,
                         timeout=request_timeout,
-                        impersonate="chrome124"
+                        impersonate=impersonate,
                     )
-                else:  # POST
-                    response = await session.post(
-                        url,
-                        headers=headers,
-                        json=json_data,
-                        proxy=proxy_url,
-                        timeout=request_timeout,
-                        impersonate="chrome124"
-                    )
+                else:
+                    request_kwargs = {
+                        "headers": headers,
+                        "proxy": proxy_url,
+                        "timeout": request_timeout,
+                        "impersonate": impersonate,
+                    }
+                    if raw_body is not None:
+                        request_kwargs["data"] = raw_body
+                    else:
+                        request_kwargs["json"] = json_data
+                    response = await session.post(url, **request_kwargs)
 
                 duration_ms = (time.time() - start_time) * 1000
 
-                # Log response
                 if config.debug_enabled:
                     debug_logger.log_response(
                         status_code=response.status_code,
@@ -301,18 +541,14 @@ class FlowClient:
                         duration_ms=duration_ms
                     )
 
-                # 检查HTTP错误
                 if response.status_code >= 400:
-                    # 解析错误响应
                     error_reason = f"HTTP Error {response.status_code}"
                     parsed_reason = ""
                     try:
                         error_body = response.json()
-                        # 提取 Google API 错误格式中的 reason
                         if "error" in error_body:
                             error_info = error_body["error"]
                             error_message = error_info.get("message", "")
-                            # 从 details 中提取 reason
                             details = error_info.get("details", [])
                             for detail in details:
                                 if detail.get("reason"):
@@ -321,12 +557,11 @@ class FlowClient:
                                     break
                             if error_message:
                                 error_reason = f"{error_reason}: {error_message}"
-                    except:
+                    except Exception:
                         error_reason = f"HTTP Error {response.status_code}: {response.text[:200]}"
 
-                    # 失败时输出请求体和错误内容到控制台
                     debug_logger.log_error(f"[API FAILED] URL: {url}")
-                    debug_logger.log_error(f"[API FAILED] Request Body: {json_data}")
+                    debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
                     debug_logger.log_error(f"[API FAILED] Response: {response.text}")
 
                     # Always-on operational signal: classify anti-bot failures and
@@ -357,13 +592,10 @@ class FlowClient:
             # so callers can classify (e.g. 401/UNAUTHENTICATED => ST expired).
             raise
         except Exception as e:
-            duration_ms = (time.time() - start_time) * 1000
             error_msg = str(e)
-
-            # 如果不是我们自己抛出的异常，记录日志
             if "HTTP Error" not in error_msg and not any(x in error_msg for x in ["PUBLIC_ERROR", "INVALID_ARGUMENT"]):
                 debug_logger.log_error(f"[API FAILED] URL: {url}")
-                debug_logger.log_error(f"[API FAILED] Request Body: {json_data}")
+                debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
                 debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
 
             if allow_urllib_fallback and self._should_fallback_to_urllib(error_msg):
@@ -394,6 +626,203 @@ class FlowClient:
                     )
 
             raise Exception(f"Flow API request failed: {error_msg}")
+
+    async def _make_text_request(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict] = None,
+        json_data: Optional[Dict] = None,
+        raw_body: Optional[Union[str, bytes]] = None,
+        use_st: bool = False,
+        st_token: Optional[str] = None,
+        use_at: bool = False,
+        at_token: Optional[str] = None,
+        timeout: Optional[int] = None,
+        respect_fingerprint_proxy: bool = True,
+        force_no_proxy: bool = False,
+        apply_default_client_headers: bool = True,
+        impersonate: str = "chrome124",
+    ) -> str:
+        """执行原始文本请求（如 SSE），返回响应文本。"""
+        fingerprint = self._request_fingerprint_ctx.get()
+
+        proxy_url = None
+        if not force_no_proxy:
+            if self.proxy_manager:
+                if hasattr(self.proxy_manager, "get_request_proxy_url"):
+                    proxy_url = await self.proxy_manager.get_request_proxy_url()
+                else:
+                    proxy_url = await self.proxy_manager.get_proxy_url()
+
+            if respect_fingerprint_proxy and isinstance(fingerprint, dict) and "proxy_url" in fingerprint:
+                proxy_url = fingerprint.get("proxy_url")
+                if proxy_url == "":
+                    proxy_url = None
+
+        request_timeout = timeout or self.timeout
+
+        if headers is None:
+            headers = {}
+        else:
+            headers = dict(headers)
+
+        if use_st and st_token:
+            headers["Cookie"] = f"__Secure-next-auth.session-token={st_token}"
+
+        if use_at and at_token:
+            headers["authorization"] = f"Bearer {at_token}"
+
+        account_id = None
+        if st_token:
+            account_id = st_token[:16]
+        elif at_token:
+            account_id = at_token[:16]
+
+        fingerprint_user_agent = None
+        if isinstance(fingerprint, dict):
+            fingerprint_user_agent = fingerprint.get("user_agent")
+
+        effective_user_agent = str(fingerprint_user_agent or self._generate_user_agent(account_id)).strip()
+        headers.setdefault("Content-Type", "application/json")
+        headers.setdefault("User-Agent", effective_user_agent)
+        headers.setdefault("Accept-Language", self._get_primary_accept_language(fallback="zh-CN,zh;q=0.9"))
+
+        if isinstance(fingerprint, dict):
+            if fingerprint.get("accept_language"):
+                headers.setdefault("Accept-Language", fingerprint["accept_language"])
+            if fingerprint.get("sec_ch_ua"):
+                headers["sec-ch-ua"] = self._normalize_sec_ch_ua_header(
+                    fingerprint["sec_ch_ua"],
+                    user_agent=headers.get("User-Agent"),
+                )
+            if fingerprint.get("sec_ch_ua_mobile"):
+                headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
+            if fingerprint.get("sec_ch_ua_platform"):
+                headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
+            if self._should_attach_runtime_session_cookies(url):
+                origin = str(fingerprint.get("origin") or "").strip() or "https://labs.google"
+                referer = str(fingerprint.get("referer") or "").strip()
+                if not referer:
+                    fingerprint_project_id = str(fingerprint.get("project_id") or "").strip()
+                    if fingerprint_project_id:
+                        referer = self._build_flow_project_page_url(fingerprint_project_id)
+                if origin:
+                    headers.setdefault("Origin", origin)
+                if referer:
+                    headers.setdefault("Referer", referer)
+            if self._should_attach_runtime_session_cookies(url):
+                merged_cookie_header = self._merge_cookie_header(
+                    headers.get("Cookie"),
+                    fingerprint.get("session_cookies"),
+                )
+                if merged_cookie_header:
+                    headers["Cookie"] = merged_cookie_header
+
+        if apply_default_client_headers:
+            for key, value in self._default_client_headers.items():
+                headers.setdefault(key, value)
+
+        if self._should_attach_runtime_session_cookies(url):
+            derived_project_id = self._extract_project_id_from_request_payload(json_data)
+            headers.setdefault("Origin", "https://labs.google")
+            if derived_project_id:
+                headers.setdefault("Referer", self._build_flow_project_page_url(derived_project_id))
+
+        inferred_fingerprint = self._build_fingerprint_from_user_agent(
+            headers.get("User-Agent"),
+            accept_language=headers.get("Accept-Language"),
+            proxy_url=proxy_url,
+        )
+        if not headers.get("sec-ch-ua") and inferred_fingerprint.get("sec_ch_ua"):
+            headers["sec-ch-ua"] = inferred_fingerprint["sec_ch_ua"]
+        if not headers.get("sec-ch-ua-platform") and inferred_fingerprint.get("sec_ch_ua_platform"):
+            headers["sec-ch-ua-platform"] = inferred_fingerprint["sec_ch_ua_platform"]
+        if not headers.get("sec-ch-ua-mobile") and inferred_fingerprint.get("sec_ch_ua_mobile"):
+            headers["sec-ch-ua-mobile"] = inferred_fingerprint["sec_ch_ua_mobile"]
+
+        request_body_for_log = raw_body if raw_body is not None else json_data
+        if config.debug_enabled:
+            if isinstance(fingerprint, dict):
+                proxy_for_log = proxy_url if proxy_url else "direct"
+                debug_logger.log_info(
+                    f"[FINGERPRINT] 使用打码浏览器指纹提交文本请求: UA={headers.get('User-Agent', '')[:120]}, proxy={proxy_for_log}"
+                )
+            debug_logger.log_request(
+                method=method,
+                url=url,
+                headers=headers,
+                body=request_body_for_log,
+                proxy=proxy_url
+            )
+
+        start_time = time.time()
+
+        try:
+            async with AsyncSession(trust_env=False) as session:
+                if method.upper() == "GET":
+                    response = await session.get(
+                        url,
+                        headers=headers,
+                        proxy=proxy_url,
+                        timeout=request_timeout,
+                        impersonate=impersonate,
+                    )
+                else:
+                    request_kwargs = {
+                        "headers": headers,
+                        "proxy": proxy_url,
+                        "timeout": request_timeout,
+                        "impersonate": impersonate,
+                    }
+                    if raw_body is not None:
+                        request_kwargs["data"] = raw_body
+                    else:
+                        request_kwargs["json"] = json_data
+                    response = await session.post(url, **request_kwargs)
+
+                duration_ms = (time.time() - start_time) * 1000
+                response_text = response.text
+
+                if config.debug_enabled:
+                    debug_logger.log_response(
+                        status_code=response.status_code,
+                        headers=dict(response.headers),
+                        body=response_text,
+                        duration_ms=duration_ms
+                    )
+
+                if response.status_code >= 400:
+                    error_reason = f"HTTP Error {response.status_code}: {response_text[:500]}"
+                    try:
+                        error_body = response.json()
+                        if "error" in error_body:
+                            error_info = error_body["error"]
+                            error_message = error_info.get("message", "")
+                            details = error_info.get("details", [])
+                            for detail in details:
+                                if detail.get("reason"):
+                                    error_reason = detail.get("reason")
+                                    break
+                            if error_message:
+                                error_reason = f"{error_reason}: {error_message}"
+                    except Exception:
+                        pass
+
+                    debug_logger.log_error(f"[API FAILED] URL: {url}")
+                    debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
+                    debug_logger.log_error(f"[API FAILED] Response: {response_text}")
+                    raise Exception(error_reason)
+
+                return response_text
+
+        except Exception as e:
+            error_msg = str(e)
+            if "HTTP Error" not in error_msg and not any(x in error_msg for x in ["PUBLIC_ERROR", "INVALID_ARGUMENT"]):
+                debug_logger.log_error(f"[API FAILED] URL: {url}")
+                debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
+                debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
+            raise Exception(f"Flow API text request failed: {error_msg}")
 
     def _should_fallback_to_urllib(self, error_message: str) -> bool:
         """判断是否应从 curl_cffi 回退到 urllib。"""
@@ -428,6 +857,7 @@ class FlowClient:
         """使用 urllib 执行 JSON 请求，作为 curl_cffi 的网络回退。"""
         request_headers = dict(headers or {})
         request_headers.setdefault("Accept", "application/json")
+        request_headers["Accept-Encoding"] = "identity"
 
         data = None
         if method.upper() != "GET" and json_data is not None:
@@ -457,14 +887,26 @@ class FlowClient:
             ) as response:
                 payload = response.read()
                 status_code = int(response.getcode() or 0)
+                content_encoding = str(response.headers.get("Content-Encoding") or "").lower()
         except urllib.error.HTTPError as exc:
             payload = exc.read() if hasattr(exc, "read") else b""
             status_code = int(getattr(exc, "code", 500) or 500)
+            content_encoding = str(getattr(exc, "headers", {}).get("Content-Encoding") or "").lower()
+            if content_encoding == "gzip" and payload:
+                try:
+                    payload = gzip.decompress(payload)
+                except Exception:
+                    pass
             body_text = payload.decode("utf-8", errors="replace")
             raise FlowAPIError(status_code, f"HTTP Error {status_code}: {body_text[:200]}") from exc
         except Exception as exc:
             raise Exception(str(exc)) from exc
 
+        if content_encoding == "gzip" and payload:
+            try:
+                payload = gzip.decompress(payload)
+            except Exception:
+                pass
         body_text = payload.decode("utf-8", errors="replace")
         if status_code >= 400:
             raise FlowAPIError(status_code, f"HTTP Error {status_code}: {body_text[:200]}")
@@ -536,24 +978,93 @@ class FlowClient:
         """视频状态查询是轻量轮询，请求超时不应超过下一轮轮询太久。"""
         return max(10, min(int(self.timeout or 0) or 120, 45))
 
+    def _resolve_generation_retry_budget(self, base_max_retries: int, error: Optional[Union[Exception, str]] = None) -> int:
+        """计算当前生成链路允许的总重试次数。"""
+        effective_max_retries = max(1, int(base_max_retries or 1))
+        if error is None:
+            return effective_max_retries
+
+        error_str = str(error)
+        error_lower = error_str.lower()
+        if "recaptcha evaluation failed" in error_lower or "recaptcha 验证失败" in error_str:
+            return max(effective_max_retries, int(config.browser_captcha_generation_retries or 6))
+        return effective_max_retries
+
+    def _build_realistic_video_submit_headers(self) -> Dict[str, str]:
+        """构造当前上游真实抓包风格的视频提交头。"""
+        return self._build_current_flow_media_headers(content_type="text/plain;charset=UTF-8")
+
+    def _resolve_runtime_impersonate(self, fallback: str = "chrome124") -> str:
+        resolved = self._resolve_impersonate_from_fingerprint(fallback=fallback)
+        return resolved or fallback
+
+    def _resolve_impersonate_from_fingerprint(self, fallback: str = "chrome124") -> str:
+        """根据当前请求链路绑定的浏览器指纹，选择最接近的 curl_cffi impersonate。"""
+        fingerprint = self.get_request_fingerprint()
+        if not isinstance(fingerprint, dict):
+            return fallback
+
+        ua = str(fingerprint.get("user_agent") or "").strip()
+        ua_lower = ua.lower()
+        if not ua_lower:
+            return fallback
+
+        if "android" in ua_lower:
+            return "chrome_android"
+        if "edg/" in ua_lower or " edge/" in ua_lower:
+            return "edge"
+        if "safari/" in ua_lower and "chrome/" not in ua_lower and "chromium/" not in ua_lower:
+            if "iphone" in ua_lower or "ipad" in ua_lower or "ios" in ua_lower:
+                return "safari_ios"
+            return "safari"
+
+        if "chrome/" not in ua_lower and "chromium/" not in ua_lower:
+            return fallback
+
+        import re
+        match = re.search(r"(?:chrome|chromium)/(\d+)", ua_lower)
+        if not match:
+            return "chrome"
+
+        major = int(match.group(1))
+        supported = [99, 100, 101, 104, 107, 110, 116, 119, 120, 123, 124]
+        if major in supported:
+            return f"chrome{major}"
+        if major > max(supported):
+            return "chrome"
+        lower_or_equal = [v for v in supported if v <= major]
+        if lower_or_equal:
+            return f"chrome{max(lower_or_equal)}"
+        return fallback
+
     async def _make_video_api_request(
         self,
         url: str,
         json_data: Dict[str, Any],
         at: str,
         timeout: int,
+        project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
+        action: str = "VIDEO_GENERATION",
     ) -> Dict[str, Any]:
         """视频 API 加硬截止，避免 curl_cffi 底层偶发卡住导致整条请求悬挂。"""
+        raw_body = json.dumps(json_data, ensure_ascii=False, separators=(",", ":"))
+        headers = self._build_realistic_video_submit_headers()
+        headers.update(self._build_labs_request_context_headers(project_id))
         try:
             return await asyncio.wait_for(
                 self._make_request(
                     method="POST",
                     url=url,
+                    headers=headers,
                     json_data=json_data,
+                    raw_body=raw_body,
                     use_at=True,
                     at_token=at,
                     timeout=timeout,
-                    allow_urllib_fallback=False
+                    allow_urllib_fallback=False,
+                    apply_default_client_headers=False,
+                    impersonate=self._resolve_runtime_impersonate(),
                 ),
                 timeout=timeout + 5
             )
@@ -589,7 +1100,9 @@ class FlowClient:
         url: str,
         json_data: Dict[str, Any],
         at: str,
-        attempt_trace: Optional[Dict[str, Any]] = None
+        attempt_trace: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """图片生成请求使用更短超时，并在网络超时时快速重试。"""
         request_timeout = config.flow_image_request_timeout
@@ -640,16 +1153,57 @@ class FlowClient:
                     "used_media_proxy": bool(prefer_media_proxy),
                 }
             try:
-                result = await self._make_request(
-                    method="POST",
-                    url=url,
-                    json_data=json_data,
-                    use_at=True,
-                    at_token=at,
-                    timeout=request_timeout,
-                    use_media_proxy=prefer_media_proxy,
-                    respect_fingerprint_proxy=not prefer_media_proxy,
-                )
+                if config.captcha_method == "browser" and project_id:
+                    from .browser_captcha import BrowserCaptchaService
+
+                    service = await BrowserCaptchaService.get_instance(self.db)
+                    response_payload, _browser_ref, fingerprint = await service.submit_flow_request(
+                        project_id=project_id,
+                        action="IMAGE_GENERATION",
+                        token_id=token_id,
+                        url=url,
+                        at_token=at,
+                        json_data=json_data,
+                        timeout=request_timeout,
+                    )
+                    self._set_request_fingerprint(fingerprint if fingerprint else None)
+
+                    status_code = int(response_payload.get("status") or 0)
+                    response_text = response_payload.get("text") or ""
+                    if status_code >= 400:
+                        error_reason = f"HTTP Error {status_code}"
+                        parsed_body = None
+                        try:
+                            parsed_body = json.loads(response_text) if response_text else None
+                        except Exception:
+                            parsed_body = None
+                        if isinstance(parsed_body, dict) and "error" in parsed_body:
+                            error_info = parsed_body["error"] or {}
+                            error_message = error_info.get("message", "")
+                            details = error_info.get("details", [])
+                            for detail in details or []:
+                                if isinstance(detail, dict) and detail.get("reason"):
+                                    error_reason = detail.get("reason")
+                                    break
+                            if error_message:
+                                error_reason = f"{error_reason}: {error_message}"
+                        elif response_text:
+                            error_reason = f"HTTP Error {status_code}: {response_text[:200]}"
+                        raise Exception(error_reason)
+
+                    result = json.loads(response_text) if response_text else {}
+                else:
+                    result = await self._make_request(
+                        method="POST",
+                        url=url,
+                        headers=self._build_labs_request_context_headers(project_id),
+                        json_data=json_data,
+                        use_at=True,
+                        at_token=at,
+                        timeout=request_timeout,
+                        use_media_proxy=prefer_media_proxy,
+                        respect_fingerprint_proxy=not prefer_media_proxy,
+                    )
                 if http_attempt_info is not None:
                     http_attempt_info["duration_ms"] = int((time.time() - http_attempt_started_at) * 1000)
                     http_attempt_info["success"] = True
@@ -1211,6 +1765,8 @@ class FlowClient:
                     json_data=json_data,
                     at=at,
                     attempt_trace=attempt_trace,
+                    project_id=project_id,
+                    token_id=token_id,
                 )
                 attempt_trace["success"] = True
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
@@ -1354,16 +1910,13 @@ class FlowClient:
         return None
 
     def _build_video_text_input(self, prompt: str, use_v2_model_config: bool = False) -> Dict[str, Any]:
-        if use_v2_model_config:
-            return {
-                "structuredPrompt": {
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }
-            }
+        # 当前 Flow 上游视频链路统一使用 structuredPrompt，不再兼容旧 prompt 字段。
         return {
-            "prompt": prompt
+            "structuredPrompt": {
+                "parts": [{
+                    "text": prompt
+                }]
+            }
         }
 
     def _build_video_media_generation_context(self, batch_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1388,6 +1941,19 @@ class FlowClient:
                 if found:
                     return found
         return None
+
+    def _truncate_large_debug_value(self, data: Any, max_length: int = 240) -> Any:
+        """截断调试输出中的超长字段，避免污染控制台。"""
+        if isinstance(data, dict):
+            return {
+                key: self._truncate_large_debug_value(value, max_length=max_length)
+                for key, value in data.items()
+            }
+        if isinstance(data, list):
+            return [self._truncate_large_debug_value(item, max_length=max_length) for item in data]
+        if isinstance(data, str) and len(data) > max_length:
+            return f"{data[:max_length]}... (truncated, total {len(data)} chars)"
+        return data
 
     def _extract_video_status_from_media(self, media: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
         status_block = (
@@ -1577,6 +2143,12 @@ class FlowClient:
 
         return normalized
 
+    def _build_video_media_generation_context(self, batch_id: str) -> Dict[str, Any]:
+        return {
+            "batchId": batch_id,
+            "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
+        }
+
     def _operations_to_media_refs(
         self,
         operations: List[Dict[str, Any]],
@@ -1637,11 +2209,14 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoText"
 
-        # 403/reCAPTCHA 重试逻辑 - 使用配置的最大重试次数
-        max_retries = config.flow_max_retries
+        # 403/reCAPTCHA 重试逻辑 - reCAPTCHA evaluation failed 时允许更高重试上限
+        max_retries = self._resolve_generation_retry_budget(config.flow_max_retries)
         last_error = None
-        
-        for retry_attempt in range(max_retries):
+        retry_attempt = 0
+        session_id = self._generate_session_id()
+        batch_id = str(uuid.uuid4())
+        video_context_warmed = False
+        while retry_attempt < max_retries:
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             launch_gate_acquired = False
             launch_ok, _, _ = await self._acquire_video_launch_gate(
@@ -1672,10 +2247,21 @@ class FlowClient:
                     log_prefix="[VIDEO T2V] 生成",
                 )
                 if should_retry:
+                    retry_attempt += 1
                     continue
                 raise last_error
-            session_id = self._generate_session_id()
-            scene_id = str(uuid.uuid4())
+            if not video_context_warmed:
+                await self._warmup_flow_video_frontend_context(
+                    at=at,
+                    project_id=project_id,
+                    token_id=token_id,
+                    session_id=session_id,
+                    user_paygate_tier=user_paygate_tier,
+                    prompt=prompt,
+                    model_key=model_key,
+                    aspect_ratio=aspect_ratio,
+                )
+                video_context_warmed = True
             client_context = {
                 "recaptchaContext": {
                     "token": recaptcha_token,
@@ -1686,29 +2272,30 @@ class FlowClient:
                 "tool": "PINHOLE",
                 "userPaygateTier": user_paygate_tier
             }
+            request_seed = random.randint(1, 99999)
             request_data = {
                 "aspectRatio": aspect_ratio,
-                "seed": random.randint(1, 99999),
-                "textInput": self._build_video_text_input(prompt, use_v2_model_config=use_v2_model_config),
+                "seed": request_seed,
+                "textInput": self._build_video_text_input(prompt, use_v2_model_config=True),
                 "videoModelKey": model_key,
-                "metadata": {
-                    "sceneId": scene_id
-                }
+                "metadata": {}
             }
             json_data = {
+                "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
                 "clientContext": client_context,
-                "requests": [request_data]
+                "requests": [request_data],
+                "useV2ModelConfig": True,
             }
-            if use_v2_model_config:
-                json_data["mediaGenerationContext"] = self._build_video_media_generation_context()
-                json_data["useV2ModelConfig"] = True
 
             try:
                 result = await self._make_video_api_request(
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    project_id=project_id,
+                    token_id=token_id,
+                    action="VIDEO_GENERATION",
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -1720,14 +2307,736 @@ class FlowClient:
                     browser_id=browser_id,
                     project_id=project_id,
                     log_prefix="[VIDEO T2V] 生成",
+                    defer_browser_error_notification=True,
                 )
                 if should_retry:
+                    max_retries = self._resolve_generation_retry_budget(max_retries, e)
+                    retry_attempt += 1
                     continue
                 raise
             finally:
                 await self._notify_browser_captcha_request_finished(browser_id)
+            retry_attempt += 1
         
         # 所有重试都失败
+        raise last_error
+
+    def _build_browser_style_control_headers(
+        self,
+        referer: str,
+        origin: Optional[str] = None,
+        account_id: Optional[str] = None,
+        content_type: Optional[str] = None,
+        accept_language: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> Dict[str, str]:
+        headers: Dict[str, str] = {
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Referer": referer,
+            "User-Agent": self._get_effective_request_user_agent(account_id),
+            "Accept-Language": accept_language or self._get_primary_accept_language(fallback="zh-CN,zh;q=0.9"),
+            "Priority": "u=1, i",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
+        }
+        if origin:
+            headers["Origin"] = origin
+            if origin == "https://labs.google":
+                headers.setdefault("sec-fetch-storage-access", "active")
+        if content_type:
+            headers["Content-Type"] = content_type
+        if api_key:
+            headers["x-goog-api-key"] = api_key
+        headers.setdefault("x-browser-channel", self.FLOW_BROWSER_CHANNEL_HEADER)
+        headers.setdefault("x-browser-copyright", self.FLOW_BROWSER_COPYRIGHT_HEADER)
+        headers.setdefault("x-browser-validation", self.FLOW_BROWSER_VALIDATION_HEADER)
+        headers.setdefault("x-browser-year", self.FLOW_BROWSER_YEAR_HEADER)
+        return headers
+
+    async def _labs_trpc_get_with_st(
+        self,
+        path_with_query: str,
+        st: str,
+        project_id: str,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        page_url = self._build_flow_project_page_url(project_id)
+        return await self._make_request(
+            method="GET",
+            url=f"{self.labs_base_url}/trpc/{path_with_query}",
+            headers=self._build_browser_style_control_headers(
+                referer=page_url,
+                account_id=st[:16],
+                content_type="application/json",
+            ),
+            use_st=True,
+            st_token=st,
+            timeout=timeout or self._get_control_plane_timeout(),
+            apply_default_client_headers=False,
+            allow_urllib_fallback=False,
+            impersonate=self._resolve_runtime_impersonate(),
+        )
+
+    async def _labs_trpc_post_with_st(
+        self,
+        trpc_path: str,
+        payload: Dict[str, Any],
+        st: str,
+        project_id: str,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        page_url = self._build_flow_project_page_url(project_id)
+        return await self._make_request(
+            method="POST",
+            url=f"{self.labs_base_url}/trpc/{trpc_path}",
+            headers=self._build_browser_style_control_headers(
+                referer=page_url,
+                origin="https://labs.google",
+                account_id=st[:16],
+                content_type="application/json",
+            ),
+            json_data=payload,
+            use_st=True,
+            st_token=st,
+            timeout=timeout or self._get_control_plane_timeout(),
+            apply_default_client_headers=False,
+            allow_urllib_fallback=False,
+            impersonate=self._resolve_runtime_impersonate(),
+        )
+
+    async def _aisandbox_request(
+        self,
+        method: str,
+        path: str,
+        at: Optional[str],
+        *,
+        json_data: Optional[Dict[str, Any]] = None,
+        raw_body: Optional[Union[str, bytes]] = None,
+        content_type: Optional[str] = "text/plain;charset=UTF-8",
+        accept_language: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout: Optional[int] = None,
+        account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        headers = self._build_browser_style_control_headers(
+            referer="https://labs.google/",
+            origin="https://labs.google",
+            account_id=account_id,
+            content_type=content_type,
+            accept_language=accept_language,
+            api_key=api_key,
+        )
+        return await self._make_request(
+            method=method,
+            url=f"{self.api_base_url}{path}",
+            headers=headers,
+            json_data=json_data,
+            raw_body=raw_body,
+            use_at=bool(at),
+            at_token=at,
+            timeout=timeout or self._get_control_plane_timeout(),
+            apply_default_client_headers=False,
+            allow_urllib_fallback=False,
+            impersonate=self._resolve_runtime_impersonate(),
+        )
+
+    async def _warmup_flow_video_frontend_context(
+        self,
+        *,
+        at: str,
+        project_id: str,
+        token_id: Optional[int],
+        session_id: str,
+        user_paygate_tier: str,
+        prompt: str,
+        model_key: str,
+        aspect_ratio: str,
+    ) -> None:
+        """按当前上游真实页面顺序补齐视频提交前的最小首方初始化/telemetry链路。"""
+        account_id = at[:16] if at else None
+        page_url = self._build_flow_project_page_url(project_id)
+        session_create_time = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+
+        st = await self._get_token_st_by_id(token_id)
+        if st:
+            null_meta_input = self._encode_trpc_input({
+                "json": None,
+                "meta": {"values": ["undefined"]},
+            })
+            labs_get_paths = [
+                f"general.fetchUserPreferences?input={null_meta_input}",
+                f"videoFx.getFlowAppConfig?input={null_meta_input}",
+                f"videoFx.getUserSettings?input={null_meta_input}",
+            ]
+            for path_with_query in labs_get_paths:
+                try:
+                    await self._labs_trpc_get_with_st(path_with_query, st=st, project_id=project_id)
+                except Exception as e:
+                    debug_logger.log_warning(f"[VIDEO WARMUP] Labs GET 失败 ({path_with_query}): {e}")
+
+            labs_batch_log_payload = {
+                "json": {
+                    "appEvents": [{
+                        "event": "PAGE_VIEW",
+                        "eventProperties": [
+                            {"key": "URL", "stringValue": page_url},
+                            {"key": "USER_AGENT", "stringValue": self._get_effective_request_user_agent(st[:16])},
+                            {"key": "IS_DESKTOP"},
+                        ],
+                        "activeExperiments": [],
+                        "eventMetadata": {"sessionId": session_id},
+                        "eventTime": session_create_time,
+                    }]
+                }
+            }
+            try:
+                await self._labs_trpc_post_with_st(
+                    "general.submitBatchLog",
+                    payload=labs_batch_log_payload,
+                    st=st,
+                    project_id=project_id,
+                )
+            except Exception as e:
+                debug_logger.log_warning(f"[VIDEO WARMUP] Labs submitBatchLog 失败: {e}")
+
+        try:
+            await self._aisandbox_request(
+                "POST",
+                ":checkAppAvailability",
+                at=None,
+                raw_body=self._compact_json_dumps({"clientContext": {"tool": "PINHOLE"}}),
+                api_key=self.FLOW_PUBLIC_API_KEY,
+                account_id=account_id,
+            )
+        except Exception as e:
+            debug_logger.log_warning(f"[VIDEO WARMUP] checkAppAvailability 失败: {e}")
+
+        debug_logger.log_info(
+            f"[VIDEO WARMUP] 当前视频最小初始化链路已补齐: project_id={project_id}, "
+            f"session_id={session_id}, model_key={model_key}, aspect_ratio={aspect_ratio}, "
+            f"user_paygate_tier={user_paygate_tier}, prompt_len={len(prompt or '')}"
+        )
+
+    def _video_aspect_ratio_to_agent_aspect_ratio(self, aspect_ratio: str) -> str:
+        mapping = {
+            "VIDEO_ASPECT_RATIO_LANDSCAPE": "16:9",
+            "VIDEO_ASPECT_RATIO_PORTRAIT": "9:16",
+            "VIDEO_ASPECT_RATIO_SQUARE": "1:1",
+        }
+        return mapping.get(str(aspect_ratio or "").strip(), "16:9")
+
+    def _parse_sse_json_events(self, raw_text: str) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        if not raw_text:
+            return events
+
+        for block in raw_text.split("\n\n"):
+            block = block.strip()
+            if not block:
+                continue
+
+            data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
+            if not data_lines:
+                continue
+
+            payload_text = "\n".join(data_lines).strip()
+            if not payload_text or payload_text == "[DONE]":
+                continue
+
+            try:
+                payload = json.loads(payload_text)
+            except Exception:
+                continue
+
+            if isinstance(payload, dict):
+                events.append(payload)
+
+        return events
+
+    def _extract_agent_session_id(self, sessions_payload: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(sessions_payload, dict):
+            return None
+
+        sessions = sessions_payload.get("sessions")
+        if isinstance(sessions, list):
+            for session in sessions:
+                if not isinstance(session, dict):
+                    continue
+                session_id = str(session.get("agentSessionId") or "").strip()
+                if session_id:
+                    return session_id
+
+        session_info = sessions_payload.get("sessionInfo")
+        if isinstance(session_info, dict):
+            session_id = str(session_info.get("agentSessionId") or "").strip()
+            if session_id:
+                return session_id
+
+        return None
+
+    def _extract_flow_entity_id(self, entity_payload: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(entity_payload, dict):
+            return None
+
+        candidates = [entity_payload]
+        result = entity_payload.get("result")
+        if isinstance(result, dict):
+            candidates.append(result)
+            data = result.get("data")
+            if isinstance(data, dict):
+                candidates.append(data)
+                json_node = data.get("json")
+                if isinstance(json_node, dict):
+                    candidates.append(json_node)
+                    nested_result = json_node.get("result")
+                    if isinstance(nested_result, dict):
+                        candidates.append(nested_result)
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            for key in ("entityId", "id", "parentEntityId"):
+                entity_id = str(candidate.get(key) or "").strip()
+                if entity_id:
+                    return entity_id
+
+        return None
+
+    def _extract_turn_count(self, session_detail: Dict[str, Any]) -> int:
+        if not isinstance(session_detail, dict):
+            return 0
+        turns = session_detail.get("turns")
+        if isinstance(turns, list):
+            return len(turns)
+        return 0
+
+    def _extract_generate_video_with_references_result(
+        self,
+        events: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            agent_message = event.get("agentMessage")
+            if not isinstance(agent_message, dict):
+                continue
+            agent_events = agent_message.get("agentEvents")
+            if not isinstance(agent_events, list):
+                continue
+            for agent_event in agent_events:
+                if not isinstance(agent_event, dict):
+                    continue
+                tool_result_wrapper = agent_event.get("toolResult")
+                if not isinstance(tool_result_wrapper, dict):
+                    continue
+                if tool_result_wrapper.get("toolName") != "generate_video_with_references":
+                    continue
+                tool_result = tool_result_wrapper.get("toolResult")
+                if isinstance(tool_result, dict):
+                    return tool_result
+        return None
+
+    async def get_flow_creation_agent_session(
+        self,
+        at: str,
+        project_id: str,
+        *,
+        account_id: Optional[str] = None,
+        allow_global_fallback: bool = True,
+    ) -> Optional[str]:
+        sessions_result = await self._aisandbox_request(
+            "GET",
+            f"/flowCreationAgent/sessions?projectId={quote(project_id, safe='')}",
+            at=at,
+            content_type=None,
+            account_id=account_id,
+        )
+        session_id = self._extract_agent_session_id(sessions_result)
+        if session_id or not allow_global_fallback:
+            return session_id
+
+        global_sessions_result = await self._aisandbox_request(
+            "GET",
+            "/flowCreationAgent/sessions",
+            at=at,
+            content_type=None,
+            account_id=account_id,
+        )
+        return self._extract_agent_session_id(global_sessions_result)
+
+    async def get_flow_creation_agent_session_detail(
+        self,
+        at: str,
+        agent_session_id: str,
+        *,
+        account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return await self._aisandbox_request(
+            "GET",
+            f"/flowCreationAgent/sessions/{quote(agent_session_id, safe='')}",
+            at=at,
+            content_type=None,
+            account_id=account_id,
+        )
+
+    async def create_flow_entity(
+        self,
+        st: str,
+        project_id: str,
+    ) -> str:
+        payload = {"json": {"projectId": project_id}}
+        result = await self._labs_trpc_post_with_st(
+            "flow.createEntity",
+            payload=payload,
+            st=st,
+            project_id=project_id,
+        )
+        entity_id = self._extract_flow_entity_id(result)
+        if not entity_id:
+            raise RuntimeError(f"flow.createEntity 响应缺少 entityId: keys={list(result.keys())}")
+        return entity_id
+
+    async def copy_project_media_to_character_slot(
+        self,
+        at: str,
+        *,
+        project_id: str,
+        media_id: str,
+        entity_id: str,
+        image_reference_index: int,
+        account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "mediaId": media_id,
+            "destinationProjectId": project_id,
+            "destinationMediaContext": {
+                "entityContext": {
+                    "entityId": entity_id,
+                    "characterSlot": {
+                        "imageReferenceIndex": int(image_reference_index),
+                    },
+                }
+            },
+        }
+        return await self._aisandbox_request(
+            "POST",
+            "/flow:copyProjectMedia",
+            at=at,
+            raw_body=self._compact_json_dumps(payload),
+            account_id=account_id,
+        )
+
+    async def stream_flow_creation_agent(
+        self,
+        at: str,
+        payload: Dict[str, Any],
+        *,
+        project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
+        action: str = "VIDEO_GENERATION",
+        account_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        url = f"{self.api_base_url}/flowCreationAgent:streamChat?alt=sse"
+        headers = self._build_browser_style_control_headers(
+            referer="https://labs.google/",
+            origin="https://labs.google",
+            account_id=account_id,
+            content_type="application/json",
+            accept_language=self._get_primary_accept_language(),
+        )
+        headers["Accept"] = "text/event-stream, text/event-stream"
+
+        if config.captcha_method == "browser" and project_id:
+            from .browser_captcha import BrowserCaptchaService
+
+            service = await BrowserCaptchaService.get_instance(self.db)
+            response_payload, _browser_ref, fingerprint = await service.submit_flow_request(
+                project_id=project_id,
+                action=action,
+                token_id=token_id,
+                url=url,
+                at_token=at,
+                json_data=payload,
+                timeout=self._get_video_submit_timeout(),
+            )
+            self._set_request_fingerprint(fingerprint if fingerprint else None)
+
+            status_code = int(response_payload.get("status") or 0)
+            raw_text = response_payload.get("text") or ""
+            if status_code >= 400:
+                error_reason = f"HTTP Error {status_code}"
+                parsed_body = None
+                try:
+                    parsed_body = json.loads(raw_text) if raw_text else None
+                except Exception:
+                    parsed_body = None
+                if isinstance(parsed_body, dict) and "error" in parsed_body:
+                    error_info = parsed_body["error"] or {}
+                    error_message = error_info.get("message", "")
+                    details = error_info.get("details", [])
+                    for detail in details or []:
+                        if isinstance(detail, dict) and detail.get("reason"):
+                            error_reason = detail.get("reason")
+                            break
+                    if error_message:
+                        error_reason = f"{error_reason}: {error_message}"
+                elif raw_text:
+                    error_reason = f"HTTP Error {status_code}: {raw_text[:200]}"
+                raise Exception(error_reason)
+        else:
+            raw_text = await self._make_text_request(
+                method="POST",
+                url=url,
+                headers=headers,
+                json_data=payload,
+                use_at=True,
+                at_token=at,
+                timeout=self._get_video_submit_timeout(),
+                apply_default_client_headers=False,
+                impersonate=self._resolve_runtime_impersonate(),
+            )
+        return self._parse_sse_json_events(raw_text)
+
+    async def generate_omni_reference_video(
+        self,
+        at: str,
+        st: str,
+        project_id: str,
+        prompt: str,
+        aspect_ratio: str,
+        reference_media_ids: List[str],
+        model_usage_key: str = "abra_r2v_10s",
+        model_display_name: str = "Omni Flash",
+        duration: int = 10,
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        token_id: Optional[int] = None,
+        token_video_concurrency: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if not st:
+            raise RuntimeError("Omni 参考图视频需要 ST token，但当前账号未提供 ST")
+        if not reference_media_ids:
+            raise RuntimeError("Omni 参考图视频至少需要 1 张参考图")
+
+        max_retries = self._resolve_generation_retry_budget(config.flow_max_retries)
+        last_error = None
+        retry_attempt = 0
+        session_id = self._generate_session_id()
+        entity_handle = "entity-0"
+        video_context_warmed = False
+        account_id = at[:16] if at else None
+        entity_id: Optional[str] = None
+        agent_aspect_ratio = self._video_aspect_ratio_to_agent_aspect_ratio(aspect_ratio)
+        agent_prompt = (
+            f"{prompt}\n\nUse a {agent_aspect_ratio} aspect ratio."
+            if prompt
+            else f"Use a {agent_aspect_ratio} aspect ratio."
+        )
+
+        while retry_attempt < max_retries:
+            launch_gate_acquired = False
+            approve_browser_id = None
+            launch_ok, _, _ = await self._acquire_video_launch_gate(
+                token_id=token_id,
+                token_video_concurrency=token_video_concurrency,
+            )
+            if not launch_ok:
+                last_error = Exception("Video launch queue wait timeout")
+                raise last_error
+
+            launch_gate_acquired = True
+            browser_id = None
+            try:
+                recaptcha_token, browser_id = await self._get_recaptcha_token(
+                    project_id,
+                    action="VIDEO_GENERATION",
+                    token_id=token_id,
+                )
+            finally:
+                if launch_gate_acquired:
+                    await self._release_video_launch_gate(token_id)
+
+            if not recaptcha_token:
+                last_error = Exception("Failed to obtain reCAPTCHA token")
+                should_retry = await self._handle_missing_recaptcha_token(
+                    retry_attempt=retry_attempt,
+                    max_retries=max_retries,
+                    browser_id=browser_id,
+                    project_id=project_id,
+                    log_prefix="[VIDEO OMNI-R2V] 生成",
+                )
+                if should_retry:
+                    retry_attempt += 1
+                    continue
+                raise last_error
+
+            try:
+                if not entity_id:
+                    entity_id = await self.create_flow_entity(st=st, project_id=project_id)
+                    for index, media_id in enumerate(reference_media_ids):
+                        await self.copy_project_media_to_character_slot(
+                            at=at,
+                            project_id=project_id,
+                            media_id=media_id,
+                            entity_id=entity_id,
+                            image_reference_index=index,
+                            account_id=account_id,
+                        )
+                    debug_logger.log_info(
+                        f"[VIDEO OMNI-R2V] 已创建角色实体并挂载参考图: project_id={project_id}, entity_id={entity_id}, refs={len(reference_media_ids)}"
+                    )
+
+                if not video_context_warmed:
+                    await self._warmup_flow_video_frontend_context(
+                        at=at,
+                        project_id=project_id,
+                        token_id=token_id,
+                        session_id=session_id,
+                        user_paygate_tier=user_paygate_tier,
+                        prompt=agent_prompt,
+                        model_key=model_usage_key,
+                        aspect_ratio=aspect_ratio,
+                    )
+                    video_context_warmed = True
+
+                agent_session_id = await self.get_flow_creation_agent_session(
+                    at=at,
+                    project_id=project_id,
+                    account_id=account_id,
+                    allow_global_fallback=True,
+                )
+                if not agent_session_id:
+                    raise RuntimeError(f"未找到 Flow Creation Agent Session: project_id={project_id}")
+
+                session_detail = await self.get_flow_creation_agent_session_detail(
+                    at=at,
+                    agent_session_id=agent_session_id,
+                    account_id=account_id,
+                )
+                current_turn_count = self._extract_turn_count(session_detail)
+                next_turn_number = current_turn_count + 1
+
+                prompt_payload = {
+                    "agentSessionId": agent_session_id,
+                    "agentClientContext": {
+                        "projectId": f"projects/{project_id}",
+                        "clientSessionId": session_id,
+                        "recaptchaContext": {
+                            "token": recaptcha_token,
+                            "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                        },
+                        "turnNumber": next_turn_number,
+                    },
+                    "userMessage": {
+                        "userPrompt": {
+                            "parts": [{"text": agent_prompt}],
+                        },
+                        "entityReferences": [
+                            {
+                                "entityId": entity_id,
+                                "handle": entity_handle,
+                            }
+                        ],
+                    },
+                }
+
+                prompt_events = await self.stream_flow_creation_agent(
+                    at=at,
+                    payload=prompt_payload,
+                    project_id=project_id,
+                    token_id=token_id,
+                    account_id=account_id,
+                )
+                tool_result = self._extract_generate_video_with_references_result(prompt_events)
+
+                if not tool_result:
+                    approve_recaptcha_token, approve_browser_id = await self._get_recaptcha_token(
+                        project_id,
+                        action="VIDEO_GENERATION",
+                        token_id=token_id,
+                    )
+                    if not approve_recaptcha_token:
+                        raise RuntimeError("Omni 参考图视频审批阶段获取 reCAPTCHA token 失败")
+                    approve_payload = {
+                        "agentSessionId": agent_session_id,
+                        "agentClientContext": {
+                            "projectId": f"projects/{project_id}",
+                            "clientSessionId": session_id,
+                            "recaptchaContext": {
+                                "token": approve_recaptcha_token,
+                                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                            },
+                            "turnNumber": next_turn_number + 1,
+                        },
+                        "userMessage": {
+                            "userPrompt": {
+                                "parts": [{"text": "Approve"}],
+                            }
+                        },
+                    }
+                    approve_events = await self.stream_flow_creation_agent(
+                        at=at,
+                        payload=approve_payload,
+                        project_id=project_id,
+                        token_id=token_id,
+                        account_id=account_id,
+                    )
+                    tool_result = self._extract_generate_video_with_references_result(approve_events)
+                    await self._notify_browser_captcha_request_finished(approve_browser_id)
+                    approve_browser_id = None
+
+                if not tool_result:
+                    raise RuntimeError("Omni 参考图视频链路未返回 generate_video_with_references toolResult")
+
+                media_id = str(tool_result.get("media_id") or "").strip()
+                resolved_project_id = str(tool_result.get("project_id") or project_id).strip() or project_id
+                if not media_id:
+                    raise RuntimeError(f"Omni 参考图视频 toolResult 缺少 media_id: {tool_result}")
+
+                operation = {
+                    "operation": {"name": media_id},
+                    "name": media_id,
+                    "mediaName": media_id,
+                    "projectId": resolved_project_id,
+                    "workflowId": tool_result.get("workflow_id"),
+                    "batchId": tool_result.get("batch_id"),
+                    "status": "MEDIA_GENERATION_STATUS_ACTIVE",
+                }
+                return {
+                    "operations": [operation],
+                    "agentToolResult": tool_result,
+                    "projectId": resolved_project_id,
+                    "entityId": entity_id,
+                    "entityHandle": entity_handle,
+                    "modelUsageKey": model_usage_key,
+                    "aspectRatio": tool_result.get("aspect_ratio") or aspect_ratio,
+                    "duration": duration,
+                    "modelDisplayName": model_display_name,
+                }
+            except Exception as e:
+                last_error = e
+                should_retry = await self._handle_retryable_generation_error(
+                    error=e,
+                    retry_attempt=retry_attempt,
+                    max_retries=max_retries,
+                    browser_id=browser_id,
+                    project_id=project_id,
+                    log_prefix="[VIDEO OMNI-R2V] 生成",
+                    defer_browser_error_notification=True,
+                )
+                if should_retry:
+                    max_retries = self._resolve_generation_retry_budget(max_retries, e)
+                    retry_attempt += 1
+                    continue
+                raise
+            finally:
+                await self._notify_browser_captcha_request_finished(browser_id)
+                if approve_browser_id:
+                    await self._notify_browser_captcha_request_finished(approve_browser_id)
+
+            retry_attempt += 1
+
         raise last_error
 
     async def generate_video_reference_images(
@@ -1758,11 +3067,14 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoReferenceImages"
 
-        # 403/reCAPTCHA 重试逻辑 - 使用配置的最大重试次数
-        max_retries = config.flow_max_retries
+        # 403/reCAPTCHA 重试逻辑 - reCAPTCHA evaluation failed 时允许更高重试上限
+        max_retries = self._resolve_generation_retry_budget(config.flow_max_retries)
         last_error = None
-        
-        for retry_attempt in range(max_retries):
+        retry_attempt = 0
+        session_id = self._generate_session_id()
+        batch_id = str(uuid.uuid4())
+        video_context_warmed = False
+        while retry_attempt < max_retries:
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             launch_gate_acquired = False
             launch_ok, _, _ = await self._acquire_video_launch_gate(
@@ -1793,12 +3105,22 @@ class FlowClient:
                     log_prefix="[VIDEO R2V] 生成",
                 )
                 if should_retry:
+                    retry_attempt += 1
                     continue
                 raise last_error
-            session_id = self._generate_session_id()
-            batch_id = str(uuid.uuid4())
-            scene_id = str(uuid.uuid4())
-
+            if not video_context_warmed:
+                await self._warmup_flow_video_frontend_context(
+                    at=at,
+                    project_id=project_id,
+                    token_id=token_id,
+                    session_id=session_id,
+                    user_paygate_tier=user_paygate_tier,
+                    prompt=prompt,
+                    model_key=model_key,
+                    aspect_ratio=aspect_ratio,
+                )
+                video_context_warmed = True
+            request_seed = random.randint(1, 99999)
             json_data = {
                 "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
                 "clientContext": {
@@ -1813,19 +3135,11 @@ class FlowClient:
                 },
                 "requests": [{
                     "aspectRatio": aspect_ratio,
-                    "seed": random.randint(1, 99999),
-                    "textInput": {
-                        "structuredPrompt": {
-                            "parts": [{
-                                "text": prompt
-                            }]
-                        }
-                    },
+                    "seed": request_seed,
+                    "textInput": self._build_video_text_input(prompt, use_v2_model_config=True),
                     "videoModelKey": model_key,
                     "referenceImages": reference_images,
-                    "metadata": {
-                        "sceneId": scene_id
-                    }
+                    "metadata": {}
                 }],
                 "useV2ModelConfig": True
             }
@@ -1835,7 +3149,10 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    project_id=project_id,
+                    token_id=token_id,
+                    action="VIDEO_GENERATION",
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -1847,12 +3164,16 @@ class FlowClient:
                     browser_id=browser_id,
                     project_id=project_id,
                     log_prefix="[VIDEO R2V] 生成",
+                    defer_browser_error_notification=True,
                 )
                 if should_retry:
+                    max_retries = self._resolve_generation_retry_budget(max_retries, e)
+                    retry_attempt += 1
                     continue
                 raise
             finally:
                 await self._notify_browser_captcha_request_finished(browser_id)
+            retry_attempt += 1
         
         # 所有重试都失败
         raise last_error
@@ -1888,11 +3209,14 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoStartAndEndImage"
 
-        # 403/reCAPTCHA 重试逻辑 - 使用配置的最大重试次数
-        max_retries = config.flow_max_retries
+        # 403/reCAPTCHA 重试逻辑 - reCAPTCHA evaluation failed 时允许更高重试上限
+        max_retries = self._resolve_generation_retry_budget(config.flow_max_retries)
         last_error = None
-        
-        for retry_attempt in range(max_retries):
+        retry_attempt = 0
+        session_id = self._generate_session_id()
+        batch_id = str(uuid.uuid4())
+        video_context_warmed = False
+        while retry_attempt < max_retries:
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             launch_gate_acquired = False
             launch_ok, _, _ = await self._acquire_video_launch_gate(
@@ -1923,10 +3247,21 @@ class FlowClient:
                     log_prefix="[VIDEO I2V] 首尾帧生成",
                 )
                 if should_retry:
+                    retry_attempt += 1
                     continue
                 raise last_error
-            session_id = self._generate_session_id()
-            scene_id = str(uuid.uuid4())
+            if not video_context_warmed:
+                await self._warmup_flow_video_frontend_context(
+                    at=at,
+                    project_id=project_id,
+                    token_id=token_id,
+                    session_id=session_id,
+                    user_paygate_tier=user_paygate_tier,
+                    prompt=prompt,
+                    model_key=model_key,
+                    aspect_ratio=aspect_ratio,
+                )
+                video_context_warmed = True
             client_context = {
                 "recaptchaContext": {
                     "token": recaptcha_token,
@@ -1937,10 +3272,11 @@ class FlowClient:
                 "tool": "PINHOLE",
                 "userPaygateTier": user_paygate_tier
             }
+            request_seed = random.randint(1, 99999)
             request_data = {
                 "aspectRatio": aspect_ratio,
-                "seed": random.randint(1, 99999),
-                "textInput": self._build_video_text_input(prompt, use_v2_model_config=use_v2_model_config),
+                "seed": request_seed,
+                "textInput": self._build_video_text_input(prompt, use_v2_model_config=True),
                 "videoModelKey": model_key,
                 "startImage": {
                     "mediaId": start_media_id
@@ -1948,24 +3284,24 @@ class FlowClient:
                 "endImage": {
                     "mediaId": end_media_id
                 },
-                "metadata": {
-                    "sceneId": scene_id
-                }
+                "metadata": {}
             }
             json_data = {
+                "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
                 "clientContext": client_context,
-                "requests": [request_data]
+                "requests": [request_data],
+                "useV2ModelConfig": True,
             }
-            if use_v2_model_config:
-                json_data["mediaGenerationContext"] = self._build_video_media_generation_context()
-                json_data["useV2ModelConfig"] = True
 
             try:
                 result = await self._make_video_api_request(
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    project_id=project_id,
+                    token_id=token_id,
+                    action="VIDEO_GENERATION",
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -1977,12 +3313,16 @@ class FlowClient:
                     browser_id=browser_id,
                     project_id=project_id,
                     log_prefix="[VIDEO I2V] 首尾帧生成",
+                    defer_browser_error_notification=True,
                 )
                 if should_retry:
+                    max_retries = self._resolve_generation_retry_budget(max_retries, e)
+                    retry_attempt += 1
                     continue
                 raise
             finally:
                 await self._notify_browser_captcha_request_finished(browser_id)
+            retry_attempt += 1
         
         # 所有重试都失败
         raise last_error
@@ -2016,11 +3356,14 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoStartImage"
 
-        # 403/reCAPTCHA 重试逻辑 - 使用配置的最大重试次数
-        max_retries = config.flow_max_retries
+        # 403/reCAPTCHA 重试逻辑 - reCAPTCHA evaluation failed 时允许更高重试上限
+        max_retries = self._resolve_generation_retry_budget(config.flow_max_retries)
         last_error = None
-        
-        for retry_attempt in range(max_retries):
+        retry_attempt = 0
+        session_id = self._generate_session_id()
+        batch_id = str(uuid.uuid4())
+        video_context_warmed = False
+        while retry_attempt < max_retries:
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             launch_gate_acquired = False
             launch_ok, _, _ = await self._acquire_video_launch_gate(
@@ -2051,10 +3394,21 @@ class FlowClient:
                     log_prefix="[VIDEO I2V] 首帧生成",
                 )
                 if should_retry:
+                    retry_attempt += 1
                     continue
                 raise last_error
-            session_id = self._generate_session_id()
-            scene_id = str(uuid.uuid4())
+            if not video_context_warmed:
+                await self._warmup_flow_video_frontend_context(
+                    at=at,
+                    project_id=project_id,
+                    token_id=token_id,
+                    session_id=session_id,
+                    user_paygate_tier=user_paygate_tier,
+                    prompt=prompt,
+                    model_key=model_key,
+                    aspect_ratio=aspect_ratio,
+                )
+                video_context_warmed = True
             client_context = {
                 "recaptchaContext": {
                     "token": recaptcha_token,
@@ -2065,33 +3419,34 @@ class FlowClient:
                 "tool": "PINHOLE",
                 "userPaygateTier": user_paygate_tier
             }
+            request_seed = random.randint(1, 99999)
             request_data = {
                 "aspectRatio": aspect_ratio,
-                "seed": random.randint(1, 99999),
-                "textInput": self._build_video_text_input(prompt, use_v2_model_config=use_v2_model_config),
+                "seed": request_seed,
+                "textInput": self._build_video_text_input(prompt, use_v2_model_config=True),
                 "videoModelKey": model_key,
                 "startImage": {
                     "mediaId": start_media_id
                 },
                 # 注意: 没有endImage字段,只用首帧
-                "metadata": {
-                    "sceneId": scene_id
-                }
+                "metadata": {}
             }
             json_data = {
+                "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
                 "clientContext": client_context,
-                "requests": [request_data]
+                "requests": [request_data],
+                "useV2ModelConfig": True,
             }
-            if use_v2_model_config:
-                json_data["mediaGenerationContext"] = self._build_video_media_generation_context()
-                json_data["useV2ModelConfig"] = True
 
             try:
                 result = await self._make_video_api_request(
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    project_id=project_id,
+                    token_id=token_id,
+                    action="VIDEO_GENERATION",
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -2103,12 +3458,16 @@ class FlowClient:
                     browser_id=browser_id,
                     project_id=project_id,
                     log_prefix="[VIDEO I2V] 首帧生成",
+                    defer_browser_error_notification=True,
                 )
                 if should_retry:
+                    max_retries = self._resolve_generation_retry_budget(max_retries, e)
+                    retry_attempt += 1
                     continue
                 raise
             finally:
                 await self._notify_browser_captcha_request_finished(browser_id)
+            retry_attempt += 1
         
         # 所有重试都失败
         raise last_error
@@ -2143,11 +3502,15 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoExtendVideo"
 
-        # 403/reCAPTCHA 重试逻辑 - 最多重试3次
-        max_retries = 3
+        # 403/reCAPTCHA 重试逻辑 - reCAPTCHA evaluation failed 时允许更高重试上限
+        max_retries = self._resolve_generation_retry_budget(config.flow_max_retries)
         last_error = None
-
-        for retry_attempt in range(max_retries):
+        retry_attempt = 0
+        session_id = self._generate_session_id()
+        workflow_id = str(uuid.uuid4())
+        batch_id = str(uuid.uuid4())
+        video_context_warmed = False
+        while retry_attempt < max_retries:
             launch_gate_acquired = False
             launch_ok, _, _ = await self._acquire_video_launch_gate(
                 token_id=token_id,
@@ -2177,11 +3540,23 @@ class FlowClient:
                     log_prefix="[VIDEO EXTEND] 续写",
                 )
                 if should_retry:
+                    retry_attempt += 1
                     continue
                 raise last_error
-            session_id = self._generate_session_id()
-            workflow_id = str(uuid.uuid4())
+            if not video_context_warmed:
+                await self._warmup_flow_video_frontend_context(
+                    at=at,
+                    project_id=project_id,
+                    token_id=token_id,
+                    session_id=session_id,
+                    user_paygate_tier=user_paygate_tier,
+                    prompt=prompt,
+                    model_key=model_key,
+                    aspect_ratio=aspect_ratio,
+                )
+                video_context_warmed = True
 
+            request_seed = random.randint(1, 99999)
             json_data = {
                 "clientContext": {
                     "recaptchaContext": {
@@ -2193,10 +3568,10 @@ class FlowClient:
                     "tool": "PINHOLE",
                     "userPaygateTier": user_paygate_tier
                 },
-                "mediaGenerationContext": self._build_video_media_generation_context(),
+                "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
                 "requests": [{
                     "aspectRatio": aspect_ratio,
-                    "seed": random.randint(1, 99999),
+                    "seed": request_seed,
                     "textInput": {
                         "structuredPrompt": {
                             "parts": [{"text": prompt}]
@@ -2223,7 +3598,10 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    project_id=project_id,
+                    token_id=token_id,
+                    action="VIDEO_GENERATION",
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -2235,12 +3613,16 @@ class FlowClient:
                     browser_id=browser_id,
                     project_id=project_id,
                     log_prefix="[VIDEO EXTEND] 续写",
+                    defer_browser_error_notification=True,
                 )
                 if should_retry:
+                    max_retries = self._resolve_generation_retry_budget(max_retries, e)
+                    retry_attempt += 1
                     continue
                 raise
             finally:
                 await self._notify_browser_captcha_request_finished(browser_id)
+            retry_attempt += 1
 
         # 所有重试都失败
         raise last_error
@@ -2401,6 +3783,7 @@ class FlowClient:
         aspect_ratio: str,
         resolution: str,
         model_key: str,
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
     ) -> dict:
@@ -2419,11 +3802,15 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoUpsampleVideo"
 
-        # 403/reCAPTCHA 重试逻辑 - 使用配置的最大重试次数
-        max_retries = config.flow_max_retries
+        # 403/reCAPTCHA 重试逻辑 - reCAPTCHA evaluation failed 时允许更高重试上限
+        max_retries = self._resolve_generation_retry_budget(config.flow_max_retries)
         last_error = None
-        
-        for retry_attempt in range(max_retries):
+        retry_attempt = 0
+        session_id = self._generate_session_id()
+        batch_id = str(uuid.uuid4())
+        scene_id = str(uuid.uuid4())
+        video_context_warmed = False
+        while retry_attempt < max_retries:
             launch_gate_acquired = False
             launch_ok, _, _ = await self._acquire_video_launch_gate(
                 token_id=token_id,
@@ -2453,16 +3840,29 @@ class FlowClient:
                     log_prefix="[VIDEO UPSAMPLE] 放大",
                 )
                 if should_retry:
+                    retry_attempt += 1
                     continue
                 raise last_error
-            session_id = self._generate_session_id()
-            scene_id = str(uuid.uuid4())
+            if not video_context_warmed:
+                await self._warmup_flow_video_frontend_context(
+                    at=at,
+                    project_id=project_id,
+                    token_id=token_id,
+                    session_id=session_id,
+                    user_paygate_tier=user_paygate_tier,
+                    prompt="",
+                    model_key=model_key,
+                    aspect_ratio=aspect_ratio,
+                )
+                video_context_warmed = True
 
+            request_seed = random.randint(1, 99999)
             json_data = {
+                "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
                 "requests": [{
                     "aspectRatio": aspect_ratio,
                     "resolution": resolution,
-                    "seed": random.randint(1, 99999),
+                    "seed": request_seed,
                     "videoInput": {
                         "mediaId": video_media_id
                     },
@@ -2478,8 +3878,10 @@ class FlowClient:
                     },
                     "sessionId": session_id,
                     "projectId": project_id,
-                    "tool": "PINHOLE"
-                }
+                    "tool": "PINHOLE",
+                    "userPaygateTier": user_paygate_tier,
+                },
+                "useV2ModelConfig": True,
             }
 
             try:
@@ -2487,7 +3889,10 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    project_id=project_id,
+                    token_id=token_id,
+                    action="VIDEO_GENERATION",
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -2499,12 +3904,16 @@ class FlowClient:
                     browser_id=browser_id,
                     project_id=project_id,
                     log_prefix="[VIDEO UPSAMPLE] 放大",
+                    defer_browser_error_notification=True,
                 )
                 if should_retry:
+                    max_retries = self._resolve_generation_retry_budget(max_retries, e)
+                    retry_attempt += 1
                     continue
                 raise
             finally:
                 await self._notify_browser_captcha_request_finished(browser_id)
+            retry_attempt += 1
         
         raise last_error
 
@@ -2515,7 +3924,7 @@ class FlowClient:
 
         Args:
             at: Access Token
-            operations: 操作列表 [{"operation": {"name": "task_id"}, "sceneId": "...", "status": "..."}]
+            operations: 内部操作列表；当前上游状态查询仅使用其中抽取出的 media 引用
 
         Returns:
             {
@@ -2531,7 +3940,10 @@ class FlowClient:
         url = f"{self.api_base_url}/video:batchCheckAsyncVideoGenerationStatus"
 
         media_refs = self._operations_to_media_refs(operations)
-        json_data = {"media": media_refs} if media_refs else {"operations": operations}
+        if not media_refs:
+            raise ValueError("视频状态查询缺少 media 引用，无法按当前上游结构发起查询")
+
+        json_data = {"media": media_refs}
         max_retries = config.flow_max_retries
         last_error: Optional[Exception] = None
 
@@ -2543,19 +3955,27 @@ class FlowClient:
                     at=at,
                     timeout=self._get_video_poll_timeout()
                 )
+                try:
+                    media_preview = result.get("media") if isinstance(result, dict) else None
+                    operations_preview = result.get("operations") if isinstance(result, dict) else None
+                    preview_payload = {
+                        "top_keys": list(result.keys()) if isinstance(result, dict) else [],
+                        "media_count": len(media_preview) if isinstance(media_preview, list) else 0,
+                        "operations_count": len(operations_preview) if isinstance(operations_preview, list) else 0,
+                        "first_media": media_preview[0] if isinstance(media_preview, list) and media_preview else None,
+                        "first_operation": operations_preview[0] if isinstance(operations_preview, list) and operations_preview else None,
+                    }
+                    print(
+                        "[VIDEO POLL RAW] "
+                        + json.dumps(
+                            self._truncate_large_debug_value(preview_payload),
+                            ensure_ascii=False,
+                        )[:4000]
+                    )
+                except Exception:
+                    pass
                 return self._normalize_video_generation_response(result)
             except Exception as e:
-                if media_refs:
-                    try:
-                        result = await self._make_video_api_request(
-                            url=url,
-                            json_data={"operations": operations},
-                            at=at,
-                            timeout=self._get_video_poll_timeout()
-                        )
-                        return self._normalize_video_generation_response(result)
-                    except Exception:
-                        pass
                 last_error = e
                 retry_reason = self._get_retry_reason(str(e))
                 if retry_reason and retry_attempt < max_retries - 1:
@@ -2720,6 +4140,78 @@ class FlowClient:
             st_token=st
         )
 
+    async def get_media_url_redirect(
+        self,
+        st: str,
+        media_name: str,
+        media_url_type: str = "MEDIA_URL_TYPE_FULL_MEDIA",
+    ) -> Optional[str]:
+        """通过 trpc media.getMediaUrlRedirect 获取媒体实际访问 URL。"""
+        normalized_media_name = str(media_name or "").strip()
+        if not normalized_media_name:
+            return None
+
+        url = (
+            f"{self.labs_base_url}/trpc/media.getMediaUrlRedirect"
+            f"?name={quote(normalized_media_name, safe='')}"
+            f"&mediaUrlType={quote(str(media_url_type or 'MEDIA_URL_TYPE_FULL_MEDIA'), safe='')}"
+        )
+
+        proxy_url = None
+        if self.proxy_manager:
+            if hasattr(self.proxy_manager, "get_request_proxy_url"):
+                proxy_url = await self.proxy_manager.get_request_proxy_url()
+            else:
+                proxy_url = await self.proxy_manager.get_proxy_url()
+
+        headers = {
+            "Cookie": f"__Secure-next-auth.session-token={st}",
+            "User-Agent": self._generate_user_agent(st[:16] if st else None),
+            "Accept": "*/*",
+        }
+        for key, value in self._default_client_headers.items():
+            headers.setdefault(key, value)
+
+        request_timeout = self._get_control_plane_timeout()
+        start_time = time.time()
+        try:
+            async with AsyncSession(trust_env=False) as session:
+                response = await session.get(
+                    url,
+                    headers=headers,
+                    proxy=proxy_url,
+                    timeout=request_timeout,
+                    impersonate="chrome124",
+                    allow_redirects=False,
+                )
+
+            duration_ms = (time.time() - start_time) * 1000
+            if config.debug_enabled:
+                debug_logger.log_response(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    body=response.text,
+                    duration_ms=duration_ms,
+                )
+
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("Location") or response.headers.get("location")
+                if location:
+                    return urljoin(url, location)
+
+            final_url = str(getattr(response, "url", "") or "").strip()
+            if response.status_code == 200 and final_url and final_url != url:
+                return final_url
+
+            raise RuntimeError(
+                f"media.getMediaUrlRedirect returned unexpected status={response.status_code} "
+                f"for media={normalized_media_name}"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"获取媒体重定向地址失败: media={normalized_media_name}, type={media_url_type}, error={e}"
+            ) from e
+
     # ========== 辅助方法 ==========
 
     async def _handle_retryable_generation_error(
@@ -2730,32 +4222,43 @@ class FlowClient:
         browser_id: Optional[Union[int, str]],
         project_id: str,
         log_prefix: str,
+        defer_browser_error_notification: bool = False,
     ) -> bool:
         """统一处理生成链路的重试判定与打码自愈通知。"""
         error_str = str(error)
         retry_reason = self._get_retry_reason(error_str)
-        notify_reason = retry_reason or error_str[:120] or type(error).__name__
-        await self._notify_browser_captcha_error(
-            browser_id=browser_id,
-            project_id=project_id,
-            error_reason=notify_reason,
-            error_message=error_str,
+        retry_delay = self._get_retry_delay_seconds(error_str, retry_attempt)
+
+        effective_max_retries = self._resolve_generation_retry_budget(max_retries, error_str)
+        is_terminal_attempt = retry_attempt >= effective_max_retries - 1
+        should_notify_browser = (
+            not defer_browser_error_notification
+            or not retry_reason
+            or is_terminal_attempt
         )
+
+        if should_notify_browser:
+            notify_reason = retry_reason or error_str[:120] or type(error).__name__
+            await self._notify_browser_captcha_error(
+                browser_id=browser_id,
+                project_id=project_id,
+                error_reason=notify_reason,
+                error_message=error_str,
+            )
+
         if not retry_reason:
             return False
 
-        is_terminal_attempt = retry_attempt >= max_retries - 1
-
         if is_terminal_attempt:
             debug_logger.log_warning(
-                f"{log_prefix}遇到{retry_reason}，已达到最大重试次数({max_retries})，本次请求失败并执行关闭回收。"
+                f"{log_prefix}遇到{retry_reason}，已达到最大重试次数({effective_max_retries})，本次请求失败并执行关闭回收。"
             )
             return False
 
         debug_logger.log_warning(
-            f"{log_prefix}遇到{retry_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})..."
+            f"{log_prefix}遇到{retry_reason}，将在 {retry_delay} 秒后重新获取验证码重试 ({retry_attempt + 2}/{effective_max_retries})..."
         )
-        await asyncio.sleep(1)
+        await asyncio.sleep(retry_delay)
         return True
 
     async def _handle_missing_recaptcha_token(
@@ -2779,6 +4282,10 @@ class FlowClient:
     def _get_retry_reason(self, error_str: str) -> Optional[str]:
         """判断是否需要重试，返回日志提示内容"""
         error_lower = error_str.lower()
+        if "error_no_slot_available_block" in error_lower:
+            return "打码服务资源阻塞"
+        if "error_no_slot_available" in error_lower:
+            return "打码服务资源不足"
         if "403" in error_lower:
             return "403 error"
         if "429" in error_lower or "too many requests" in error_lower:
@@ -2801,6 +4308,72 @@ class FlowClient:
         ]):
             return "500/internal error"
         return None
+
+    def _get_retry_delay_seconds(self, error_str: str, retry_attempt: int) -> int:
+        error_lower = str(error_str or "").lower()
+        if "error_no_slot_available_block" in error_lower:
+            return 20
+        if "error_no_slot_available" in error_lower:
+            index = max(0, min(retry_attempt, len(self.YESCAPTCHA_SLOT_BACKOFF_SECONDS) - 1))
+            return self.YESCAPTCHA_SLOT_BACKOFF_SECONDS[index]
+        if "recaptcha evaluation failed" in error_lower:
+            return 2
+        if "recaptcha" in error_lower:
+            return 2
+        return 1
+
+    def _resolve_recaptcha_runtime_settings(
+        self,
+        method: str,
+        action: str,
+    ) -> Dict[str, Any]:
+        normalized_action = str(action or "IMAGE_GENERATION").strip() or "IMAGE_GENERATION"
+        website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+
+        if method == "yescaptcha":
+            page_action = normalized_action
+            task_type = config.yescaptcha_task_type
+            min_score = get_yescaptcha_min_score(task_type)
+        elif method == "capmonster":
+            page_action = normalized_action
+            task_type = "RecaptchaV3TaskProxyless"
+            min_score = None
+        elif method == "ezcaptcha":
+            page_action = normalized_action
+            task_type = "ReCaptchaV3TaskProxylessS9"
+            min_score = None
+        elif method == "capsolver":
+            page_action = normalized_action
+            task_type = "ReCaptchaV3EnterpriseTaskProxyLess"
+            min_score = None
+        else:
+            page_action = normalized_action
+            task_type = None
+            min_score = None
+
+        return {
+            "website_key": website_key,
+            "page_action": page_action,
+            "task_type": task_type,
+            "min_score": min_score,
+        }
+
+    def _merge_request_fingerprint(self, patch: Optional[Dict[str, Any]]):
+        if not isinstance(patch, dict) or not patch:
+            return
+        current = self.get_request_fingerprint() or {}
+        merged = dict(current)
+        for key, value in patch.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                normalized = value.strip()
+                if not normalized:
+                    continue
+                merged[key] = normalized
+            else:
+                merged[key] = value
+        self._set_request_fingerprint(merged if merged else None)
 
     async def _notify_browser_captcha_error(
         self,
@@ -3203,17 +4776,61 @@ class FlowClient:
                 debug_logger.log_info(f"[reCAPTCHA] 导入 BrowserCaptchaService 成功")
                 service = await BrowserCaptchaService.get_instance(self.db)
                 debug_logger.log_info(f"[reCAPTCHA] 获取服务实例成功，准备调用 get_token")
-                get_token_with_metadata = getattr(service, "get_token_with_metadata", None)
-                if callable(get_token_with_metadata):
-                    token, _slot_id, _cookie_source_token_id = await get_token_with_metadata(
+                solve_bundle = None
+                get_token_bundle = getattr(service, "get_token_bundle", None)
+                if callable(get_token_bundle):
+                    solve_bundle = await get_token_bundle(
                         project_id,
                         action,
                         token_id=token_id,
                     )
+                    token = str((solve_bundle or {}).get("token") or "").strip() or None
                 else:
-                    token = await service.get_token(project_id, action, token_id=token_id)
+                    get_token_with_metadata = getattr(service, "get_token_with_metadata", None)
+                    if callable(get_token_with_metadata):
+                        token, _slot_id, _cookie_source_token_id = await get_token_with_metadata(
+                            project_id,
+                            action,
+                            token_id=token_id,
+                        )
+                    else:
+                        token = await service.get_token(project_id, action, token_id=token_id)
+                    solve_bundle = {
+                        "token": token,
+                        "fingerprint": service.get_last_fingerprint() if token else None,
+                    } if token else None
                 debug_logger.log_info(f"[reCAPTCHA] get_token 返回: {token[:50] if token else None}...")
-                fingerprint = service.get_last_fingerprint() if token else None
+                fingerprint = (
+                    solve_bundle.get("fingerprint")
+                    if isinstance(solve_bundle, dict) and isinstance(solve_bundle.get("fingerprint"), dict)
+                    else None
+                )
+                if isinstance(solve_bundle, dict) and token:
+                    session_cookies = solve_bundle.get("session_cookies")
+                    proxy_url = str(solve_bundle.get("proxy_url") or "").strip()
+                    next_fingerprint = dict(fingerprint or {})
+                    if isinstance(session_cookies, dict) and session_cookies:
+                        next_fingerprint["session_cookies"] = dict(session_cookies)
+                    if proxy_url and not str(next_fingerprint.get("proxy_url") or "").strip():
+                        next_fingerprint["proxy_url"] = proxy_url
+                    next_fingerprint["project_id"] = project_id
+                    next_fingerprint.setdefault("origin", "https://labs.google")
+                    next_fingerprint.setdefault("referer", self._build_flow_project_page_url(project_id))
+                    fingerprint = next_fingerprint or None
+                if token:
+                    effective_ua = str((fingerprint or {}).get("user_agent") or "").strip()
+                    effective_lang = str((fingerprint or {}).get("accept_language") or "").strip()
+                    if not effective_ua:
+                        debug_logger.log_warning(
+                            "[reCAPTCHA Personal] 已拿到 token，但未提取到浏览器指纹 UA；"
+                            "为避免协议提交与打码环境失配，丢弃本次 token 并触发重试"
+                        )
+                        self._set_request_fingerprint(None)
+                        return None, None
+                    debug_logger.log_info(
+                        "[reCAPTCHA Personal] 使用浏览器指纹: "
+                        f"UA={effective_ua[:120]}, Accept-Language={effective_lang or '<empty>'}"
+                    )
                 self._set_request_fingerprint(fingerprint if token else None)
                 return token, None
             except RuntimeError as e:
@@ -3283,20 +4900,36 @@ class FlowClient:
                 return None, None
         # API打码服务
         elif captcha_method in ["yescaptcha", "capmonster", "ezcaptcha", "capsolver"]:
-            # 为 API 打码也设置指纹（包含代理），确保 token 获取和后续请求环境一致
+            proxy_url = None
             if self.proxy_manager:
                 try:
                     proxy_url = await self.proxy_manager.get_request_proxy_url()
-                    if proxy_url:
-                        self._set_request_fingerprint({"proxy_url": proxy_url})
-                    else:
-                        self._set_request_fingerprint(None)
                 except Exception as e:
                     debug_logger.log_warning(f"[reCAPTCHA] Failed to get proxy for API captcha: {e}")
-                    self._set_request_fingerprint(None)
-            else:
-                self._set_request_fingerprint(None)
-            api_result = await self._get_api_captcha_token(captcha_method, project_id, action)
+
+            api_captcha_ua = self._generate_user_agent(str(token_id or project_id or captcha_method))
+            self._set_request_fingerprint(
+                self._build_fingerprint_from_user_agent(
+                    api_captcha_ua,
+                    accept_language=self._get_primary_accept_language(),
+                    proxy_url=proxy_url,
+                )
+            )
+            self._merge_request_fingerprint(
+                {
+                    "project_id": project_id,
+                    "origin": "https://labs.google",
+                    "referer": self._build_flow_project_page_url(project_id),
+                }
+            )
+
+            api_result = await self._get_api_captcha_token(
+                captcha_method,
+                project_id,
+                action,
+                proxy_url=proxy_url,
+                user_agent=api_captcha_ua,
+            )
             if api_result is None:
                 return None, None
             token, captcha_user_agent = api_result
@@ -3323,7 +4956,9 @@ class FlowClient:
         self,
         method: str,
         project_id: str,
-        action: str = "IMAGE_GENERATION"
+        action: str = "IMAGE_GENERATION",
+        proxy_url: Optional[str] = None,
+        user_agent: Optional[str] = None,
     ) -> Optional[tuple[str, str]]:
         """通用API打码服务
 
@@ -3331,6 +4966,8 @@ class FlowClient:
             method: 打码服务类型
             project_id: 项目ID
             action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
+            proxy_url: 预解析后的代理地址，确保打码与后续提交走同一出口
+            user_agent: 显式传给打码服务的 UA，避免 solve / submit 环境不一致
 
         Returns:
             (gRecaptchaResponse, userAgent) 元组, 或 None (失败时)。
@@ -3341,23 +4978,15 @@ class FlowClient:
         if method == "yescaptcha":
             client_key = config.yescaptcha_api_key
             base_url = config.yescaptcha_base_url
-            task_type = config.yescaptcha_task_type
-            min_score = get_yescaptcha_min_score(task_type)
         elif method == "capmonster":
             client_key = config.capmonster_api_key
             base_url = config.capmonster_base_url
-            task_type = "RecaptchaV3TaskProxyless"
-            min_score = None
         elif method == "ezcaptcha":
             client_key = config.ezcaptcha_api_key
             base_url = config.ezcaptcha_base_url
-            task_type = "ReCaptchaV3TaskProxylessS9"
-            min_score = None
         elif method == "capsolver":
             client_key = config.capsolver_api_key
             base_url = config.capsolver_base_url
-            task_type = "ReCaptchaV3EnterpriseTaskProxyLess"
-            min_score = None
         else:
             debug_logger.log_error(f"[reCAPTCHA] Unknown API method: {method}")
             return None
@@ -3366,27 +4995,36 @@ class FlowClient:
             debug_logger.log_info(f"[reCAPTCHA] {method} API key not configured, skipping")
             return None
 
-        website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
-        website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
-        page_action = action
+        runtime_settings = self._resolve_recaptcha_runtime_settings(method, action)
+        task_type = runtime_settings["task_type"]
+        min_score = runtime_settings["min_score"]
+        website_key = runtime_settings["website_key"]
+        website_url = self._build_flow_project_page_url(project_id)
+        page_action = runtime_settings["page_action"]
 
         try:
             # 获取代理配置，让打码API请求也走代理
             # 注意：curl_cffi 对 SOCKS5 使用 proxy 参数，HTTP 代理使用 proxies 参数
             proxy = None
             proxies = None
-            if self.proxy_manager:
+            resolved_proxy_url = str(proxy_url or "").strip()
+            if not resolved_proxy_url and self.proxy_manager:
                 try:
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                    if proxy_url:
-                        if proxy_url.startswith("socks5://"):
+                    resolved_proxy_url = str(await self.proxy_manager.get_request_proxy_url() or "").strip()
+                    if resolved_proxy_url:
+                        if resolved_proxy_url.startswith("socks5://"):
                             # curl_cffi 对 SOCKS5 使用 proxy 参数
-                            proxy = proxy_url
+                            proxy = resolved_proxy_url
                         else:
                             # HTTP/HTTPS 代理使用 proxies 字典
-                            proxies = {"http": proxy_url, "https": proxy_url}
+                            proxies = {"http": resolved_proxy_url, "https": resolved_proxy_url}
                 except Exception as e:
                     debug_logger.log_warning(f"[reCAPTCHA {method}] Failed to get proxy: {e}")
+            elif resolved_proxy_url:
+                if resolved_proxy_url.startswith("socks5://"):
+                    proxy = resolved_proxy_url
+                else:
+                    proxies = {"http": resolved_proxy_url, "https": resolved_proxy_url}
             
             async with AsyncSession() as session:
                 create_url = f"{base_url}/createTask"
@@ -3399,22 +5037,51 @@ class FlowClient:
                         "pageAction": page_action
                     }
                 }
+                effective_user_agent = str(
+                    user_agent
+                    or (self.get_request_fingerprint() or {}).get("user_agent")
+                    or self._generate_user_agent(str(project_id or method))
+                ).strip()
+                if effective_user_agent:
+                    create_data["task"]["userAgent"] = effective_user_agent
                 if min_score is not None:
                     create_data["task"]["minScore"] = min_score
 
-                if proxy:
-                    result = await session.post(create_url, json=create_data, impersonate="chrome124", proxy=proxy)
-                else:
-                    result = await session.post(create_url, json=create_data, impersonate="chrome124", proxies=proxies)
+                task_id = None
+                last_create_error = None
+                max_create_attempts = len(self.YESCAPTCHA_SLOT_BACKOFF_SECONDS) if method == "yescaptcha" else 1
+                for create_attempt in range(max_create_attempts):
+                    if proxy:
+                        result = await session.post(create_url, json=create_data, impersonate="chrome124", proxy=proxy)
+                    else:
+                        result = await session.post(create_url, json=create_data, impersonate="chrome124", proxies=proxies)
 
-                debug_logger.log_info(f"[reCAPTCHA {method}] createTask response status: {result.status_code}")
-                result_json = result.json()
-                task_id = result_json.get('taskId')
+                    debug_logger.log_info(f"[reCAPTCHA {method}] createTask response status: {result.status_code}")
+                    result_json = result.json()
+                    task_id = result_json.get('taskId')
 
-                debug_logger.log_info(f"[reCAPTCHA {method}] created task_id: {task_id}, response: {result_json}")
+                    debug_logger.log_info(f"[reCAPTCHA {method}] created task_id: {task_id}, response: {result_json}")
+
+                    if task_id:
+                        break
+
+                    error_code = str(result_json.get("errorCode") or "").strip()
+                    error_desc = result_json.get('errorDescription', 'Unknown error')
+                    last_create_error = result_json
+                    if method == "yescaptcha" and error_code in {"ERROR_NO_SLOT_AVAILABLE", "ERROR_NO_SLOT_AVAILABLE_BLOCK"}:
+                        delay = self._get_retry_delay_seconds(error_code, create_attempt)
+                        if create_attempt < max_create_attempts - 1:
+                            debug_logger.log_warning(
+                                f"[reCAPTCHA {method}] createTask 资源不足 ({error_code})，将在 {delay} 秒后重试 "
+                                f"({create_attempt + 2}/{max_create_attempts})"
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                    debug_logger.log_error(f"[reCAPTCHA {method}] Failed to create task: {error_desc}")
+                    return None
 
                 if not task_id:
-                    error_desc = result_json.get('errorDescription', 'Unknown error')
+                    error_desc = (last_create_error or {}).get('errorDescription', 'Unknown error')
                     debug_logger.log_error(f"[reCAPTCHA {method}] Failed to create task: {error_desc}")
                     return None
 
@@ -3438,6 +5105,13 @@ class FlowClient:
                         solution = result_json.get('solution', {})
                         response = solution.get('gRecaptchaResponse')
                         if response:
+                            self._merge_request_fingerprint(
+                                self._build_fingerprint_from_user_agent(
+                                    solution.get("userAgent"),
+                                    accept_language=self._get_primary_accept_language(),
+                                    proxy_url=resolved_proxy_url,
+                                )
+                            )
                             debug_logger.log_info(f"[reCAPTCHA {method}] Token获取成功")
                             # 同时返回 userAgent, 调用方会注入到 fingerprint context,
                             # 保证 Flow API 提交请求时使用与打码一致的 UA。
@@ -3452,3 +5126,5 @@ class FlowClient:
         except Exception as e:
             debug_logger.log_error(f"[reCAPTCHA {method}] error: {str(e)}")
             return None
+
+
