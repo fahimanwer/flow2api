@@ -20,6 +20,7 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
+from .services.async_task_manager import AsyncTaskManager
 from .api import routes, admin, ext_update
 
 
@@ -240,6 +241,11 @@ async def lifespan(app: FastAPI):
 
     log_cleanup_task_handle = asyncio.create_task(log_cleanup_task())
 
+    # Async generation jobs: their workers live in this process, so anything the
+    # last run left queued/running is dead and must stop being polled.
+    interrupted_async_tasks = await async_task_manager.fail_interrupted_tasks()
+    await async_task_manager.start_cleanup_task()
+
     print("✓ Database initialized")
     print(f"✓ Total tokens: {len(tokens)}")
     print(f"✓ Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
@@ -259,6 +265,12 @@ async def lifespan(app: FastAPI):
         )
     else:
         print("✓ Log cleanup task started (currently disabled in config)")
+    if interrupted_async_tasks:
+        print(f"✓ Async jobs: failed {interrupted_async_tasks} interrupted by the previous shutdown")
+    print(
+        f"✓ Async job cleanup task started "
+        f"(results kept {AsyncTaskManager.RESULT_RETENTION_HOURS}h after completion)"
+    )
     print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
@@ -280,6 +292,8 @@ async def lifespan(app: FastAPI):
         await log_cleanup_task_handle
     except asyncio.CancelledError:
         pass
+    # Stop async generation workers and their retention sweep
+    await async_task_manager.shutdown()
     # Stop upstream protocol token refresher
     await token_manager.stop_protocol_refresher()
     # Close browser if initialized
@@ -287,6 +301,7 @@ async def lifespan(app: FastAPI):
         await browser_service.close()
         print("✓ Browser captcha service closed")
     print("✓ File cache cleanup task stopped")
+    print("✓ Async job workers stopped")
     print("✓ Token auto-recovery task stopped")
     print("✓ Log cleanup task stopped")
     print("✓ Protocol token refresher stopped")
@@ -307,9 +322,11 @@ generation_handler = GenerationHandler(
     concurrency_manager,
     proxy_manager  # 添加 proxy_manager 参数
 )
+async_task_manager = AsyncTaskManager(db)
 
 # Set dependencies
 routes.set_generation_handler(generation_handler)
+routes.set_async_task_manager(async_task_manager)
 admin.set_dependencies(token_manager, proxy_manager, db, concurrency_manager)
 ext_update.set_dependencies(db, admin.verify_admin_token)
 

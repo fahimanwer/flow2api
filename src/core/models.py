@@ -123,6 +123,29 @@ class Task(BaseModel):
     completed_at: Optional[datetime] = None
 
 
+class AsyncTask(BaseModel):
+    """Client-facing async generation job.
+
+    Distinct from Task above: Task tracks a single upstream Flow operation, this
+    tracks one client submission through the whole generation pipeline so a
+    disconnected client can reconnect by task_id instead of paying twice.
+    """
+
+    id: Optional[int] = None
+    task_id: str  # uuid4-based, unguessable, returned to the client
+    api_key_hash: str  # sha256 of the caller's API key; scopes reads to that principal
+    idempotency_key: Optional[str] = None
+    status: str  # queued, running, succeeded, failed
+    response_format: str = "openai"  # openai or gemini: which sync shape the result renders as
+    model: str
+    prompt: Optional[str] = None
+    result_body: Optional[str] = None  # JSON payload the sync endpoint would have returned
+    error_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
 class RequestLog(BaseModel):
     """API request log"""
 
@@ -350,3 +373,12 @@ class ChatCompletionRequest(BaseModel):
     contents: Optional[List[Any]] = None  # Gemini native contents
 
     model_config = ConfigDict(extra="allow")  # Allow extra fields like extra_body passthrough
+
+
+class AsyncGenerationRequest(ChatCompletionRequest):
+    """Async submit request: the sync body plus an optional idempotency key.
+
+    The key may also be sent as an Idempotency-Key header; the header wins.
+    """
+
+    idempotency_key: Optional[str] = None

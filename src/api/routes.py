@@ -9,18 +9,21 @@ import re
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
+    AsyncGenerationRequest,
+    AsyncTask,
     ChatCompletionRequest,
     ChatMessage,
     GeminiContent,
     GeminiGenerateContentRequest,
 )
+from ..services.async_task_manager import TERMINAL_STATUSES, AsyncTaskManager
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
 from ..services.browser_captcha_extension import ExtensionCaptchaService
 
@@ -69,6 +72,10 @@ GEMINI_STATUS_MAP = {
 
 # Dependency injection will be set up in main.py
 generation_handler: GenerationHandler = None
+async_task_manager: AsyncTaskManager = None
+
+# Polling hint for clients waiting on an unfinished async job.
+ASYNC_RESULT_RETRY_AFTER_SECONDS = 5
 
 
 @dataclass
@@ -88,10 +95,22 @@ def set_generation_handler(handler: GenerationHandler):
     generation_handler = handler
 
 
+def set_async_task_manager(manager: AsyncTaskManager):
+    """Set async task manager instance."""
+    global async_task_manager
+    async_task_manager = manager
+
+
 def _ensure_generation_handler() -> GenerationHandler:
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
     return generation_handler
+
+
+def _ensure_async_task_manager() -> AsyncTaskManager:
+    if async_task_manager is None:
+        raise HTTPException(status_code=500, detail="Async task manager not initialized")
+    return async_task_manager
 
 
 def _build_model_description(model_config: Dict[str, Any]) -> str:
@@ -984,6 +1003,244 @@ async def stream_generate_content(
             status_code=500,
             content=_build_gemini_error_payload(500, str(exc)),
         )
+
+# ---------------------------------------------------------------------------
+# Async generation lifecycle: submit -> poll status -> fetch result.
+#
+# The sync endpoints above await the whole generation inline, so a client that
+# dies mid-call has no handle to reconnect with and can only re-submit, paying
+# twice. These endpoints run the same pipeline behind a task_id, and an
+# idempotency key makes the re-submit after a crash free.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_idempotency_key(header_value: Optional[str], body_value: Optional[str]) -> Optional[str]:
+    """Header wins over the body field; blank means no idempotency."""
+    return (header_value or body_value or "").strip() or None
+
+
+def _build_async_task_payload(task: AsyncTask, replayed: bool = False) -> Dict[str, Any]:
+    """Status/submit response body. Timestamps are UTC."""
+    payload: Dict[str, Any] = {
+        "task_id": task.task_id,
+        "status": task.status,
+        "model": task.model,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+    }
+    if task.idempotency_key:
+        payload["idempotency_key"] = task.idempotency_key
+    if task.error_message:
+        payload["error"] = task.error_message
+    if replayed:
+        # Tells the client this submit started nothing new, so no second charge.
+        payload["replayed"] = True
+    return payload
+
+
+def _build_openai_error_payload(status_code: int, message: str) -> Dict[str, Any]:
+    return {
+        "error": {
+            "message": message,
+            "type": "server_error" if status_code >= 500 else "invalid_request_error",
+            "code": "generation_failed",
+            "status_code": status_code,
+        }
+    }
+
+
+async def _lookup_async_task(task_id: str, api_key: str) -> AsyncTask:
+    manager = _ensure_async_task_manager()
+    task = await manager.get(task_id, api_key)
+    if task is None:
+        # Also the answer for a task owned by a different API key: an unknown
+        # task id and someone else's task are indistinguishable on purpose.
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    return task
+
+
+async def _submit_async_generation(
+    *,
+    api_key: str,
+    idempotency_key: Optional[str],
+    response_format: str,
+    normalized: NormalizedGenerationRequest,
+    base_url_override: Optional[str],
+    pool: str = "auto",
+) -> JSONResponse:
+    """Register a job for an already-normalized request and start it."""
+    manager = _ensure_async_task_manager()
+    _ensure_generation_handler()
+
+    # The pipeline rejects unknown models too, but only once running. Checking
+    # here keeps a typo from burning an idempotency key on a doomed job.
+    if normalized.model not in MODEL_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Unsupported model: {normalized.model}")
+
+    async def run() -> str:
+        return await _collect_non_stream_result(
+            normalized.model,
+            normalized.prompt,
+            normalized.images,
+            base_url_override=base_url_override,
+            video_media_id=normalized.video_media_id,
+            pool=pool,
+        )
+
+    task, replayed = await manager.submit(
+        api_key=api_key,
+        model=normalized.model,
+        prompt=normalized.prompt,
+        run=run,
+        response_format=response_format,
+        idempotency_key=idempotency_key,
+    )
+    return JSONResponse(
+        status_code=200 if replayed else 202,
+        content=_build_async_task_payload(task, replayed=replayed),
+    )
+
+
+@router.post("/v1/async/chat/completions")
+async def submit_async_chat_completion(
+    request: AsyncGenerationRequest,
+    raw_request: Request,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Start an OpenAI-shaped generation and return a task handle immediately."""
+    manager = _ensure_async_task_manager()
+    try:
+        resolved_key = _resolve_idempotency_key(idempotency_key, request.idempotency_key)
+        if resolved_key:
+            existing = await manager.find_by_idempotency_key(api_key, resolved_key)
+            if existing:
+                return JSONResponse(
+                    status_code=200,
+                    content=_build_async_task_payload(existing, replayed=True),
+                )
+
+        normalized = await _normalize_openai_request(request)
+        if not normalized.prompt:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+        if request.stream:
+            # There is no socket to stream into once this returns; the result is
+            # always collected in the non-streaming shape.
+            debug_logger.log_warning("[ASYNC] 异步提交忽略 stream=true，结果按非流式返回")
+
+        pool = "failed_image" if (raw_request.headers.get("x-flow-pool", "").strip().lower()
+                                  == "failed_image") else "auto"
+
+        return await _submit_async_generation(
+            api_key=api_key,
+            idempotency_key=resolved_key,
+            response_format="openai",
+            normalized=normalized,
+            base_url_override=_get_request_base_url(raw_request),
+            pool=pool,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/v1beta/models/{model}:asyncGenerateContent")
+@router.post("/models/{model}:asyncGenerateContent")
+async def submit_async_generate_content(
+    model: str,
+    request: GeminiGenerateContentRequest,
+    raw_request: Request,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Start a Gemini-shaped generateContent and return a task handle immediately."""
+    manager = _ensure_async_task_manager()
+    try:
+        body_key = getattr(request, "idempotency_key", None)
+        resolved_key = _resolve_idempotency_key(idempotency_key, body_key)
+        if resolved_key:
+            existing = await manager.find_by_idempotency_key(api_key, resolved_key)
+            if existing:
+                return JSONResponse(
+                    status_code=200,
+                    content=_build_async_task_payload(existing, replayed=True),
+                )
+
+        normalized = await _normalize_gemini_request(model, request)
+        if not normalized.prompt:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+        return await _submit_async_generation(
+            api_key=api_key,
+            idempotency_key=resolved_key,
+            response_format="gemini",
+            normalized=normalized,
+            base_url_override=_get_request_base_url(raw_request),
+        )
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=_build_gemini_error_payload(exc.status_code, str(exc.detail)),
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content=_build_gemini_error_payload(500, str(exc)),
+        )
+
+
+@router.get("/v1/async/tasks/{task_id}")
+async def get_async_task_status(
+    task_id: str,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Report the lifecycle state of an async job."""
+    task = await _lookup_async_task(task_id, api_key)
+    return _build_async_task_payload(task)
+
+
+@router.get("/v1/async/tasks/{task_id}/result")
+async def get_async_task_result(
+    task_id: str,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Return the finished job's payload in the shape its submit surface uses."""
+    task = await _lookup_async_task(task_id, api_key)
+
+    if task.status not in TERMINAL_STATUSES:
+        return JSONResponse(
+            status_code=425,
+            content={
+                "task_id": task.task_id,
+                "status": task.status,
+                "message": "Generation is not finished yet",
+            },
+            headers={"Retry-After": str(ASYNC_RESULT_RETRY_AFTER_SECONDS)},
+        )
+
+    is_gemini = task.response_format == "gemini"
+
+    # A failed job with no stored body never reached the pipeline's own error
+    # shape (it raised), so its message is rendered as a 500 here.
+    if not task.result_body:
+        message = task.error_message or "Generation failed"
+        if is_gemini:
+            return JSONResponse(status_code=500, content=_build_gemini_error_payload(500, message))
+        return JSONResponse(status_code=500, content=_build_openai_error_payload(500, message))
+
+    payload = _parse_handler_result(task.result_body)
+
+    if is_gemini:
+        payload = _enrich_payload_with_direct_url(payload)
+        if "error" in payload:
+            return _build_gemini_error_response_from_handler(payload)
+        return JSONResponse(content=await _build_gemini_success_payload(payload, task.model))
+
+    return _build_openai_json_response(payload)
+
 
 @router.websocket("/captcha_ws")
 async def captcha_websocket_endpoint(websocket: WebSocket):

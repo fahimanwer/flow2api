@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, LogCleanupConfig, TokenRefreshConfig
+from .models import Token, TokenStats, Task, AsyncTask, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, LogCleanupConfig, TokenRefreshConfig
 
 
 class Database:
@@ -44,17 +44,31 @@ class Database:
         """Return the logical date used by daily token statistics."""
         return date.today().isoformat()
 
+    def _new_connection(self):
+        """Build an aiosqlite connection whose worker thread cannot block exit.
+
+        Each aiosqlite connection is a Thread. Cancelling a coroutine while it is
+        still establishing the connection leaves that thread parked forever
+        (aiosqlite only cleans up on Exception, and CancelledError is not one),
+        and a non-daemon thread keeps the interpreter from exiting. Daemon
+        threads are reaped at exit instead; SQLite already survives an abrupt
+        process end, so nothing is lost that a crash would not also lose.
+        """
+        connection = aiosqlite.connect(self.db_path, timeout=self._connect_timeout)
+        connection.daemon = True
+        return connection
+
     @asynccontextmanager
     async def _connect(self, *, write: bool = False):
         """Open a configured SQLite connection and optionally serialize writes."""
         if write:
             async with self._write_lock:
-                async with aiosqlite.connect(self.db_path, timeout=self._connect_timeout) as db:
+                async with self._new_connection() as db:
                     await self._configure_connection(db)
                     yield db
             return
 
-        async with aiosqlite.connect(self.db_path, timeout=self._connect_timeout) as db:
+        async with self._new_connection() as db:
             await self._configure_connection(db)
             yield db
 
@@ -777,6 +791,25 @@ class Database:
                 )
             """)
 
+            # Async generation jobs table (client-facing submit/status/result lifecycle)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS async_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT UNIQUE NOT NULL,
+                    api_key_hash TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    response_format TEXT NOT NULL DEFAULT 'openai',
+                    model TEXT NOT NULL,
+                    prompt TEXT,
+                    result_body TEXT,
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+            """)
+
             # Request logs table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS request_logs (
@@ -939,6 +972,14 @@ class Database:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_project_id ON projects(project_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_email ON tokens(email)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_is_active_last_used_at ON tokens(is_active, last_used_at)")
+
+            # Idempotency lookup + guard. SQLite treats NULLs as distinct in a UNIQUE
+            # index, so submissions without an idempotency_key are never deduplicated.
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_async_tasks_idempotency "
+                "ON async_tasks(api_key_hash, idempotency_key)"
+            )
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_async_tasks_created_at ON async_tasks(created_at)")
 
             # Migrate request_logs table if needed
             await self._migrate_request_logs(db)
@@ -1452,6 +1493,127 @@ class Database:
                 query = f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = ?"
                 await db.execute(query, params)
                 await db.commit()
+
+    # Async generation job operations
+    async def create_async_task(self, task: AsyncTask) -> int:
+        """Insert a new async job row.
+
+        Raises aiosqlite.IntegrityError when (api_key_hash, idempotency_key)
+        already exists; callers should treat that as "another submit won the
+        race" and re-read the existing row.
+        """
+        async with self._connect(write=True) as db:
+            cursor = await db.execute("""
+                INSERT INTO async_tasks
+                    (task_id, api_key_hash, idempotency_key, status, response_format, model, prompt)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (task.task_id, task.api_key_hash, task.idempotency_key,
+                  task.status, task.response_format, task.model, task.prompt))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_async_task(self, task_id: str, api_key_hash: str) -> Optional[AsyncTask]:
+        """Get an async job by ID, scoped to the API key that created it."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM async_tasks WHERE task_id = ? AND api_key_hash = ?",
+                (task_id, api_key_hash),
+            )
+            row = await cursor.fetchone()
+            return AsyncTask(**dict(row)) if row else None
+
+    async def get_async_task_by_idempotency_key(
+        self, api_key_hash: str, idempotency_key: str
+    ) -> Optional[AsyncTask]:
+        """Get an existing async job for this key + idempotency key, if any."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM async_tasks WHERE api_key_hash = ? AND idempotency_key = ?",
+                (api_key_hash, idempotency_key),
+            )
+            row = await cursor.fetchone()
+            return AsyncTask(**dict(row)) if row else None
+
+    async def mark_async_task_running(self, task_id: str):
+        """Move a queued job to running."""
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                UPDATE async_tasks
+                SET status = 'running', started_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND status = 'queued'
+                """,
+                (task_id,),
+            )
+            await db.commit()
+
+    async def finish_async_task(
+        self,
+        task_id: str,
+        status: str,
+        result_body: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ):
+        """Record a terminal state ('succeeded' or 'failed') with its payload."""
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                UPDATE async_tasks
+                SET status = ?, result_body = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE task_id = ?
+                """,
+                (status, result_body, error_message, task_id),
+            )
+            await db.commit()
+
+    async def fail_unfinished_async_tasks(
+        self, error_message: str, task_ids: Optional[List[str]] = None
+    ) -> int:
+        """Fail jobs still queued/running, optionally limited to task_ids.
+
+        The workers live in the server process, so anything unfinished when it
+        goes down would be polled forever. Already-finished rows are left alone,
+        so a job that completed while shutting down keeps its result. Returns
+        the number of rows failed.
+        """
+        query = """
+            UPDATE async_tasks
+            SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP
+            WHERE status IN ('queued', 'running')
+        """
+        params: List[Any] = [error_message]
+
+        if task_ids is not None:
+            if not task_ids:
+                return 0
+            query += f" AND task_id IN ({','.join('?' * len(task_ids))})"
+            params.extend(task_ids)
+
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(query, params)
+            await db.commit()
+            return cursor.rowcount or 0
+
+    async def delete_old_async_tasks(self, retention_hours: int) -> int:
+        """Delete finished jobs older than retention_hours.
+
+        Retention is measured from completion so a long-running job is never
+        pruned while a client is still polling it.
+        """
+        retention_hours = max(1, int(retention_hours))
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                """
+                DELETE FROM async_tasks
+                WHERE status IN ('succeeded', 'failed')
+                  AND COALESCE(completed_at, created_at) < datetime('now', ?)
+                """,
+                (f"-{retention_hours} hours",),
+            )
+            await db.commit()
+            return cursor.rowcount or 0
 
     # Token stats operations (kept for compatibility, now delegates to specific methods)
     async def increment_token_stats(self, token_id: int, stat_type: str):
