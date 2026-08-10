@@ -29,6 +29,9 @@ def _make_tm():
     tm._refresh_locks = {}
     tm._refresh_lock_guard = MagicMock()
     tm._get_token_lock = AsyncMock(return_value=asyncio.Lock())
+    # Post-merge state: upstream's AT-validation cache (set in __init__, which
+    # this fixture bypasses via __new__).
+    tm._at_validation_cache = {}
     return tm
 
 
