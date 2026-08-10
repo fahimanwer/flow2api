@@ -669,13 +669,16 @@ class ImportTokenItem(BaseModel):
     video_enabled: bool = True
     image_concurrency: int = -1
     video_concurrency: int = -1
-    protocol_mode: str = "session"
+    # Protocol-login fields: None = "not in the import file" — update_token then
+    # SKIPS them, so re-importing an old backup can't reset a token's protocol
+    # mode/refresh settings to defaults. (add_token normalizes None to defaults.)
+    protocol_mode: Optional[str] = None
     google_cookies: Optional[str] = None
     login_account: Optional[str] = None
     login_password: Optional[str] = None
     proxy_url: Optional[str] = None
-    auto_refresh_enabled: bool = True
-    refresh_interval_minutes: int = 120
+    auto_refresh_enabled: Optional[bool] = None
+    refresh_interval_minutes: Optional[int] = None
 
 
 class ImportTokensRequest(BaseModel):
@@ -1487,13 +1490,15 @@ async def import_tokens(
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
                         video_concurrency=item.video_concurrency,
-                        protocol_mode=item.protocol_mode,
+                        protocol_mode=item.protocol_mode or "session",
                         google_cookies=item.google_cookies,
                         login_account=item.login_account,
                         login_password=item.login_password,
                         proxy_url=item.proxy_url,
-                        auto_refresh_enabled=item.auto_refresh_enabled,
-                        refresh_interval_minutes=item.refresh_interval_minutes
+                        # Import fields are None when absent from the file — for a brand-new
+                        # token coalesce to the normal add-time defaults.
+                        auto_refresh_enabled=True if item.auto_refresh_enabled is None else item.auto_refresh_enabled,
+                        refresh_interval_minutes=item.refresh_interval_minutes or 120
                     )
                     # 如果过期则禁用
                     if is_expired:
@@ -1947,13 +1952,21 @@ async def update_token_refresh_enabled(
     request: Optional[dict] = None,
     token: str = Depends(verify_admin_token)
 ):
-    """Update protocol ST refresh enabled; AT refresh remains always enabled."""
-    enabled = (request or {}).get("enabled")
-    if enabled is not None:
-        await db.update_token_refresh_config(enabled=bool(enabled))
+    """Legacy console endpoint — compatibility NO-OP (pre-merge semantics).
+
+    The retained console's "Auto-refresh AT" toggle posts {"enabled": bool} here;
+    AT refresh is always on, so that must stay a no-op. Upstream repurposed this
+    route to flip the hidden protocol-ST refresher, which would let the legacy
+    toggle silently change an unrelated background feature. Changing protocol
+    refresh now requires the explicit {"protocol": true} flag (or use
+    /api/token-refresh/config)."""
+    body = request or {}
+    if body.get("protocol") is True and body.get("enabled") is not None:
+        await db.update_token_refresh_config(enabled=bool(body.get("enabled")))
+        return {"success": True, "message": "协议 ST 刷新配置已更新"}
     return {
         "success": True,
-        "message": "刷新配置已更新"
+        "message": "Flow2API的AT自动刷新默认启用且无法关闭"
     }
 
 
@@ -2784,7 +2797,9 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 google_cookies=request.get("google_cookies"),
                 login_account=request.get("login_account"),
                 login_password=request.get("login_password"),
-                proxy_url=request.get("proxy_url"),
+                # NOTE: request["proxy_url"] is the worker extension's residential
+                # REDEEM proxy (persisted as redeem_proxy_url below) — it must never
+                # overwrite the protocol-login proxy_url field.
                 auto_refresh_enabled=request.get("auto_refresh_enabled"),
                 refresh_interval_minutes=request.get("refresh_interval_minutes"),
             )
@@ -2848,7 +2863,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 google_cookies=request.get("google_cookies"),
                 login_account=request.get("login_account"),
                 login_password=request.get("login_password"),
-                proxy_url=request.get("proxy_url"),
+                # NOTE: request["proxy_url"] is the worker's residential REDEEM proxy
+                # (persisted as redeem_proxy_url below), NOT the protocol-login proxy.
                 auto_refresh_enabled=request.get("auto_refresh_enabled", True),
                 refresh_interval_minutes=request.get("refresh_interval_minutes", 120),
             )

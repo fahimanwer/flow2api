@@ -1578,9 +1578,9 @@ class GenerationHandler:
             error_msg = f"Generation failed: {str(e)}"
             debug_logger.log_error(f"[GENERATION] ❌ {error_msg}")
             if token:
-                # 记录错误（环境/验证码类错误不计入自动禁用阈值，避免误禁有效 token；
-                # record_error 内部自带环境/配额/reCAPTCHA 分类 — upstream 的
-                # _should_count_token_error 由此路径吸收）
+                # 记录错误（环境/验证码/容量类错误不计入自动禁用阈值，避免误禁有效 token；
+                # 分类集中在 TokenManager.record_error：capacity/solver → 忽略，
+                # environmental → reCAPTCHA 冷却，quota → 模型级冷却）
                 await self.token_manager.record_error(token.id, error_msg, model)
 
             # 先将最终失败状态落库，再返回错误响应，避免日志停在 102。
@@ -1620,39 +1620,6 @@ class GenerationHandler:
             return "No token available for image generation. All tokens are disabled, cooling down, locked, or expired."
         else:
             return "No token available for video generation. All tokens are disabled, cooling down, out of quota, or expired."
-
-    def _should_count_token_error(self, error: Exception) -> bool:
-        """判断失败是否应计入 token 连续错误。
-
-        reCAPTCHA 获取失败、验证码供应商错误、打码资源不足等问题通常不是账号本身异常；
-        若将其纳入连续错误，会在回归测试或代理波动时把 token 自动打成 inactive。
-        """
-        error_text = str(error or "").strip().lower()
-        if not error_text:
-            return True
-
-        non_token_fault_markers = (
-            "failed to obtain recaptcha token",
-            "recaptcha evaluation failed",
-            "recaptcha 验证失败",
-            "recaptcha 错误",
-            "public_error_unusual_activity",
-            "too much traffic",
-            "error_no_slot_available",
-            "打码服务资源不足",
-            "打码服务资源阻塞",
-            "yescaptcha",
-            "capsolver",
-            "capmonster",
-            "ezcaptcha",
-        )
-        if any(marker in error_text for marker in non_token_fault_markers):
-            return False
-
-        if "没有可用的token进行" in error_text:
-            return False
-
-        return True
 
     async def _handle_image_generation(
         self,

@@ -134,7 +134,7 @@ class FlowClient:
         """清理请求链路绑定的浏览器指纹。"""
         self._set_request_fingerprint(None)
 
-    def _get_primary_accept_language(self, fallback: str = "zh-CN,zh;q=0.9") -> str:
+    def _get_primary_accept_language(self, fallback: str = "en-US,en;q=0.9") -> str:
         fingerprint = self.get_request_fingerprint()
         if isinstance(fingerprint, dict):
             accept_language = str(fingerprint.get("accept_language") or "").strip()
@@ -218,7 +218,7 @@ class FlowClient:
     def _normalize_accept_language_header(
         self,
         accept_language: Optional[str],
-        fallback: str = "zh-CN,zh;q=0.9",
+        fallback: str = "en-US,en;q=0.9",
     ) -> str:
         raw = str(accept_language or "").strip()
         if not raw:
@@ -310,7 +310,7 @@ class FlowClient:
         headers = {
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": self._get_primary_accept_language(fallback="zh-CN,zh;q=0.9"),
+            "Accept-Language": self._get_primary_accept_language(fallback="en-US,en;q=0.9"),
             "Content-Type": content_type,
             "Origin": "https://labs.google",
             "Priority": "u=1, i",
@@ -686,7 +686,7 @@ class FlowClient:
         effective_user_agent = str(fingerprint_user_agent or self._generate_user_agent(account_id)).strip()
         headers.setdefault("Content-Type", "application/json")
         headers.setdefault("User-Agent", effective_user_agent)
-        headers.setdefault("Accept-Language", self._get_primary_accept_language(fallback="zh-CN,zh;q=0.9"))
+        headers.setdefault("Accept-Language", self._get_primary_accept_language(fallback="en-US,en;q=0.9"))
 
         if isinstance(fingerprint, dict):
             if fingerprint.get("accept_language"):
@@ -2335,7 +2335,7 @@ class FlowClient:
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Referer": referer,
             "User-Agent": self._get_effective_request_user_agent(account_id),
-            "Accept-Language": accept_language or self._get_primary_accept_language(fallback="zh-CN,zh;q=0.9"),
+            "Accept-Language": accept_language or self._get_primary_accept_language(fallback="en-US,en;q=0.9"),
             "Priority": "u=1, i",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",

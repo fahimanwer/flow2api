@@ -1,5 +1,6 @@
 """Token manager for Flow2API with AT auto-refresh"""
 import asyncio
+import re
 from dataclasses import dataclass
 import time
 from datetime import datetime, timedelta, timezone
@@ -53,6 +54,31 @@ def _is_environmental_token_error(error_message: Optional[str]) -> bool:
         return False
     lowered = error_message.lower()
     return any(marker in lowered for marker in _ENVIRONMENTAL_ERROR_MARKERS)
+
+
+# Upstream capacity / captcha-SOLVER outages: not the account's fault AND not its
+# IP reputation either — so unlike environmental errors these get NO reCAPTCHA
+# cooldown (pausing an account for Flow being busy or a solver outage is wrong)
+# and NO auto-disable count. Absorbed from upstream's _should_count_token_error.
+_CAPACITY_ERROR_MARKERS = (
+    "too much traffic",
+    "error_no_slot_available",
+    "打码服务资源不足",
+    "打码服务资源阻塞",
+    "没有可用的token进行",
+    "yescaptcha",
+    "capsolver",
+    "capmonster",
+    "ezcaptcha",
+)
+
+
+def _is_capacity_or_solver_error(error_message: Optional[str]) -> bool:
+    """True if the error is upstream capacity / captcha-provider trouble."""
+    if not error_message:
+        return False
+    lowered = error_message.lower()
+    return any(marker in lowered for marker in _CAPACITY_ERROR_MARKERS)
 
 
 # Error fragments that mean the account hit a usage quota (daily/per-model). Not a
@@ -764,12 +790,12 @@ class TokenManager:
             update_fields["refresh_interval_minutes"] = self._normalize_refresh_interval(refresh_interval_minutes)
 
         # 检查token是否因429被禁用，如果是且未过期，则清空429状态
+        # NOTE: no unconditional revive here. Re-enabling a disabled account is the
+        # CALLER's policy decision — the plugin session-push path (admin.py) revives
+        # auto-disabled accounts and honors auto_enable_on_update for manual ones.
+        # An unconditional is_active=True here (upstream behavior) would resurrect
+        # manually disabled accounts on every worker credential push.
         token = await self.db.get_token(token_id)
-        if credential_updated and token and not token.is_active:
-            debug_logger.log_info(f"[UPDATE_TOKEN] Token {token_id} 已更新凭证，自动恢复为启用状态")
-            update_fields["is_active"] = True
-            update_fields["ban_reason"] = None
-            update_fields["banned_at"] = None
 
         if token and token.ban_reason == "429_rate_limit":
             # 检查token是否过期
@@ -951,20 +977,32 @@ class TokenManager:
     def _is_auth_error(self, error: Exception) -> bool:
         """True iff the error is an authentication failure (ST/AT invalid).
 
-        Prefers the structured status code/reason from FlowAPIError and only
-        falls back to substring matching for legacy/wrapped errors.
+        Prefers the structured status code/reason from FlowAPIError. The legacy
+        string fallback is deliberately NARROW ("HTTP ... 401" / UNAUTHENTICATED):
+        a bare "401" substring also matches ports/byte counts inside transport
+        errors, which would misclassify a network blip as an expired credential
+        and (via refresh_and_check) disable a healthy token.
         """
         if isinstance(error, FlowAPIError):
             return error.status_code == 401 or error.reason == "UNAUTHENTICATED"
         error_msg = str(error)
-        return "401" in error_msg or "UNAUTHENTICATED" in error_msg
+        if "UNAUTHENTICATED" in error_msg:
+            return True
+        return bool(re.search(r"\bHTTP\b[^0-9]{0,20}\b401\b|\bstatus(?:\s+code)?[:= ]\s*401\b", error_msg, re.IGNORECASE))
 
     def _classify_refresh_error(self, error: Exception) -> str:
-        """Map a refresh exception to a RefreshOutcome reason."""
-        if self._is_auth_error(error):
+        """Map a refresh exception to a RefreshOutcome reason.
+
+        Order matters: structured auth first (precise), then transport (so a
+        timeout/proxy error can never fall through to the string-auth match),
+        then the narrow legacy-string auth fallback.
+        """
+        if isinstance(error, FlowAPIError) and (error.status_code == 401 or error.reason == "UNAUTHENTICATED"):
             return "st_expired"
         if self.flow_client._is_timeout_error(error) or self.flow_client._is_proxy_connection_error(error):
             return "network"
+        if self._is_auth_error(error):
+            return "st_expired"
         return "unknown"
 
     async def _do_refresh_at(self, token_id: int, st: str, token: Optional[Token] = None) -> RefreshOutcome:
@@ -1246,9 +1284,15 @@ class TokenManager:
                     updates["credits"] = credits_result.get("credits", 0)
                     updates["user_paygate_tier"] = credits_result.get("userPaygateTier")
                 except Exception as e:
+                    # An AUTH failure here means the freshly minted AT is invalid — that is
+                    # a failed refresh, not a cosmetic balance miss. Only transport blips
+                    # are tolerated (AT already obtained; validation was just unreachable).
+                    if self._is_auth_error(e):
+                        raise RuntimeError(f"AT 验证失败 (401/UNAUTHENTICATED): {e}") from e
                     debug_logger.log_warning(f"[PROTOCOL_REFRESH] Token {token_id}: 刷新余额失败 - {e}")
 
                 await self.db.update_token(token_id, **updates)
+                self._mark_at_valid(token_id)
                 record_token_refresh("at", "success")
                 debug_logger.log_info(f"[PROTOCOL_REFRESH] Token {token_id}: 协议刷新 ST/AT 成功")
             except Exception as e:
@@ -1371,6 +1415,15 @@ class TokenManager:
         not token validity. Counting them would auto-disable an otherwise-valid
         (often paid) token after a burst of transient reCAPTCHA rejections.
         """
+        if _is_capacity_or_solver_error(error_message):
+            # Flow capacity / captcha-solver outage: not the account's fault and not its
+            # IP reputation — no disable count, and no reCAPTCHA cooldown either.
+            debug_logger.log_info(
+                f"[TOKEN] Token {token_id} hit an upstream capacity/solver error; "
+                f"not counting toward auto-disable: {str(error_message)[:120]}"
+            )
+            return
+
         if _is_environmental_token_error(error_message):
             # Anti-bot/reCAPTCHA rejection: don't count it toward auto-disable (it's IP/
             # fingerprint reputation, not token health) BUT apply a progressive per-account
