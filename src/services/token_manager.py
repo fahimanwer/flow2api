@@ -1385,13 +1385,16 @@ class TokenManager:
             )
             if login_result.get("success") and login_result.get("session_token"):
                 new_st = str(login_result["session_token"]).strip()
+                # CANDIDATE only — never written here. The caller feeds it to
+                # validate-then-promote, which commits st+at TOGETHER under the lock
+                # only after the API accepts the AT. Writing st alone (and unlocked)
+                # could pair a dead ST with a valid AT a concurrent push just promoted.
                 await self.db.update_token(
                     token_id,
-                    st=new_st,
                     last_st_refresh_at=datetime.now(timezone.utc),
-                    last_st_refresh_result="success",
+                    last_st_refresh_result="minted (pending verification)",
                 )
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 协议刷新 ST 成功")
+                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 协议刷新 ST 成功 (candidate)")
                 record_token_refresh("st", "success")
                 return new_st
 
@@ -1466,9 +1469,9 @@ class TokenManager:
                 record_token_refresh("st", "failure")
                 return None
             if new_st and new_st != token.st:
-                # 更新数据库中的 ST
-                await self.db.update_token(token_id, st=new_st)
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST 已自动更新")
+                # CANDIDATE only: the caller commits st+at together under the lock after
+                # the API accepts the AT (validate-then-promote). No unlocked st write.
+                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 获取到新 ST (candidate, pending verification)")
                 record_token_refresh("st", "success")
                 return new_st
             elif new_st == token.st:
