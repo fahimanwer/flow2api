@@ -419,6 +419,15 @@ async function setBadge(state) {
       chrome.action.setTitle({ title: "Flow2API Worker — Google Labs login required" });
       return;
     }
+    // Grant expired: the cookie is still there (so login_required never fires) but Google
+    // stopped renewing this account's access token. Only a human sign-out/sign-in fixes it.
+    // Separate persisted state — NOT login_required, which is cleared by mere cookie presence.
+    if (await isGrantExpired()) {
+      chrome.action.setBadgeText({ text: "!" });
+      chrome.action.setBadgeBackgroundColor({ color: "#f06262" });
+      chrome.action.setTitle({ title: "Flow2API Worker — sign out of Google Labs and sign back in, then Reconnect" });
+      return;
+    }
     // Login is fine — surface an available update on the icon (blue ↑) so it can't be missed.
     const { updateInfo } = await chrome.storage.local.get(["updateInfo"]);
     if (updateInfo && updateInfo.updateAvailable) {
@@ -509,6 +518,46 @@ async function clearLoginRequired() {
     setBadge("ok");
     await log("SUCCESS", "Google Labs session restored");
   }
+}
+
+/* ------------------------- grant-expired state ------------------------ */
+// Set ONLY when the server answers a session push with action=relogin_required (it
+// verified the access token inside our cookie against Google's API and it is dead).
+// Cleared ONLY by a push the server confirms as credential_verified — never by the cookie
+// merely being present, which is exactly the trap that kept accounts flapping for weeks.
+async function isGrantExpired() {
+  try { const { grantExpired } = await chrome.storage.local.get(["grantExpired"]); return !!(grantExpired && grantExpired.state === "grant_expired"); }
+  catch (_) { return false; }
+}
+
+async function setGrantExpired(message) {
+  const was = await isGrantExpired();
+  await chrome.storage.local.set({ grantExpired: { state: "grant_expired", since: Date.now(), message: message || "" } });
+  setBadge("ok"); // falls through to the grant-expired branch (login_required still outranks it)
+  await log("ERROR", "Google stopped renewing this account's access token — sign out of Google Labs, sign back in, then click Reconnect", { message: (message || "").slice(0, 160) });
+  if (!was) notifyGrantExpired();
+}
+
+async function clearGrantExpired() {
+  if (await isGrantExpired()) {
+    await chrome.storage.local.remove("grantExpired");
+    setBadge("ok");
+    await log("SUCCESS", "Google access token verified — account healthy again");
+  }
+}
+
+async function notifyGrantExpired() {
+  try {
+    await chrome.notifications.create("flow2api_grant_" + Date.now(), {
+      type: "basic",
+      iconUrl: "data:image/svg+xml;base64," + btoa(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" rx="18" fill="#f06262"/><text x="48" y="68" font-size="64" text-anchor="middle" fill="#fff" font-family="sans-serif">!</text></svg>'
+      ),
+      title: "Flow2API Worker — please sign in again",
+      message: "Google stopped renewing this account's access token. Sign OUT of Google Labs, sign back IN, then click Reconnect in the extension.",
+      priority: 2
+    });
+  } catch (_) {}
 }
 
 /* --------------------------- tab utilities --------------------------- */
@@ -984,11 +1033,17 @@ async function connectWS() {
       tokenQueue = tokenQueue.then(() => handleGetToken(data, settings, socket)).catch(() => {});
     }
     if (data.type === "refresh_session") {
-      // Direct call (NOT tokenQueue): refreshSession's common path is tab-free
-      // (cookie read + POST), so it can't conflict with an in-flight mint, and the
-      // only tab-reloading path (empty-cookie fallback) is already mint-busy-guarded.
-      // Queueing behind a long (video) mint would blow the backend's 30s wait.
-      handleRefreshSession(data, socket);
+      if (data.reload) {
+        // Forced reload navigates the Labs tab → must be serialized behind mints
+        // (tokenQueue) exactly like the periodic roll; the server waits longer (45s) for it.
+        tokenQueue = tokenQueue.then(() => handleRefreshSession(data, socket)).catch(() => {});
+      } else {
+        // Direct call (NOT tokenQueue): refreshSession's common path is tab-free
+        // (cookie read + POST), so it can't conflict with an in-flight mint, and the
+        // only tab-reloading path (empty-cookie fallback) is already mint-busy-guarded.
+        // Queueing behind a long (video) mint would blow the backend's 30s wait.
+        handleRefreshSession(data, socket);
+      }
     }
   };
 
@@ -1112,7 +1167,7 @@ async function maybeReloadForRoll() {
   await log("INFO", "Proactive reload rolled session cookie", { tabId, prevTtlMs: ttl });
 }
 
-async function refreshSession(token_id = null) {
+async function refreshSession(token_id = null, opts = {}) {
   const settings = await getSettings();
   if (!settings.serverBase || !settings.connectionToken) {
     await log("INFO", "Session refresh skipped (need Server URL + Connection Token)");
@@ -1125,6 +1180,23 @@ async function refreshSession(token_id = null) {
     // (login-aware: won't spin up tabs while a re-login is required).
     if (settings.tabMode === "persistent") {
       await maybeEnsurePersistentTab();
+    }
+    // Forced reload (server found our access token dead): navigate Labs FIRST so
+    // NextAuth gets a chance to renew the grant, then push. Never yank the tab from
+    // under a mint — the caller (handleRefreshSession) already serializes via tokenQueue,
+    // this is the belt to that suspender.
+    if (opts.reload && settings.tabMode === "persistent") {
+      if (mintInFlight || (Date.now() - lastMintAt < RELOAD_ACTIVE_MS)) {
+        return { success: false, error: "busy minting, retry next cycle", reason: "busy" };
+      }
+      const reloadedTab = await rollSessionTab(); // never throws; arms breaker on login bounce
+      if (reloadedTab == null) {
+        const auth = await getAuthState();
+        if (auth.state === "login_required") return { success: false, error: "login required", reason: "logged_out" };
+      } else {
+        await sleep(COOKIE_SETTLE_MS);
+      }
+      await log("INFO", "Forced Labs reload before session push (server reported a dead access token)");
     }
     // Read the session-token cookie directly (no extra tab needed).
     let cookie = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
@@ -1206,7 +1278,14 @@ async function refreshSession(token_id = null) {
       };
     }
     const result = await resp.json();
+    // The server VERIFIES the access token inside our cookie against Google's API. A 2xx
+    // no longer means "healthy": honor the action before touching any state.
+    if (result && result.action === "relogin_required") {
+      await setGrantExpired(result.message);
+      return { success: false, message: result.message, action: result.action, reason: "relogin_required" };
+    }
     await clearLoginRequired(); // a valid cookie pushed -> session is healthy
+    if (!result || result.credential_verified !== false) await clearGrantExpired();
     await log("SUCCESS", "Session token pushed to Flow2API", { action: result.action, message: result.message });
     return { success: true, message: result.message, action: result.action, reason: "refreshed" };
   } catch (e) {
@@ -1221,7 +1300,8 @@ async function refreshSession(token_id = null) {
 async function handleRefreshSession(data, responseSocket = ws) {
   let status, msg = null, err = null;
   try {
-    const r = await refreshSession(data.token_id);
+    const r = await refreshSession(data.token_id, { reload: !!data.reload });
+    // reason carries relogin_required / refreshed / busy / logged_out / network verbatim.
     status = r.reason || (r.success ? "refreshed" : "network");
     msg = r.message || null;
     err = r.error || null;
@@ -1340,7 +1420,13 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
     return true;
   }
   if (req.action === "getConnState") {
-    sendResponse({ connected: !!(ws && ws.readyState === WebSocket.OPEN) });
+    (async () => {
+      sendResponse({
+        connected: !!(ws && ws.readyState === WebSocket.OPEN),
+        grantExpired: await isGrantExpired(),
+        loginRequired: (await getAuthState()).state === "login_required",
+      });
+    })();
     return true;
   }
   if (req.action === "getUpdateInfo") {

@@ -973,6 +973,29 @@ class Database:
                 )
             """)
 
+            # Account-health cooldowns, keyed by (token, kind) so kinds never overwrite
+            # each other (a throttle must not shorten a 2h reCAPTCHA pause, hence a
+            # SIBLING table, not a `kind` column on recaptcha_cooldowns).
+            #   at_stale — Google Labs session cookie still valid but the access token
+            #              inside it is dead/not renewed (API 401). Not an expired
+            #              session: a human re-login on that device is the only cure.
+            #   throttle — reserved (PUBLIC_ERROR_USER_REQUESTS_THROTTLED), not wired yet.
+            # credential_fingerprint = hash of the AT that failed; lets a later success
+            # on a NEWER credential clear the entry while an older in-flight success
+            # (same fingerprint) cannot mask a fresher failure.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS token_health_cooldowns (
+                    token_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    until TIMESTAMP NOT NULL,
+                    strikes INTEGER NOT NULL DEFAULT 1,
+                    first_failure_at TIMESTAMP,
+                    last_failure_at TIMESTAMP,
+                    credential_fingerprint TEXT,
+                    PRIMARY KEY (token_id, kind)
+                )
+            """)
+
             # Coordinated residential-IP balancing: which pool port (= which IP) each
             # device (route_key) is assigned. Server hands out the least-loaded port so
             # each account gets its own IP while IPs are free, then spreads evenly.
@@ -1275,6 +1298,54 @@ class Database:
     async def delete_recaptcha_cooldown(self, token_id: int):
         async with self._connect(write=True) as db:
             await db.execute("DELETE FROM recaptcha_cooldowns WHERE token_id = ?", (token_id,))
+            await db.commit()
+
+    # ---- Account-health cooldowns (at_stale / throttle), keyed by (token, kind) ----
+    async def upsert_token_health_cooldown(
+        self,
+        token_id: int,
+        kind: str,
+        until: datetime,
+        strikes: int,
+        first_failure_at: datetime,
+        last_failure_at: datetime,
+        credential_fingerprint: Optional[str],
+    ):
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "INSERT INTO token_health_cooldowns "
+                "(token_id, kind, until, strikes, first_failure_at, last_failure_at, credential_fingerprint) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(token_id, kind) DO UPDATE SET until = excluded.until, strikes = excluded.strikes, "
+                "first_failure_at = excluded.first_failure_at, last_failure_at = excluded.last_failure_at, "
+                "credential_fingerprint = excluded.credential_fingerprint",
+                (
+                    token_id, kind, until.isoformat(), int(strikes),
+                    first_failure_at.isoformat(), last_failure_at.isoformat(), credential_fingerprint,
+                ),
+            )
+            await db.commit()
+
+    async def get_recent_token_health_cooldowns(self, max_age_hours: int = 3) -> List[tuple]:
+        """Rows still cooling OR expired within max_age_hours — strike memory must outlive
+        the pause itself (an at_stale strike window is 2h) so a restart can't reset it."""
+        cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT token_id, kind, until, strikes, first_failure_at, last_failure_at, credential_fingerprint "
+                "FROM token_health_cooldowns WHERE until > ?",
+                (cutoff_iso,),
+            )
+            return [tuple(row) for row in await cursor.fetchall()]
+
+    async def delete_token_health_cooldown(self, token_id: int, kind: Optional[str] = None):
+        async with self._connect(write=True) as db:
+            if kind is None:
+                await db.execute("DELETE FROM token_health_cooldowns WHERE token_id = ?", (token_id,))
+            else:
+                await db.execute(
+                    "DELETE FROM token_health_cooldowns WHERE token_id = ? AND kind = ?", (token_id, kind)
+                )
             await db.commit()
 
     # ---- Coordinated residential-IP (proxy-port) assignment per device ----

@@ -213,6 +213,12 @@ class LoadBalancer:
             if self.token_manager.is_recaptcha_cooldown(token.id):
                 filtered_reasons[token.id] = "reCAPTCHA 冷却中（账号级）"
                 continue
+            # Account-health pause (at_stale: Google stopped renewing this account's access
+            # token — cookie alive, API 401). Skip it entirely; the refresh leader handles
+            # device reload / threshold disable. See TokenManager._handle_at_stale.
+            if self.token_manager.is_health_cooldown(token.id):
+                filtered_reasons[token.id] = self.token_manager.health_cooldown_reason(token.id) or "账号健康冷却中"
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             # Image generation is exempt from paygate-tier gating (free accounts
             # can generate images on Flow); only video enforces account tier.
@@ -390,6 +396,16 @@ class LoadBalancer:
             return (
                 "All accounts are briefly cooling down after reCAPTCHA / unusual-activity "
                 "checks; they auto-recover shortly (progressive backoff)."
+            )
+
+        # All otherwise-usable accounts are paused for a dead Google access token
+        # (at_stale) — a human must sign out/in on those worker devices.
+        if supported_tokens and all(
+            self.token_manager.is_health_cooldown(t.id, "at_stale") for t in supported_tokens
+        ):
+            return (
+                "All accounts are paused: Google stopped renewing their access tokens. "
+                "Sign out of Google Labs and back in on the worker devices (the extension shows a red '!')."
             )
 
         # All otherwise-usable tokens have exhausted THIS model's quota (other

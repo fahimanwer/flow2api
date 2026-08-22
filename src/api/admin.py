@@ -2784,15 +2784,32 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     else:
         existing_token = await db.get_token_by_email(email)
 
+    # Legacy extensions (< 3.3.5) ignore `action` and clear their login state on any 2xx,
+    # so they must keep receiving the old "updated" action; only newer builds understand
+    # relogin_required (persisted grant_expired state + red badge + notification).
+    ext_supports_relogin = _ext_version_at_least(reported_ext_version, (3, 3, 5))
+
     if existing_token:
         # Update existing token
         try:
-            # Update token
+            # VALIDATE-THEN-PROMOTE: the ST/AT pair is stored only if the API accepts the
+            # access token. A session whose embedded AT Google stopped renewing (cookie
+            # alive, API 401 = at_stale) must never overwrite working credentials nor
+            # re-enable the account — that loop is what kept 30 accounts flapping hourly.
+            outcome = await token_manager.validate_and_promote(
+                existing_token.id, session_token, source="plugin_push"
+            )
+            if not outcome.success and outcome.reason == "st_expired":
+                raise HTTPException(status_code=400, detail="Invalid session token (expired)")
+            if not outcome.success and outcome.reason not in ("at_stale",):
+                # Transport/unknown failure talking to Google: nothing stored; let the
+                # device retry next cycle (non-400 ⇒ extension treats it as network).
+                raise HTTPException(status_code=503, detail=f"Could not verify session with Google ({outcome.reason}); retry")
+            credential_ok = outcome.success
+
+            # Non-credential fields (protocol-login settings) are independent of the AT.
             await token_manager.update_token(
                 token_id=existing_token.id,
-                st=session_token,
-                at=at,
-                at_expires=at_expires,
                 protocol_mode=request.get("protocol_mode"),
                 google_cookies=request.get("google_cookies"),
                 login_account=request.get("login_account"),
@@ -2828,29 +2845,51 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                     f"route_key={_redeem_updates.get('extension_route_key', '(kept)')}"
                 )
 
-            # Auto-recover a disabled account. A fresh session push means the credential
-            # is healthy again, so if the account was AUTO-disabled (auto_* reason, e.g.
-            # ST expiry) we re-enable it. A MANUALLY disabled account (ban_reason NULL) is
-            # only revived when the admin opted into the broad auto_enable_on_update.
-            auto_disabled = (existing_token.ban_reason or "") in token_manager.AUTO_DISABLE_REASONS
-            if not existing_token.is_active and (auto_disabled or plugin_config.auto_enable_on_update):
+            if not credential_ok:
+                # at_stale: cookie alive, access token dead. Credentials untouched, no
+                # re-enable. Tell a capable device to show "sign out / sign in"; older
+                # builds just see a normal update (they'd clear login state on any 2xx).
+                debug_logger.op_warning(
+                    f"[TOKEN] push for token={existing_token.id} ({email}) carries a DEAD access token "
+                    f"(ext={reported_ext_version or '?'}) — not promoted, not enabled; device re-login needed"
+                )
+                return {
+                    "success": True,
+                    "message": f"Google is no longer renewing this account's access token — sign out of Google Labs and back in, then Reconnect ({email})",
+                    "action": "relogin_required" if ext_supports_relogin else "updated",
+                    "credential_verified": False,
+                }
+
+            # Auto-recover a disabled account — ONLY now that the pushed credential is
+            # VERIFIED. A verified login proves an auth-class ban (auto_st_expired /
+            # auto_at_stale) is healed; it proves nothing about auto_error / 429 bans, so
+            # those are never lifted by a push. A MANUAL disable (ban_reason NULL) is
+            # revived only when the admin opted into auto_enable_on_update.
+            ban = existing_token.ban_reason or ""
+            auth_disabled = ban in token_manager.AUTH_DISABLE_REASONS
+            manual_disabled = not ban
+            if not existing_token.is_active and (auth_disabled or (manual_disabled and plugin_config.auto_enable_on_update)):
                 await token_manager.enable_token(existing_token.id)
                 debug_logger.event(
                     f"[TOKEN] auto-re-enabled token={existing_token.id} ({email}) "
-                    f"was={existing_token.ban_reason or 'manual'}"
+                    f"was={existing_token.ban_reason or 'manual'} (credential verified)"
                 )
                 return {
                     "success": True,
                     "message": f"Token updated and auto-enabled for {email}",
                     "action": "updated",
-                    "auto_enabled": True
+                    "auto_enabled": True,
+                    "credential_verified": True,
                 }
 
             return {
                 "success": True,
                 "message": f"Token updated for {email}",
-                "action": "updated"
+                "action": "updated",
+                "credential_verified": True,
             }
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to update token: {str(e)}")
     else:
@@ -2885,14 +2924,52 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             if _redeem_updates:
                 await db.update_token(new_token.id, **_redeem_updates)
 
+            # add_token swallows a get_credits failure and creates an ACTIVE token. Verify
+            # the access token here: a dead grant becomes an INACTIVE row (auto_at_stale)
+            # so it is visible in the admin but never enters the pool, and the device is
+            # told to re-login.
+            try:
+                await token_manager.flow_client.get_credits(new_token.at)
+            except Exception as probe_err:
+                if token_manager._is_auth_error(probe_err):
+                    await token_manager.disable_token(new_token.id, reason="auto_at_stale")
+                    debug_logger.op_warning(
+                        f"[TOKEN] new token={new_token.id} ({new_token.email}) added with a DEAD access token "
+                        f"— created inactive (auto_at_stale); device re-login needed"
+                    )
+                    return {
+                        "success": True,
+                        "message": f"Account added but Google is not renewing its access token — sign out of Google Labs and back in, then Reconnect ({new_token.email})",
+                        "action": "relogin_required" if ext_supports_relogin else "added",
+                        "token_id": new_token.id,
+                        "credential_verified": False,
+                    }
+                # transport blip: keep the active token (AT likely fine)
+
             return {
                 "success": True,
                 "message": f"Token added for {new_token.email}",
                 "action": "added",
-                "token_id": new_token.id
+                "token_id": new_token.id,
+                "credential_verified": True,
             }
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to add token: {str(e)}")
+
+
+def _ext_version_at_least(version: Optional[str], minimum: tuple) -> bool:
+    """Dotted-numeric compare of a reported extension version ("3.3.5") against `minimum`.
+    Unknown/unparseable ⇒ False (treat as legacy)."""
+    if not version:
+        return False
+    try:
+        parts = tuple(int(p) for p in str(version).strip().split(".")[:3])
+    except Exception:
+        return False
+    parts = parts + (0,) * (3 - len(parts))
+    return parts >= tuple(minimum)
 
 
 @router.post("/api/plugin/check-tokens")
