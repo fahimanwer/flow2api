@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, W
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.config import LEGACY_PRINCIPAL, config
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -812,7 +813,7 @@ async def _iterate_gemini_stream(
 
 
 @router.get("/v1/models")
-async def list_models(api_key: str = Depends(verify_api_key_flexible)):
+async def list_models(principal: str = Depends(verify_api_key_flexible)):
     """List available models."""
     models = [
         {
@@ -828,7 +829,7 @@ async def list_models(api_key: str = Depends(verify_api_key_flexible)):
 
 
 @router.get("/v1/models/aliases")
-async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
+async def list_model_aliases(principal: str = Depends(verify_api_key_flexible)):
     """List simplified model aliases for generationConfig-based resolution."""
     aliases = get_base_model_aliases()
     alias_models = []
@@ -847,7 +848,7 @@ async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
 
 @router.get("/v1beta/models")
 @router.get("/models")
-async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
+async def list_gemini_models(principal: str = Depends(verify_api_key_flexible)):
     """List available models using Gemini-compatible response shape."""
     catalog = _get_gemini_model_catalog()
     return {
@@ -860,7 +861,7 @@ async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
 
 @router.get("/v1beta/models/{model}")
 @router.get("/models/{model}")
-async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_flexible)):
+async def get_gemini_model(model: str, principal: str = Depends(verify_api_key_flexible)):
     """Return a single model using Gemini-compatible response shape."""
     catalog = _get_gemini_model_catalog()
     description = catalog.get(model)
@@ -877,7 +878,7 @@ async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_fle
 async def create_chat_completion(
     request: ChatCompletionRequest,
     raw_request: Request,
-    api_key: str = Depends(verify_api_key_flexible),
+    principal: str = Depends(verify_api_key_flexible),
 ):
     """OpenAI-compatible unified generation endpoint."""
     try:
@@ -927,7 +928,7 @@ async def generate_content(
     model: str,
     request: GeminiGenerateContentRequest,
     raw_request: Request,
-    api_key: str = Depends(verify_api_key_flexible),
+    principal: str = Depends(verify_api_key_flexible),
 ):
     """Gemini official generateContent endpoint."""
     try:
@@ -974,7 +975,7 @@ async def stream_generate_content(
     request: GeminiGenerateContentRequest,
     raw_request: Request,
     alt: Optional[str] = Query(None),
-    api_key: str = Depends(verify_api_key_flexible),
+    principal: str = Depends(verify_api_key_flexible),
 ):
     """Gemini official streamGenerateContent endpoint."""
     try:
@@ -1050,11 +1051,23 @@ def _build_openai_error_payload(status_code: int, message: str) -> Dict[str, Any
     }
 
 
-async def _lookup_async_task(task_id: str, api_key: str) -> AsyncTask:
+def _legacy_api_key_for(principal: str) -> Optional[str]:
+    """Raw key for the legacy-hash task lookup; only the legacy principal gets one.
+
+    Jobs created before principals existed are owned by sha256(raw key). The
+    legacy principal is, by definition, whoever holds the current single key,
+    so its raw value is the one the fallback needs.
+    """
+    if principal == LEGACY_PRINCIPAL:
+        return config.api_key or None
+    return None
+
+
+async def _lookup_async_task(task_id: str, principal: str) -> AsyncTask:
     manager = _ensure_async_task_manager()
-    task = await manager.get(task_id, api_key)
+    task = await manager.get(task_id, principal, legacy_api_key=_legacy_api_key_for(principal))
     if task is None:
-        # Also the answer for a task owned by a different API key: an unknown
+        # Also the answer for a task owned by a different principal: an unknown
         # task id and someone else's task are indistinguishable on purpose.
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     return task
@@ -1062,7 +1075,7 @@ async def _lookup_async_task(task_id: str, api_key: str) -> AsyncTask:
 
 async def _submit_async_generation(
     *,
-    api_key: str,
+    principal: str,
     idempotency_key: Optional[str],
     response_format: str,
     normalized: NormalizedGenerationRequest,
@@ -1089,12 +1102,13 @@ async def _submit_async_generation(
         )
 
     task, replayed = await manager.submit(
-        api_key=api_key,
+        principal=principal,
         model=normalized.model,
         prompt=normalized.prompt,
         run=run,
         response_format=response_format,
         idempotency_key=idempotency_key,
+        legacy_api_key=_legacy_api_key_for(principal),
     )
     return JSONResponse(
         status_code=200 if replayed else 202,
@@ -1107,14 +1121,16 @@ async def submit_async_chat_completion(
     request: AsyncGenerationRequest,
     raw_request: Request,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-    api_key: str = Depends(verify_api_key_flexible),
+    principal: str = Depends(verify_api_key_flexible),
 ):
     """Start an OpenAI-shaped generation and return a task handle immediately."""
     manager = _ensure_async_task_manager()
     try:
         resolved_key = _resolve_idempotency_key(idempotency_key, request.idempotency_key)
         if resolved_key:
-            existing = await manager.find_by_idempotency_key(api_key, resolved_key)
+            existing = await manager.find_by_idempotency_key(
+                principal, resolved_key, legacy_api_key=_legacy_api_key_for(principal)
+            )
             if existing:
                 return JSONResponse(
                     status_code=200,
@@ -1134,7 +1150,7 @@ async def submit_async_chat_completion(
                                   == "failed_image") else "auto"
 
         return await _submit_async_generation(
-            api_key=api_key,
+            principal=principal,
             idempotency_key=resolved_key,
             response_format="openai",
             normalized=normalized,
@@ -1154,7 +1170,7 @@ async def submit_async_generate_content(
     request: GeminiGenerateContentRequest,
     raw_request: Request,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-    api_key: str = Depends(verify_api_key_flexible),
+    principal: str = Depends(verify_api_key_flexible),
 ):
     """Start a Gemini-shaped generateContent and return a task handle immediately."""
     manager = _ensure_async_task_manager()
@@ -1162,7 +1178,9 @@ async def submit_async_generate_content(
         body_key = getattr(request, "idempotency_key", None)
         resolved_key = _resolve_idempotency_key(idempotency_key, body_key)
         if resolved_key:
-            existing = await manager.find_by_idempotency_key(api_key, resolved_key)
+            existing = await manager.find_by_idempotency_key(
+                principal, resolved_key, legacy_api_key=_legacy_api_key_for(principal)
+            )
             if existing:
                 return JSONResponse(
                     status_code=200,
@@ -1174,7 +1192,7 @@ async def submit_async_generate_content(
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         return await _submit_async_generation(
-            api_key=api_key,
+            principal=principal,
             idempotency_key=resolved_key,
             response_format="gemini",
             normalized=normalized,
@@ -1195,20 +1213,20 @@ async def submit_async_generate_content(
 @router.get("/v1/async/tasks/{task_id}")
 async def get_async_task_status(
     task_id: str,
-    api_key: str = Depends(verify_api_key_flexible),
+    principal: str = Depends(verify_api_key_flexible),
 ):
     """Report the lifecycle state of an async job."""
-    task = await _lookup_async_task(task_id, api_key)
+    task = await _lookup_async_task(task_id, principal)
     return _build_async_task_payload(task)
 
 
 @router.get("/v1/async/tasks/{task_id}/result")
 async def get_async_task_result(
     task_id: str,
-    api_key: str = Depends(verify_api_key_flexible),
+    principal: str = Depends(verify_api_key_flexible),
 ):
     """Return the finished job's payload in the shape its submit surface uses."""
-    task = await _lookup_async_task(task_id, api_key)
+    task = await _lookup_async_task(task_id, principal)
 
     if task.status not in TERMINAL_STATUSES:
         return JSONResponse(
@@ -1255,9 +1273,13 @@ async def captcha_websocket_endpoint(websocket: WebSocket):
     if authorization.lower().startswith("bearer "):
         api_key = authorization[7:].strip()
 
-    if not api_key or not AuthManager.verify_api_key(api_key):
+    # Same principal resolution as the HTTP endpoints: the extension carries its
+    # own named key. An unconfigured server refuses the socket outright too.
+    principal = AuthManager.resolve_principal(api_key) if config.auth_configured else None
+    if principal is None:
         await websocket.close(code=1008)
         return
+    debug_logger.log_info(f"[CAPTCHA_WS] connection authenticated as principal={principal}")
 
     # Pass the db so register-time pool_mode persistence works even when no
     # admin call has seeded the singleton yet (e.g. right after a restart).

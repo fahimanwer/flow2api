@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
+from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_api_keys, normalize_yescaptcha_task_type
 from .models import Token, TokenStats, Task, AsyncTask, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, LogCleanupConfig, TokenRefreshConfig
 
 
@@ -104,22 +104,26 @@ class Database:
         if count[0] == 0:
             admin_username = "admin"
             admin_password = "admin"
-            api_key = "han1234"
+            # No bootstrap API key: until an operator configures one, auth
+            # refuses every request with 503 rather than accepting a public default.
+            api_key = ""
+            api_keys = {}
             error_ban_threshold = 3
 
             if config_dict:
                 global_config = config_dict.get("global", {})
                 admin_username = global_config.get("admin_username", "admin")
                 admin_password = global_config.get("admin_password", "admin")
-                api_key = global_config.get("api_key", "han1234")
+                api_key = (global_config.get("api_key") or "").strip()
+                api_keys = normalize_api_keys(global_config.get("api_keys"))
 
                 admin_config = config_dict.get("admin", {})
                 error_ban_threshold = admin_config.get("error_ban_threshold", 3)
 
             await db.execute("""
-                INSERT INTO admin_config (id, username, password, api_key, error_ban_threshold)
-                VALUES (1, ?, ?, ?, ?)
-            """, (admin_username, admin_password, api_key, error_ban_threshold))
+                INSERT INTO admin_config (id, username, password, api_key, api_keys, error_ban_threshold)
+                VALUES (1, ?, ?, ?, ?, ?)
+            """, (admin_username, admin_password, api_key, json.dumps(api_keys), error_ban_threshold))
 
         # Ensure proxy_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM proxy_config")
@@ -542,12 +546,18 @@ class Database:
 
             # Check and add missing columns to admin_config table
             if await self._table_exists(db, "admin_config"):
-                if not await self._column_exists(db, "admin_config", "error_ban_threshold"):
-                    try:
-                        await db.execute("ALTER TABLE admin_config ADD COLUMN error_ban_threshold INTEGER DEFAULT 3")
-                        print("  ✓ Added column 'error_ban_threshold' to admin_config table")
-                    except Exception as e:
-                        print(f"  ✗ Failed to add column 'error_ban_threshold': {e}")
+                admin_columns_to_add = [
+                    ("error_ban_threshold", "INTEGER DEFAULT 3"),
+                    ("api_keys", "TEXT DEFAULT '{}'"),  # named principals, JSON {name: key}
+                ]
+
+                for col_name, col_type in admin_columns_to_add:
+                    if not await self._column_exists(db, "admin_config", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE admin_config ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to admin_config table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
 
             # Check and add missing columns to proxy_config table
             if await self._table_exists(db, "proxy_config"):
@@ -834,7 +844,8 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     username TEXT DEFAULT 'admin',
                     password TEXT DEFAULT 'admin',
-                    api_key TEXT DEFAULT 'han1234',
+                    api_key TEXT DEFAULT '',
+                    api_keys TEXT DEFAULT '{}',
                     error_ban_threshold INTEGER DEFAULT 3,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -2259,6 +2270,32 @@ class Database:
 
             await db.commit()
 
+    async def sync_named_api_keys_from_toml(self, config_dict: dict) -> bool:
+        """Write `[global.api_keys]` from setting.toml into admin_config.
+
+        Unlike the other config rows, which the TOML seeds only on first
+        startup, named keys are re-applied on EVERY startup whenever the TOML
+        table is non-empty. Key rotation is then "edit setting.toml, restart",
+        and a stale value left in the database can never resurrect an old key.
+        An absent/empty TOML table leaves the database row (and therefore any
+        keys set through the admin API) untouched.
+
+        Returns True when the row was changed.
+        """
+        global_config = (config_dict or {}).get("global", {})
+        toml_keys = normalize_api_keys(global_config.get("api_keys"))
+        if not toml_keys:
+            return False
+
+        current = await self.get_admin_config()
+        if current is None:
+            return False
+        if current.named_api_keys() == toml_keys:
+            return False
+
+        await self.update_admin_config(api_keys=json.dumps(toml_keys))
+        return True
+
     async def reload_config_to_memory(self):
         """
         Reload all configuration from database to in-memory Config instance.
@@ -2277,7 +2314,8 @@ class Database:
         if admin_config:
             config.set_admin_username_from_db(admin_config.username)
             config.set_admin_password_from_db(admin_config.password)
-            config.api_key = admin_config.api_key
+            config.api_key = admin_config.api_key or ""
+            config.set_api_keys(admin_config.named_api_keys())
 
         # Reload cache config
         cache_config = await self.get_cache_config()

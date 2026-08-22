@@ -15,10 +15,13 @@ These three endpoints wrap the *same* pipeline in a resumable job:
 
 `POST /models/{model}:asyncGenerateContent` works too, matching the sync route's alias.
 
-**Auth is unchanged**: the same API key, accepted the same three ways as every other endpoint —
-`Authorization: Bearer <key>`, `x-goog-api-key: <key>`, or `?key=<key>`. A job is scoped to the
-key that created it; another key asking for it gets `404`, identical to a task id that does not
-exist.
+**Auth is unchanged**: the same API keys, accepted the same three ways as every other endpoint —
+`Authorization: Bearer <key>`, `x-goog-api-key: <key>`, or `?key=<key>`. Each key belongs to a
+named **principal** (`[global.api_keys]` in `setting.toml`, e.g. `ai-reels = "sk-…"`; the single
+`[global] api_key` is the principal `legacy`). A job is owned by the principal that created it,
+so rotating a principal's key keeps its jobs reachable; another principal asking for it gets
+`404`, identical to a task id that does not exist. With no key configured at all every request is
+refused with `503 authentication not configured`.
 
 **Task ids** are `gen_` + a uuid4 hex (`gen_9f2c…`), so they cannot be guessed or enumerated.
 
@@ -220,7 +223,10 @@ reconnects to the running job.
 
 - **Where state lives**: the `async_tasks` table in the existing SQLite database
   (`data/flow.db`), created by `Database.init_db()` like every other table. Nothing new to
-  provision. The API key is stored only as a SHA-256 hash.
+  provision. Ownership is stored as `principal:<name>`; the key itself never lands in the
+  database. Rows written before named principals existed carry `sha256(raw key)` instead and
+  stay readable only through the `legacy` single key until the 24-hour retention sweep removes
+  them.
 - **Workers are in-process.** They do not survive a restart — that is why startup fails any job
   left `queued`/`running`, so clients get a definite answer instead of polling a dead job. A
   client that sees this can safely re-submit *with a new idempotency key*; reusing the old key

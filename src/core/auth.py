@@ -1,5 +1,7 @@
 """Authentication module"""
 
+import hmac
+
 import bcrypt
 from typing import Optional
 from fastapi import Header, HTTPException, Query, Security
@@ -9,19 +11,33 @@ from .config import config
 security = HTTPBearer()
 optional_security = HTTPBearer(auto_error=False)
 
+AUTH_NOT_CONFIGURED_DETAIL = "authentication not configured"
+
+
 class AuthManager:
     """Authentication manager"""
 
     @staticmethod
+    def resolve_principal(api_key: Optional[str]) -> Optional[str]:
+        """Principal name for an API key (constant-time), or None if unknown."""
+        return config.resolve_principal(api_key)
+
+    @staticmethod
     def verify_api_key(api_key: str) -> bool:
         """Verify API key"""
-        return api_key == config.api_key
+        return config.resolve_principal(api_key) is not None
 
     @staticmethod
     def verify_admin(username: str, password: str) -> bool:
         """Verify admin credentials"""
         # Compare with current config (which may be from database or config file)
-        return username == config.admin_username and password == config.admin_password
+        username_ok = hmac.compare_digest(
+            (username or "").encode("utf-8"), (config.admin_username or "").encode("utf-8")
+        )
+        password_ok = hmac.compare_digest(
+            (password or "").encode("utf-8"), (config.admin_password or "").encode("utf-8")
+        )
+        return username_ok and password_ok
 
     @staticmethod
     def hash_password(password: str) -> str:
@@ -33,12 +49,24 @@ class AuthManager:
         """Verify password"""
         return bcrypt.checkpw(password.encode(), hashed.encode())
 
-async def verify_api_key_header(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
-    """Verify API key from Authorization header"""
-    api_key = credentials.credentials
-    if not AuthManager.verify_api_key(api_key):
+
+def authenticate_api_key(api_key: Optional[str]) -> str:
+    """Resolve a presented key to its principal or raise the matching HTTP error.
+
+    With no key configured at all the answer is 503, never 401: a fresh install
+    must fail closed without ever hinting that some key would have worked.
+    """
+    if not config.auth_configured:
+        raise HTTPException(status_code=503, detail=AUTH_NOT_CONFIGURED_DETAIL)
+    principal = AuthManager.resolve_principal(api_key)
+    if principal is None:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
+    return principal
+
+
+async def verify_api_key_header(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
+    """Verify the Authorization header and return the caller's principal name."""
+    return authenticate_api_key(credentials.credentials)
 
 
 async def verify_api_key_flexible(
@@ -46,7 +74,7 @@ async def verify_api_key_flexible(
     x_goog_api_key: Optional[str] = Header(None, alias="x-goog-api-key"),
     key: Optional[str] = Query(None),
 ) -> str:
-    """Verify API key from Authorization header, x-goog-api-key header, or key query param."""
+    """Verify the API key from Authorization, x-goog-api-key, or ?key= and return the principal."""
     api_key = None
 
     if credentials is not None:
@@ -56,7 +84,4 @@ async def verify_api_key_flexible(
     elif key:
         api_key = key
 
-    if not api_key or not AuthManager.verify_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    return api_key
+    return authenticate_api_key(api_key)

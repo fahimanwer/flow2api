@@ -1,5 +1,7 @@
 """Data models for Flow2API"""
 
+import json
+
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, List, Union, Any, Literal
 from datetime import datetime
@@ -168,8 +170,17 @@ class AdminConfig(BaseModel):
     id: int = 1
     username: str
     password: str
-    api_key: str
+    api_key: str = ""  # legacy single key; empty = not configured
+    api_keys: Optional[str] = "{}"  # named principals, JSON {name: key}
     error_ban_threshold: int = 3  # Auto-disable token after N consecutive errors
+
+    def named_api_keys(self) -> dict:
+        """Decode the api_keys column; a corrupt value reads as no named keys."""
+        from .config import normalize_api_keys
+        try:
+            return normalize_api_keys(json.loads(self.api_keys or "{}"))
+        except (TypeError, ValueError):
+            return {}
 
 
 class ProxyConfig(BaseModel):

@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import json
 import uuid
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiosqlite
 
@@ -28,6 +28,12 @@ STATUS_SUCCEEDED = "succeeded"
 STATUS_FAILED = "failed"
 
 TERMINAL_STATUSES = (STATUS_SUCCEEDED, STATUS_FAILED)
+
+# Ownership values stored in async_tasks.api_key_hash. New rows carry the
+# principal name so rotating a key never strands its jobs; rows written before
+# principals existed carry sha256(raw key) and are only reachable through the
+# legacy single key (see AsyncTaskManager.owner_values).
+PRINCIPAL_OWNER_PREFIX = "principal:"
 
 
 class AsyncTaskManager:
@@ -50,8 +56,28 @@ class AsyncTaskManager:
 
     @staticmethod
     def hash_api_key(api_key: str) -> str:
-        """Scope key for a job. Hashed so the API key never lands in the DB."""
+        """Pre-principal owner value: sha256 of the raw key, never the key itself."""
         return hashlib.sha256(api_key.encode()).hexdigest()
+
+    @staticmethod
+    def principal_owner(principal: str) -> str:
+        """Owner value written for every new job."""
+        if not principal:
+            raise ValueError("principal must be a non-empty string")
+        return f"{PRINCIPAL_OWNER_PREFIX}{principal}"
+
+    @classmethod
+    def owner_values(cls, principal: str, legacy_api_key: Optional[str] = None) -> List[str]:
+        """Owner values a caller may read, most specific first.
+
+        The legacy raw-key hash is consulted only when the caller authenticated
+        with the legacy single key (the route passes that key through); named
+        principals never see hash-owned rows.
+        """
+        values = [cls.principal_owner(principal)]
+        if legacy_api_key:
+            values.append(cls.hash_api_key(legacy_api_key))
+        return values
 
     @staticmethod
     def _new_task_id() -> str:
@@ -60,22 +86,25 @@ class AsyncTaskManager:
     async def submit(
         self,
         *,
-        api_key: str,
+        principal: str,
         model: str,
         prompt: str,
         run: Callable[[], Awaitable[str]],
         response_format: str = "openai",
         idempotency_key: Optional[str] = None,
+        legacy_api_key: Optional[str] = None,
     ) -> tuple[AsyncTask, bool]:
         """Start a generation and return (job, replayed) immediately.
 
-        When idempotency_key matches an existing job for this API key, that job
-        is returned with replayed=True and nothing new is started.
+        When idempotency_key matches an existing job for this principal, that
+        job is returned with replayed=True and nothing new is started.
         """
-        api_key_hash = self.hash_api_key(api_key)
+        owner = self.principal_owner(principal)
 
         if idempotency_key:
-            existing = await self.db.get_async_task_by_idempotency_key(api_key_hash, idempotency_key)
+            existing = await self.find_by_idempotency_key(
+                principal, idempotency_key, legacy_api_key=legacy_api_key
+            )
             if existing:
                 debug_logger.log_info(
                     f"[ASYNC] 幂等命中，复用任务: {existing.task_id} (status={existing.status})"
@@ -84,7 +113,7 @@ class AsyncTaskManager:
 
         task = AsyncTask(
             task_id=self._new_task_id(),
-            api_key_hash=api_key_hash,
+            api_key_hash=owner,
             idempotency_key=idempotency_key,
             status=STATUS_QUEUED,
             response_format=response_format,
@@ -98,7 +127,7 @@ class AsyncTaskManager:
             # Two submits with the same idempotency key raced; the loser returns
             # the winner's job rather than starting a second generation.
             if idempotency_key:
-                existing = await self.db.get_async_task_by_idempotency_key(api_key_hash, idempotency_key)
+                existing = await self.db.get_async_task_by_idempotency_key(owner, idempotency_key)
                 if existing:
                     debug_logger.log_info(
                         f"[ASYNC] 幂等竞争，复用已有任务: {existing.task_id}"
@@ -108,24 +137,34 @@ class AsyncTaskManager:
 
         # Read back so the caller sees the stored row, including the timestamps
         # SQLite fills in.
-        stored = await self.db.get_async_task(task.task_id, api_key_hash) or task
+        stored = await self.db.get_async_task(task.task_id, owner) or task
 
         worker = asyncio.create_task(self._run_task(task.task_id, run))
         self._workers[task.task_id] = worker
         worker.add_done_callback(lambda _, tid=task.task_id: self._workers.pop(tid, None))
 
-        debug_logger.log_info(f"[ASYNC] 已提交任务 {task.task_id} (model={model})")
+        debug_logger.log_info(f"[ASYNC] 已提交任务 {task.task_id} (model={model}, principal={principal})")
         return stored, False
 
-    async def get(self, task_id: str, api_key: str) -> Optional[AsyncTask]:
-        """Read a job, scoped to the API key that created it."""
-        return await self.db.get_async_task(task_id, self.hash_api_key(api_key))
+    async def get(
+        self, task_id: str, principal: str, legacy_api_key: Optional[str] = None
+    ) -> Optional[AsyncTask]:
+        """Read a job, scoped to the principal that created it."""
+        for owner in self.owner_values(principal, legacy_api_key):
+            task = await self.db.get_async_task(task_id, owner)
+            if task:
+                return task
+        return None
 
-    async def find_by_idempotency_key(self, api_key: str, idempotency_key: str) -> Optional[AsyncTask]:
-        """Find this key's existing job for an idempotency key, if any."""
-        return await self.db.get_async_task_by_idempotency_key(
-            self.hash_api_key(api_key), idempotency_key
-        )
+    async def find_by_idempotency_key(
+        self, principal: str, idempotency_key: str, legacy_api_key: Optional[str] = None
+    ) -> Optional[AsyncTask]:
+        """Find this principal's existing job for an idempotency key, if any."""
+        for owner in self.owner_values(principal, legacy_api_key):
+            task = await self.db.get_async_task_by_idempotency_key(owner, idempotency_key)
+            if task:
+                return task
+        return None
 
     async def _run_task(self, task_id: str, run: Callable[[], Awaitable[str]]):
         """Background worker: run the generation and record its outcome."""

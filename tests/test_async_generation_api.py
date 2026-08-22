@@ -13,8 +13,10 @@ from src.core.database import Database
 from src.core.models import AsyncGenerationRequest, AsyncTask, GeminiGenerateContentRequest
 from src.services.async_task_manager import AsyncTaskManager
 
-API_KEY = "test-key"
-OTHER_API_KEY = "other-key"
+# Callers are identified by principal name; the auth dependency resolves the
+# presented key to one of these before any route code runs.
+PRINCIPAL = "ai-reels"
+OTHER_PRINCIPAL = "content-factory"
 VIDEO_OUTPUT = '<video src="http://localhost:8000/tmp/clip.mp4" controls></video>'
 
 
@@ -176,18 +178,18 @@ class AsyncTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.shutdown()
         self._temp_dir.cleanup()
 
-    async def _submit(self, run, idempotency_key=None, api_key=API_KEY):
+    async def _submit(self, run, idempotency_key=None, principal=PRINCIPAL):
         return await self.manager.submit(
-            api_key=api_key,
+            principal=principal,
             model="veo_3_1_t2v",
             prompt="a cat",
             run=run,
             idempotency_key=idempotency_key,
         )
 
-    async def _await_terminal(self, task_id: str, api_key: str = API_KEY) -> AsyncTask:
+    async def _await_terminal(self, task_id: str, principal: str = PRINCIPAL) -> AsyncTask:
         for _ in range(200):
-            task = await self.manager.get(task_id, api_key)
+            task = await self.manager.get(task_id, principal)
             if task.status in ("succeeded", "failed"):
                 return task
             await asyncio.sleep(0.01)
@@ -249,12 +251,12 @@ class AsyncTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.task_id, first.task_id)
         self.assertEqual(len(runs), 1)
 
-    async def test_idempotency_is_scoped_per_api_key(self):
+    async def test_idempotency_is_scoped_per_principal(self):
         async def run():
             return _openai_payload(VIDEO_OUTPUT)
 
-        first, _ = await self._submit(run, idempotency_key="job-1", api_key=API_KEY)
-        second, replayed = await self._submit(run, idempotency_key="job-1", api_key=OTHER_API_KEY)
+        first, _ = await self._submit(run, idempotency_key="job-1", principal=PRINCIPAL)
+        second, replayed = await self._submit(run, idempotency_key="job-1", principal=OTHER_PRINCIPAL)
 
         self.assertNotEqual(second.task_id, first.task_id)
         self.assertFalse(replayed)
@@ -268,22 +270,23 @@ class AsyncTaskManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.task_id.startswith("gen_"))
         self.assertEqual(len(task.task_id), len("gen_") + 32)
 
-    async def test_other_api_key_cannot_read_a_task(self):
+    async def test_other_principal_cannot_read_a_task(self):
         async def run():
             return _openai_payload(VIDEO_OUTPUT)
 
         task, _ = await self._submit(run)
 
-        self.assertIsNone(await self.manager.get(task.task_id, OTHER_API_KEY))
+        self.assertIsNone(await self.manager.get(task.task_id, OTHER_PRINCIPAL))
 
-    async def test_api_key_is_not_stored_in_the_database(self):
+    async def test_new_rows_are_owned_by_principal_not_key_hash(self):
         async def run():
             return _openai_payload(VIDEO_OUTPUT)
 
         task, _ = await self._submit(run)
 
-        stored = await self.db.get_async_task(task.task_id, AsyncTaskManager.hash_api_key(API_KEY))
-        self.assertNotIn(API_KEY, stored.api_key_hash)
+        stored = await self.db.get_async_task(task.task_id, "principal:" + PRINCIPAL)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.api_key_hash, "principal:" + PRINCIPAL)
 
 
 class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
@@ -317,12 +320,12 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
             request=request,
             raw_request=_fake_request(),
             idempotency_key=idempotency_key,
-            api_key=API_KEY,
+            principal=PRINCIPAL,
         )
 
-    async def _await_terminal(self, task_id: str, api_key: str = API_KEY):
+    async def _await_terminal(self, task_id: str, principal: str = PRINCIPAL):
         for _ in range(200):
-            task = await self.manager.get(task_id, api_key)
+            task = await self.manager.get(task_id, principal)
             if task.status in ("succeeded", "failed"):
                 return task
             await asyncio.sleep(0.01)
@@ -360,13 +363,13 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
                 request=request,
                 raw_request=_fake_request(),
                 idempotency_key=None,
-                api_key=API_KEY,
+                principal=PRINCIPAL,
             )
 
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(len(handler.calls), 0)
         # The idempotency key stays free for a corrected re-submit.
-        self.assertIsNone(await self.manager.find_by_idempotency_key(API_KEY, "job-typo"))
+        self.assertIsNone(await self.manager.find_by_idempotency_key(PRINCIPAL, "job-typo"))
 
     async def test_result_is_425_until_the_job_finishes(self):
         gate = asyncio.Event()
@@ -375,14 +378,14 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
         submit_body = _response_json(await self._submit_openai())
         task_id = submit_body["task_id"]
 
-        pending = await routes.get_async_task_result(task_id=task_id, api_key=API_KEY)
+        pending = await routes.get_async_task_result(task_id=task_id, principal=PRINCIPAL)
         self.assertEqual(pending.status_code, 425)
         self.assertEqual(pending.headers["retry-after"], str(routes.ASYNC_RESULT_RETRY_AFTER_SECONDS))
 
         gate.set()
         await self._await_terminal(task_id)
 
-        finished = await routes.get_async_task_result(task_id=task_id, api_key=API_KEY)
+        finished = await routes.get_async_task_result(task_id=task_id, principal=PRINCIPAL)
         self.assertEqual(finished.status_code, 200)
         self.assertEqual(
             _response_json(finished)["choices"][0]["message"]["content"],
@@ -395,14 +398,14 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
 
         task_id = _response_json(await self._submit_openai())["task_id"]
 
-        status = await routes.get_async_task_status(task_id=task_id, api_key=API_KEY)
+        status = await routes.get_async_task_status(task_id=task_id, principal=PRINCIPAL)
         self.assertIn(status["status"], ("queued", "running"))
         self.assertNotIn("error", status)
 
         gate.set()
         await self._await_terminal(task_id)
 
-        status = await routes.get_async_task_status(task_id=task_id, api_key=API_KEY)
+        status = await routes.get_async_task_status(task_id=task_id, principal=PRINCIPAL)
         self.assertEqual(status["status"], "succeeded")
         self.assertIsNotNone(status["completed_at"])
 
@@ -412,11 +415,11 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
         task_id = _response_json(await self._submit_openai())["task_id"]
         await self._await_terminal(task_id)
 
-        status = await routes.get_async_task_status(task_id=task_id, api_key=API_KEY)
+        status = await routes.get_async_task_status(task_id=task_id, principal=PRINCIPAL)
         self.assertEqual(status["status"], "failed")
         self.assertEqual(status["error"], "No available token")
 
-        result = await routes.get_async_task_result(task_id=task_id, api_key=API_KEY)
+        result = await routes.get_async_task_result(task_id=task_id, principal=PRINCIPAL)
         self.assertEqual(result.status_code, 503)
         self.assertEqual(_response_json(result)["error"]["message"], "No available token")
 
@@ -426,7 +429,7 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
         task_id = _response_json(await self._submit_openai())["task_id"]
         await self._await_terminal(task_id)
 
-        result = await routes.get_async_task_result(task_id=task_id, api_key=API_KEY)
+        result = await routes.get_async_task_result(task_id=task_id, principal=PRINCIPAL)
         self.assertEqual(result.status_code, 500)
         self.assertIn("upstream exploded", _response_json(result)["error"]["message"])
 
@@ -436,11 +439,11 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
         await self._await_terminal(task_id)
 
         with self.assertRaises(routes.HTTPException) as unknown:
-            await routes.get_async_task_status(task_id="gen_does_not_exist", api_key=API_KEY)
+            await routes.get_async_task_status(task_id="gen_does_not_exist", principal=PRINCIPAL)
         self.assertEqual(unknown.exception.status_code, 404)
 
         with self.assertRaises(routes.HTTPException) as foreign:
-            await routes.get_async_task_status(task_id=task_id, api_key=OTHER_API_KEY)
+            await routes.get_async_task_status(task_id=task_id, principal=OTHER_PRINCIPAL)
         self.assertEqual(foreign.exception.status_code, 404)
 
     async def test_idempotent_resubmit_returns_the_same_task_without_regenerating(self):
@@ -477,13 +480,13 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
             request=request,
             raw_request=_fake_request(),
             idempotency_key="gem-1",
-            api_key=API_KEY,
+            principal=PRINCIPAL,
         )
         submit_body = _response_json(submit)
         self.assertEqual(submit.status_code, 202)
         await self._await_terminal(submit_body["task_id"])
 
-        result = await routes.get_async_task_result(task_id=submit_body["task_id"], api_key=API_KEY)
+        result = await routes.get_async_task_result(task_id=submit_body["task_id"], principal=PRINCIPAL)
         body = _response_json(result)
 
         self.assertEqual(result.status_code, 200)
@@ -504,12 +507,12 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
                 request=request,
                 raw_request=_fake_request(),
                 idempotency_key=None,
-                api_key=API_KEY,
+                principal=PRINCIPAL,
             )
         )
         await self._await_terminal(submit_body["task_id"])
 
-        result = await routes.get_async_task_result(task_id=submit_body["task_id"], api_key=API_KEY)
+        result = await routes.get_async_task_result(task_id=submit_body["task_id"], principal=PRINCIPAL)
         body = _response_json(result)
 
         self.assertEqual(result.status_code, 503)
@@ -528,7 +531,7 @@ class AsyncGenerationRouteTests(unittest.IsolatedAsyncioTestCase):
                 request=request,
                 raw_request=_fake_request({"host": "flow.example.com", "x-flow-pool": "failed_image"}),
                 idempotency_key=None,
-                api_key=API_KEY,
+                principal=PRINCIPAL,
             )
         )
         await self._await_terminal(body["task_id"])
@@ -551,8 +554,8 @@ class AsyncEndpointAuthTests(unittest.TestCase):
 
         for endpoint in endpoints:
             with self.subTest(endpoint=endpoint.__name__):
-                api_key_param = inspect.signature(endpoint).parameters["api_key"]
-                self.assertIs(api_key_param.default.dependency, verify_api_key_flexible)
+                principal_param = inspect.signature(endpoint).parameters["principal"]
+                self.assertIs(principal_param.default.dependency, verify_api_key_flexible)
 
 
 if __name__ == "__main__":

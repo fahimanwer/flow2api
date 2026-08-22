@@ -16,7 +16,12 @@ from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
 from ..core.database import Database
-from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha_task_type
+from ..core.config import (
+    config,
+    get_yescaptcha_min_score,
+    normalize_api_keys,
+    normalize_yescaptcha_task_type,
+)
 from ..core.models import Token
 from ..core.browser_runtime_status import (
     fail_runtime_prepare,
@@ -642,6 +647,11 @@ class ChangePasswordRequest(BaseModel):
 
 class UpdateAPIKeyRequest(BaseModel):
     new_api_key: str
+
+
+class UpdateNamedAPIKeysRequest(BaseModel):
+    # Full replacement of the named-principal table, {principal: key}.
+    api_keys: Dict[str, str]
 
 
 class UpdateDebugConfigRequest(BaseModel):
@@ -1849,6 +1859,7 @@ async def get_admin_config(token: str = Depends(verify_admin_token)):
     return {
         "admin_username": admin_config.username,
         "api_key": admin_config.api_key,
+        "api_keys": admin_config.named_api_keys(),
         "error_ban_threshold": admin_config.error_ban_threshold,
         "debug_enabled": config.debug_enabled  # Return actual debug status
     }
@@ -1888,6 +1899,30 @@ async def update_api_key(
     await db.reload_config_to_memory()
 
     return {"success": True, "message": "API Key更新成功"}
+
+
+@router.post("/api/admin/apikeys")
+async def update_named_api_keys(
+    request: UpdateNamedAPIKeysRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Replace the named API key table ({principal: key}) and hot-reload it.
+
+    A principal keeps its async tasks across a key change because ownership is
+    recorded by principal name. Note that a non-empty `[global.api_keys]` in
+    setting.toml overwrites this table again on the next restart.
+    """
+    normalized = normalize_api_keys(request.api_keys)
+    if len(normalized) != len(request.api_keys):
+        raise HTTPException(
+            status_code=400,
+            detail="api_keys entries must be non-empty strings; the name 'legacy' is reserved",
+        )
+
+    await db.update_admin_config(api_keys=json.dumps(normalized))
+    await db.reload_config_to_memory()
+
+    return {"success": True, "principals": sorted(normalized)}
 
 
 @router.post("/api/admin/debug")

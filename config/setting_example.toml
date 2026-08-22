@@ -1,7 +1,19 @@
 [global]
-api_key = "han1234"
+# Legacy single API key (principal "legacy"). Leave empty to use named keys only.
+# With NO key configured anywhere, every API request is refused with 503.
+api_key = ""
 admin_username = "admin"
 admin_password = "admin"
+
+# Named API keys: principal name -> key. Each caller gets its own key; async
+# tasks are owned by the principal, so rotating a key keeps its tasks reachable.
+# Unlike the rest of this file, a non-empty table here is re-applied to the
+# database on EVERY startup (rotation = edit here, restart). The name "legacy"
+# is reserved.
+[global.api_keys]
+# ai-reels = "replace-with-a-long-random-secret"
+# content-factory = "replace-with-a-long-random-secret"
+# extension = "replace-with-a-long-random-secret"
 
 [flow]
 labs_base_url = "https://labs.google/fx/api"

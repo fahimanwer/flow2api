@@ -112,8 +112,16 @@ async def lifespan(app: FastAPI):
         await db.check_and_migrate_db(config_dict)
         print("Database migration check completed.")
 
+    # Named API keys in setting.toml win over the database on every startup so
+    # a key rotation is "edit the file, restart" (see sync_named_api_keys_from_toml).
+    if await db.sync_named_api_keys_from_toml(config_dict):
+        print("Named API keys ([global.api_keys]) synced from setting.toml into the database.")
+
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
+    if not config.auth_configured:
+        print("WARNING: no API key configured ([global] api_key / [global.api_keys]); "
+              "every API request will be refused with 503 until one is set.")
     generation_handler.file_cache.set_timeout(config.cache_timeout)
     cache_cleanup_enabled = await generation_handler.file_cache.refresh_cleanup_task()
     captcha_config = await db.get_captcha_config()

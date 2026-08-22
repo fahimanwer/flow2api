@@ -1,4 +1,5 @@
 """Configuration management for Flow2API"""
+import hmac
 import os
 import tomli
 from pathlib import Path
@@ -22,6 +23,32 @@ def normalize_yescaptcha_task_type(task_type: Optional[str]) -> str:
 
 def get_yescaptcha_min_score(task_type: Optional[str]) -> Optional[float]:
     return YESCAPTCHA_TASK_TYPE_OPTIONS.get(normalize_yescaptcha_task_type(task_type))
+
+
+# Principal name the single `[global] api_key` authenticates as. Reserved: an
+# entry with this name in `[global.api_keys]` is ignored so the legacy-hash
+# fallback in the async task store can never be claimed by a named key.
+LEGACY_PRINCIPAL = "legacy"
+
+
+def normalize_api_keys(raw: Any) -> Dict[str, str]:
+    """Coerce a `[global.api_keys]` table into {principal: key}.
+
+    Drops entries that are not non-empty str -> non-empty str, and the reserved
+    `legacy` name. Order is preserved so a duplicated key resolves predictably.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    normalized: Dict[str, str] = {}
+    for name, key in raw.items():
+        if not isinstance(name, str) or not isinstance(key, str):
+            continue
+        name = name.strip()
+        key = key.strip()
+        if not name or not key or name == LEGACY_PRINCIPAL:
+            continue
+        normalized[name] = key
+    return normalized
 
 
 class Config:
@@ -275,11 +302,52 @@ class Config:
     # Mutable properties for runtime updates
     @property
     def api_key(self) -> str:
-        return self._config["global"]["api_key"]
+        """Legacy single API key. Empty means no legacy key is configured."""
+        value = self._config.get("global", {}).get("api_key", "")
+        return value.strip() if isinstance(value, str) else ""
 
     @api_key.setter
     def api_key(self, value: str):
-        self._config["global"]["api_key"] = value
+        self._config.setdefault("global", {})["api_key"] = (value or "").strip()
+
+    @property
+    def api_keys(self) -> Dict[str, str]:
+        """Named API keys, {principal: key}. A copy; mutate via set_api_keys."""
+        return dict(normalize_api_keys(self._config.get("global", {}).get("api_keys")))
+
+    def set_api_keys(self, mapping: Any):
+        """Replace the named API key table (normally from the database)."""
+        self._config.setdefault("global", {})["api_keys"] = normalize_api_keys(mapping)
+
+    @property
+    def auth_configured(self) -> bool:
+        """True when at least one API key (legacy or named) can authenticate."""
+        return bool(self.api_key) or bool(self.api_keys)
+
+    def resolve_principal(self, api_key: Optional[str]) -> Optional[str]:
+        """Map a presented API key to its principal name, or None.
+
+        Every configured key is compared with hmac.compare_digest and the loop
+        never breaks early, so timing does not reveal which (if any) key
+        matched. The legacy key is checked first, then the named table in
+        config order, so a key string duplicated across principals resolves
+        to the first one.
+        """
+        if not isinstance(api_key, str) or not api_key:
+            return None
+        presented = api_key.encode("utf-8")
+
+        candidates = []
+        legacy_key = self.api_key
+        if legacy_key:
+            candidates.append((LEGACY_PRINCIPAL, legacy_key))
+        candidates.extend(self.api_keys.items())
+
+        matched: Optional[str] = None
+        for principal, key in candidates:
+            if hmac.compare_digest(key.encode("utf-8"), presented) and matched is None:
+                matched = principal
+        return matched
 
     @property
     def admin_password(self) -> str:

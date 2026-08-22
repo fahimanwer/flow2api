@@ -6,6 +6,7 @@ gRecaptchaResponse 与 userAgent。Google reCAPTCHA V3 评估会校验 token 与
 UA, 否则服务端判定 UNUSUAL_ACTIVITY 并返回 reCAPTCHA evaluation failed。
 """
 
+import contextvars
 import unittest
 from unittest.mock import patch, AsyncMock, MagicMock
 
@@ -62,6 +63,10 @@ class ApiCaptchaFingerprintTests(unittest.IsolatedAsyncioTestCase):
         """_get_api_captcha_token 必须返回 (token, userAgent) 元组。"""
         flow = FlowClient.__new__(FlowClient)
         flow.proxy_manager = _FakeProxyManager()
+        # __init__ is bypassed; the captcha path reads the per-request fingerprint
+        # contextvar and the per-account UA cache.
+        flow._request_fingerprint_ctx = contextvars.ContextVar("flow_request_fingerprint", default=None)
+        flow._user_agent_cache = {}
         fake_session = _FakeAsyncSession()
 
         with patch("src.services.flow_client.AsyncSession", lambda *a, **kw: fake_session), \
