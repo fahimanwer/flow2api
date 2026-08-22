@@ -360,3 +360,31 @@ class LockScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.verified)
         self.assertTrue(tm.is_health_cooldown(32))            # NOT cleared
         self.assertFalse(tm._has_recent_at_validation(32))   # NOT marked valid
+
+    async def test_stale_failure_after_a_verified_push_records_no_strike(self):
+        """Ordering race: the leader's attempt fails (lock released), a verified push then
+        promotes a fresh credential, and only afterwards does the leader get to record its
+        strike. The strike must be discarded (snapshot changed) and the fresh credential
+        re-verified — never paused."""
+        tm = _make_tm()
+        tm._health_cd = {}
+        tm.db.upsert_token_health_cooldown = AsyncMock()
+        tm.db.delete_token_health_cooldown = AsyncMock()
+        tm._try_protocol_refresh_st = AsyncMock(return_value=None)
+        tm._try_refresh_st_via_extension = AsyncMock(return_value=None)
+        tm.disable_token = AsyncMock()
+        old = MagicMock(id=40, at="DEADAT", st="st_old", is_active=True)
+        fresh = MagicMock(id=40, at="FRESHAT", st="st_new", is_active=True)
+        # By the time _handle_at_stale re-reads under the lock, the push has landed.
+        tm.db.get_token = AsyncMock(return_value=fresh)
+        tm.flow_client.st_to_at = AsyncMock(return_value={"access_token": "FRESHAT", "expires": None})
+        tm.flow_client.get_credits = AsyncMock(return_value={"credits": 5, "userPaygateTier": "T"})
+        failed = RefreshOutcome(False, "at_stale", verified=False, candidate_fp=tm._credential_fingerprint("DEADAT"))
+        from unittest.mock import patch
+        with patch("src.services.token_manager.config") as cfg:
+            cfg.captcha_method = "extension"
+            out = await tm._handle_at_stale(40, old, failed, escalate=True)
+        self.assertTrue(out.success and out.verified)
+        self.assertFalse(tm.is_health_cooldown(40))
+        self.assertEqual(tm.db.upsert_token_health_cooldown.await_count, 0)
+        self.assertEqual(tm._try_refresh_st_via_extension.await_count, 0)

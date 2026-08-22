@@ -766,6 +766,7 @@ class TokenManager:
         refresh_interval_minutes: int = 120,
         is_active: bool = True,
         ban_reason: Optional[str] = None,
+        session_result: Optional[dict] = None,
     ) -> Token:
         """Add a new token and prepare its pooled projects. is_active=False creates the
         row disabled from the start (caller verified the credential is dead) so a dead
@@ -776,7 +777,9 @@ class TokenManager:
 
         debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
         try:
-            result = await self.flow_client.st_to_at(st)
+            # A caller that already fetched (and verified) the session passes it in, so the
+            # AT we store is exactly the one it probed — never a second, unprobed mint.
+            result = session_result if session_result else await self.flow_client.st_to_at(st)
             at = result["access_token"]
             expires = result.get("expires")
             user_info = result.get("user", {})
@@ -1150,7 +1153,21 @@ class TokenManager:
         candidate_fp = failed.candidate_fp or self._credential_fingerprint(token.at)
         strike = None
         if escalate:
-            strike = await self._record_at_stale(token_id, candidate_fp)
+            # Record the strike UNDER the lock after re-checking the serving snapshot: a
+            # verified push may have promoted a fresh credential between our failed
+            # attempt (lock released) and now — then this failure is stale and must not
+            # pause the fresh credential. Holding the lock here means a push cannot
+            # interleave between the check and the write.
+            refresh_lock = await self._get_token_lock(self._refresh_locks, self._refresh_lock_guard, token_id)
+            async with refresh_lock:
+                latest = await self.db.get_token(token_id)
+                if latest and self._snapshot_fp(latest) != serving_fp:
+                    debug_logger.log_info(
+                        f"[AT_REFRESH] token={token_id} stale failure discarded — credential changed meanwhile"
+                    )
+                    fresh = await self._do_refresh_at(token_id, latest.st, latest)
+                    return fresh
+                strike = await self._record_at_stale(token_id, candidate_fp)
             if not strike.get("escalated"):
                 # Concurrent straggler inside an active pause: nothing more to do.
                 return RefreshOutcome(False, "at_stale", verified=False, candidate_fp=candidate_fp)
@@ -1517,75 +1534,41 @@ class TokenManager:
             return None
 
     async def _refresh_protocol_token(self, token: Token, now: datetime) -> None:
+        """Protocol-login healer for one token. The protocol ST mint (Google login I/O)
+        runs WITHOUT the credential lock; the result then goes through the same
+        validate-then-promote path as every other credential (lock held only for
+        st_to_at + get_credits + commit). Only a VERIFIED credential clears health or
+        re-enables an auto_at_stale row."""
         token_id = int(token.id)
-        refresh_lock = await self._get_token_lock(
-            self._refresh_locks,
-            self._refresh_lock_guard,
-            token_id,
-        )
-        async with refresh_lock:
-            latest = await self.db.get_token(token_id)
-            if not latest or (not latest.is_active and (latest.ban_reason or "") != "auto_at_stale"):
-                return
-            if not latest.auto_refresh_enabled:
-                return
-            if self._normalize_protocol_mode(latest.protocol_mode) != "protocol":
-                return
-            if not (latest.google_cookies or "").strip():
-                return
+        latest = await self.db.get_token(token_id)
+        if not latest or (not latest.is_active and (latest.ban_reason or "") != "auto_at_stale"):
+            return
+        if not latest.auto_refresh_enabled:
+            return
+        if self._normalize_protocol_mode(latest.protocol_mode) != "protocol":
+            return
+        if not (latest.google_cookies or "").strip():
+            return
 
-            new_st = await self._try_protocol_refresh_st(token_id, latest)
-            if not new_st:
-                return
+        new_st = await self._try_protocol_refresh_st(token_id, latest)
+        if not new_st:
+            return
 
-            try:
-                session = await self._st_to_at_for_token(latest, new_st)
-                new_at = str(session.get("access_token") or "").strip()
-                if not new_at:
-                    raise RuntimeError("ST 转 AT 响应缺少 access_token")
-
-                updates: Dict[str, Any] = {
-                    "st": new_st,
-                    "at": new_at,
-                    "at_expires": self._parse_at_expires(session.get("expires")),
-                    "last_st_refresh_at": now,
-                    "last_st_refresh_result": "success",
-                }
-                user_info = session.get("user") if isinstance(session.get("user"), dict) else {}
-                if user_info.get("email"):
-                    updates["email"] = user_info.get("email")
-                if user_info.get("name"):
-                    updates["name"] = user_info.get("name")
-
-                try:
-                    credits_result = await self._get_credits_for_token(latest, new_at)
-                    updates["credits"] = credits_result.get("credits", 0)
-                    updates["user_paygate_tier"] = credits_result.get("userPaygateTier")
-                except Exception as e:
-                    # An AUTH failure here means the freshly minted AT is invalid — that is
-                    # a failed refresh, not a cosmetic balance miss. Only transport blips
-                    # are tolerated (AT already obtained; validation was just unreachable).
-                    if self._is_auth_error(e):
-                        raise RuntimeError(f"AT 验证失败 (401/UNAUTHENTICATED): {e}") from e
-                    debug_logger.log_warning(f"[PROTOCOL_REFRESH] Token {token_id}: 刷新余额失败 - {e}")
-
-                await self.db.update_token(token_id, **updates)
-                self._mark_at_valid(token_id)
-                await self._note_verified_at(token_id, new_at)
-                if not latest.is_active and (latest.ban_reason or "") == "auto_at_stale":
-                    await self.enable_token(token_id)
-                    debug_logger.event(f"[PROTOCOL_REFRESH] token={token_id} auto_at_stale healed via protocol login — re-enabled")
-                record_token_refresh("at", "success")
-                debug_logger.log_info(f"[PROTOCOL_REFRESH] Token {token_id}: 协议刷新 ST/AT 成功")
-            except Exception as e:
-                await self.db.update_token(
-                    token_id,
-                    st=new_st,
-                    last_st_refresh_at=now,
-                    last_st_refresh_result=str(e),
-                )
-                record_token_refresh("at", "failure")
-                debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {token_id}: 协议 ST 转 AT 失败 - {e}")
+        outcome = await self._locked_refresh(token_id, new_st, latest)
+        if outcome.success and outcome.verified:
+            await self.db.update_token(token_id, last_st_refresh_at=now, last_st_refresh_result="success")
+            if not latest.is_active and (latest.ban_reason or "") == "auto_at_stale":
+                await self.enable_token(token_id)
+                debug_logger.event(f"[PROTOCOL_REFRESH] token={token_id} auto_at_stale healed via protocol login — re-enabled")
+            debug_logger.log_info(f"[PROTOCOL_REFRESH] Token {token_id}: 协议刷新 ST/AT 成功")
+        elif outcome.success:
+            # Promoted but unverifiable (Google API unreachable): stored, nothing else.
+            await self.db.update_token(token_id, last_st_refresh_at=now, last_st_refresh_result="stored (unverified)")
+            record_token_refresh("at", "success")
+        else:
+            await self.db.update_token(token_id, last_st_refresh_at=now, last_st_refresh_result=f"failed: {outcome.reason}")
+            record_token_refresh("at", "failure")
+            debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {token_id}: 协议 ST 转 AT 失败 - {outcome.reason}")
 
     async def run_protocol_refresh_once(self) -> None:
         """Refresh protocol-mode tokens whose ST refresh interval is due."""
