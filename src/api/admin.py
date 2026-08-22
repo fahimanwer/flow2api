@@ -2911,18 +2911,22 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
         # active window (add_token swallows get_credits failures and would otherwise
         # insert an active row and create projects with a dead AT).
         dead_grant = False
+        probe_verified = False
         try:
             await token_manager.flow_client.get_credits(at)
+            probe_verified = True
         except Exception as probe_err:
             if token_manager._is_auth_error(probe_err):
                 dead_grant = True
-            # transport blip: proceed as before (AT likely fine)
+            # transport blip: proceed as before (AT likely fine) but report UNVERIFIED
         try:
             new_token = await token_manager.add_token(
                 st=session_token,
                 remark="Added by Chrome Extension",
                 is_active=not dead_grant,
                 ban_reason=("auto_at_stale" if dead_grant else None),
+                # The AT we probed above is the one stored (no second, unprobed mint).
+                session_result=result,
                 protocol_mode=request.get("protocol_mode", "session"),
                 google_cookies=request.get("google_cookies"),
                 login_account=request.get("login_account"),
@@ -2964,10 +2968,10 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
 
             return {
                 "success": True,
-                "message": f"Token added for {new_token.email}",
+                "message": f"Token added for {new_token.email}" + ("" if probe_verified else " (verification deferred — Google API unreachable)"),
                 "action": "added",
                 "token_id": new_token.id,
-                "credential_verified": True,
+                "credential_verified": probe_verified,
             }
         except HTTPException:
             raise
