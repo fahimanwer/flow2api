@@ -24,7 +24,13 @@ function setStatus(kind, text) {
 function refreshStatus() {
   chrome.runtime.sendMessage({ action: "getConnState" }, (r) => {
     if (chrome.runtime.lastError) return;
-    if (r && r.connected) {
+    if (r && r.grantExpired) {
+      // Server verified our Google access token is dead (cookie still present). Only a
+      // real sign-out/sign-in fixes it — say exactly that, above everything else.
+      setStatus("disconnected", "⚠️ Google needs you to sign in again: sign OUT of Google Labs, sign back IN, then click Reconnect");
+    } else if (r && r.loginRequired) {
+      setStatus("disconnected", "Signed out of Google Labs — open labs.google, sign in, then click Reconnect");
+    } else if (r && r.connected) {
       setStatus("connected", "✅ Connected — working automatically");
     } else {
       setStatus("disconnected", "Not connected yet — make sure you're signed in to Google Labs, then click Reconnect");

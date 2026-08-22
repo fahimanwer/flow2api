@@ -281,13 +281,17 @@ class ExtensionCaptchaService:
             self.pending_requests.pop(req_id, None)
 
     async def _dispatch_session_refresh_to(
-        self, conn: "ExtensionConnection", token_id: Optional[int], timeout: int
+        self, conn: "ExtensionConnection", token_id: Optional[int], timeout: int, reload: bool = False
     ) -> dict:
         """Send one refresh_session command to a specific browser and await its ack.
 
         The extension reads its LIVE Google Labs cookie and pushes it to
         /api/plugin/update-token WITH this token_id; that endpoint is email-guarded
         (409 => account_mismatch) so pushing to the wrong account is a safe no-op.
+        reload=True asks the device to navigate Labs first (Google may renew a stale
+        access token on a real page load); the extension serializes it behind mints.
+        Status may come back as ``relogin_required`` (ext ≥ 3.3.5) when the push
+        endpoint found the grant still dead after the reload.
         """
         req_id = f"refresh_{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
@@ -298,6 +302,7 @@ class ExtensionCaptchaService:
                 "req_id": req_id,
                 "route_key": conn.route_key or "",
                 "token_id": token_id,
+                "reload": bool(reload),
             }))
             result = await asyncio.wait_for(future, timeout=timeout)
             return result if isinstance(result, dict) else {"status": "error", "error": "malformed ack"}
@@ -308,7 +313,9 @@ class ExtensionCaptchaService:
         finally:
             self.pending_requests.pop(req_id, None)
 
-    async def request_session_refresh(self, token_id: Optional[int], timeout: int = 30) -> dict:
+    async def request_session_refresh(
+        self, token_id: Optional[int], timeout: int = 30, reload: bool = False
+    ) -> dict:
         """Tell the worker browser holding this account's Google Labs session to
         refresh it NOW (read the live cookie, push a fresh ST), and return the result.
 
@@ -334,8 +341,8 @@ class ExtensionCaptchaService:
                     "route_key": route_key,
                     "available": self._describe_routes() or "none",
                 }
-            debug_logger.event(f"[EXT_REFRESH] token={token_id} route_key={route_key} (bound)")
-            return await self._dispatch_session_refresh_to(conn, token_id, timeout)
+            debug_logger.event(f"[EXT_REFRESH] token={token_id} route_key={route_key} (bound{', reload' if reload else ''})")
+            return await self._dispatch_session_refresh_to(conn, token_id, timeout, reload=reload)
 
         # Shared pool: bound each attempt so a stack of offline/busy browsers can't
         # blow the caller's overall timeout. Serialize to avoid multi-tab reload storms.

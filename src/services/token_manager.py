@@ -1,5 +1,6 @@
 """Token manager for Flow2API with AT auto-refresh"""
 import asyncio
+import hashlib
 import re
 from dataclasses import dataclass
 import time
@@ -21,6 +22,10 @@ class RefreshOutcome:
     ``reason`` is one of:
       - ``ok``                    success
       - ``st_expired``            ST/credential is invalid (401 / UNAUTHENTICATED)
+      - ``at_stale``              ST still valid (session returns the user) but the
+                                  access token inside it is dead and Google is not
+                                  renewing it (API 401). Only a human re-login on the
+                                  worker device fixes this — never treat as st_expired.
       - ``network``               transport/proxy/timeout failure (token is fine)
       - ``st_refresh_unavailable``ST refresh not possible in the current mode
       - ``unknown``               unclassified failure
@@ -167,8 +172,25 @@ class TokenManager:
         # Retained after expiry (NOT popped) so strikes escalate on a repeat failure;
         # cleared only on success, or decayed inside mark_recaptcha_failure.
         self._recaptcha_cd: dict[int, tuple] = {}
+        # Account-health cooldowns keyed by (token_id, kind) — see AT_STALE_* below.
+        # Entry: {until, strikes, first_failure_at, last_failure_at, fingerprint}.
+        self._health_cd: dict[tuple, dict] = {}
         # One-time lazy load of persisted cooldowns (survives restarts). See #3.
         self._quota_loaded = False
+
+    # at_stale: the session cookie is alive but the access token Google embeds in it is
+    # dead and NOT being renewed (API 401). Escalating pause instead of a disable —
+    # each strike also asks the worker device to reload Labs (Google may renew on a
+    # real navigation). Disable (auto_at_stale) only after AT_STALE_DISABLE_STRIKES
+    # failures inside AT_STALE_DISABLE_WINDOW with NO verified success in between; any
+    # verified success clears the entry, so a healthy account can never be starved.
+    AT_STALE_BACKOFF_SECONDS = (600, 1800, 3600)   # strike 1, 2, 3+
+    AT_STALE_DISABLE_STRIKES = 3
+    AT_STALE_DISABLE_WINDOW = timedelta(hours=2)
+    # Only these bans may be lifted by a worker session push — and only after the pushed
+    # credential has been VERIFIED against the API. auto_error / 429 are not proven
+    # healed by a working login, so a push never clears them.
+    AUTH_DISABLE_REASONS = ("auto_st_expired", "auto_at_stale")
 
     # Short cooldown for a generic/ambiguous rate-limit (could be transient).
     MODEL_QUOTA_COOLDOWN_MINUTES = 30
@@ -234,6 +256,30 @@ class TokenManager:
                 debug_logger.event(f"[RECAPTCHA_CD] loaded {len(rc_rows)} persisted cooldown(s)")
         except Exception as e:
             debug_logger.op_warning(f"[RECAPTCHA_CD] could not load persisted cooldowns: {e}")
+        try:
+            h_rows = await self.db.get_recent_token_health_cooldowns()
+            for token_id, kind, until_iso, strikes, first_iso, last_iso, fp in h_rows:
+                try:
+                    self._health_cd[(int(token_id), str(kind))] = {
+                        "until": self._parse_iso_utc(until_iso),
+                        "strikes": int(strikes or 1),
+                        "first_failure_at": self._parse_iso_utc(first_iso),
+                        "last_failure_at": self._parse_iso_utc(last_iso),
+                        "fingerprint": fp,
+                    }
+                except Exception:
+                    continue
+            if h_rows:
+                debug_logger.event(f"[HEALTH_CD] loaded {len(h_rows)} persisted cooldown(s)")
+        except Exception as e:
+            debug_logger.op_warning(f"[HEALTH_CD] could not load persisted cooldowns: {e}")
+
+    @staticmethod
+    def _parse_iso_utc(value) -> Optional[datetime]:
+        if not value:
+            return None
+        dt = datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
     async def mark_model_quota_exhausted(
         self, token_id: int, model: Optional[str], error_message: Optional[str] = None
@@ -348,6 +394,90 @@ class TokenManager:
                 await self.db.delete_recaptcha_cooldown(token_id)
             except Exception as e:
                 debug_logger.op_warning(f"[RECAPTCHA_CD] could not clear cooldown: {e}")
+
+    # ---------------- account-health cooldowns (at_stale) ----------------
+
+    @staticmethod
+    def _credential_fingerprint(at: Optional[str]) -> str:
+        """Short stable id of an access token — used to tell 'same dead credential' from
+        'a newer credential landed' without ever logging the token itself."""
+        return hashlib.sha256((at or "").encode("utf-8")).hexdigest()[:16] if at else ""
+
+    def is_health_cooldown(self, token_id: int, kind: Optional[str] = None) -> bool:
+        """True while the account is paused for `kind` (any kind if None). Expired entries
+        are kept (strike memory), they just stop gating."""
+        now = datetime.now(timezone.utc)
+        for (tid, k), entry in self._health_cd.items():
+            if tid != token_id or (kind is not None and k != kind):
+                continue
+            until = entry.get("until")
+            if until and now < until:
+                return True
+        return False
+
+    def health_cooldown_reason(self, token_id: int) -> Optional[str]:
+        if self.is_health_cooldown(token_id, "at_stale"):
+            return "Google login needs attention (access token dead) — device must sign out/in"
+        if self.is_health_cooldown(token_id, "throttle"):
+            return "Google throttle cooldown"
+        return None
+
+    async def _note_verified_at(self, token_id: int, at: Optional[str]) -> None:
+        """Called whenever an AT is PROVEN to work (credits OK / generation OK). Clears an
+        at_stale entry only if the verified credential is a DIFFERENT one from the one
+        that failed — an older in-flight success on the same dead AT can't mask a newer
+        failure. Pass at=None for a generation success (the AT in use must be live)."""
+        key = (int(token_id), "at_stale")
+        entry = self._health_cd.get(key)
+        if not entry:
+            return
+        if at is not None and entry.get("fingerprint") and self._credential_fingerprint(at) == entry["fingerprint"]:
+            return
+        self._health_cd.pop(key, None)
+        try:
+            await self.db.delete_token_health_cooldown(token_id, "at_stale")
+        except Exception as e:
+            debug_logger.op_warning(f"[HEALTH_CD] could not clear at_stale: {e}")
+        debug_logger.event(f"[HEALTH_CD] token={token_id} at_stale cleared (credential verified)")
+
+    async def _record_at_stale(self, token_id: int, failing_at: Optional[str]) -> dict:
+        """Leader-only: one strike for this failure round. Escalating pause; returns the
+        entry plus `disable_due` = True when strikes reached the threshold inside the
+        rolling window with no verified success in between (the window restarts whenever
+        the entry was cleared by a success, so a healthy account cannot accumulate)."""
+        now = datetime.now(timezone.utc)
+        key = (int(token_id), "at_stale")
+        prev = self._health_cd.get(key)
+        fp = self._credential_fingerprint(failing_at)
+        if prev and prev.get("until") and now < prev["until"]:
+            # Still inside the current pause → same round (concurrent straggler); no escalation.
+            return {**prev, "disable_due": False, "escalated": False}
+        first = (prev or {}).get("first_failure_at") or now
+        strikes = int((prev or {}).get("strikes", 0)) + 1
+        if now - first > self.AT_STALE_DISABLE_WINDOW:
+            # Old burst aged out → fresh window.
+            first, strikes = now, 1
+        seconds = self.AT_STALE_BACKOFF_SECONDS[min(strikes, len(self.AT_STALE_BACKOFF_SECONDS)) - 1]
+        entry = {
+            "until": now + timedelta(seconds=seconds),
+            "strikes": strikes,
+            "first_failure_at": first,
+            "last_failure_at": now,
+            "fingerprint": fp,
+        }
+        self._health_cd[key] = entry
+        try:
+            await self.db.upsert_token_health_cooldown(
+                token_id, "at_stale", entry["until"], strikes, first, now, fp
+            )
+        except Exception as e:
+            debug_logger.op_warning(f"[HEALTH_CD] could not persist at_stale: {e}")
+        disable_due = strikes >= self.AT_STALE_DISABLE_STRIKES and (now - first) <= self.AT_STALE_DISABLE_WINDOW
+        debug_logger.event(
+            f"[HEALTH_CD] token={token_id} at_stale strike={strikes} paused {seconds}s "
+            f"(session alive, access token dead — needs device re-login){' → DISABLE' if disable_due else ''}"
+        )
+        return {**entry, "disable_due": disable_due, "escalated": True}
 
     async def _get_token_lock(
         self,
@@ -584,6 +714,12 @@ class TokenManager:
         await self.db.update_token(token_id, is_active=True, ban_reason=None, banned_at=None)
         # Reset error count when enabling (only reset total error_count, keep today_error_count)
         await self.db.reset_error_count(token_id)
+        # An explicit enable (admin or verified push) wipes health pauses + strike memory.
+        self._health_cd.pop((int(token_id), "at_stale"), None)
+        try:
+            await self.db.delete_token_health_cooldown(token_id, "at_stale")
+        except Exception as e:
+            debug_logger.op_warning(f"[HEALTH_CD] could not clear on enable: {e}")
 
     # Disable reasons the system set automatically. A token disabled for one of these
     # is eligible to be auto-re-enabled when a fresh session is pushed (the credential
@@ -870,6 +1006,11 @@ class TokenManager:
         if not token:
             return None
 
+        # Paused for a dead access token (at_stale): don't burn an API call, the load
+        # balancer already skips it; direct callers get None until the pause lapses.
+        if self.is_health_cooldown(token.id, "at_stale"):
+            return None
+
         if not self._should_refresh_at(token):
             if self._has_recent_at_validation(token.id):
                 return token
@@ -881,6 +1022,7 @@ class TokenManager:
                     user_paygate_tier=credits_result.get("userPaygateTier"),
                 )
                 self._mark_at_valid(token.id)
+                await self._note_verified_at(token.id, token.at)
                 return await self.db.get_token(token.id) or token
             except Exception as e:
                 debug_logger.log_warning(
@@ -891,6 +1033,8 @@ class TokenManager:
         if not outcome.success:
             # Only a confirmed credential failure removes the token from the
             # pool. Transient network errors leave it enabled to be retried.
+            # at_stale is handled by the refresh leader (pause → device reload →
+            # threshold disable); never disabled here.
             if disable_on_failure and outcome.reason == "st_expired":
                 debug_logger.op_warning(
                     f"[AT_REFRESH] token={token.id} ST expired → disabling (auto_st_expired; "
@@ -952,9 +1096,69 @@ class TokenManager:
                         return retry
                     outcome = retry
 
+            if outcome.reason == "at_stale":
+                outcome = await self._handle_at_stale(token_id, token)
+                if outcome.success:
+                    return outcome
+
             debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed ({outcome.reason})")
             self._clear_at_validation_cache(token_id)
             return outcome
+
+    async def _handle_at_stale(self, token_id: int, token: Token) -> RefreshOutcome:
+        """Leader-only (runs under the per-token refresh lock, inside the coalesced
+        refresh task) so ONE failure round yields ONE strike / ONE forced reload / at
+        most ONE disable — concurrent waiters just receive the outcome.
+
+        Order: record the strike (pause) → try protocol refresh for protocol tokens →
+        ask the bound worker device to reload Labs and push again (the push endpoint
+        validates and promotes only a working credential) → re-verify. If still stale
+        and the strike threshold is due, disable with ban_reason=auto_at_stale, guarded
+        by a credential CAS so a valid push that landed meanwhile is never disabled.
+        """
+        failing_at = token.at
+        strike = await self._record_at_stale(token_id, failing_at)
+        if not strike.get("escalated"):
+            # Concurrent straggler inside an active pause: nothing more to do.
+            return RefreshOutcome(False, "at_stale")
+
+        # Recovery attempt 1: protocol-mode ST refresh (no-op unless configured).
+        try:
+            protocol_st = await self._try_protocol_refresh_st(token_id, token)
+        except Exception:
+            protocol_st = None
+        if protocol_st:
+            latest = await self.db.get_token(token_id) or token
+            retry = await self._do_refresh_at(token_id, protocol_st, latest)
+            if retry.success:
+                return retry
+
+        # Recovery attempt 2: bound worker device — forced Labs reload, then push. The
+        # push goes through validate_and_promote; a still-dead grant leaves st/at
+        # untouched and tells the device to show "sign out / sign in".
+        if config.captcha_method == "extension":
+            new_st = await self._try_refresh_st_via_extension(token_id, token, reload=True)
+            if new_st:
+                latest = await self.db.get_token(token_id) or token
+                retry = await self._do_refresh_at(token_id, new_st, latest)
+                if retry.success:
+                    return retry
+
+        if strike.get("disable_due"):
+            # CAS: only disable if the credential that failed is STILL the serving one.
+            latest = await self.db.get_token(token_id)
+            if latest and latest.is_active and self._credential_fingerprint(latest.at) == strike.get("fingerprint"):
+                debug_logger.op_warning(
+                    f"[AT_REFRESH] token={token_id} access token dead for {strike.get('strikes')} "
+                    f"rounds within {self.AT_STALE_DISABLE_WINDOW} → disabling (auto_at_stale; "
+                    f"device must sign out/in to Google Labs)"
+                )
+                await self.disable_token(token_id, reason="auto_at_stale")
+            else:
+                debug_logger.log_info(
+                    f"[AT_REFRESH] token={token_id} at_stale disable skipped — credential changed or already inactive"
+                )
+        return RefreshOutcome(False, "at_stale")
 
     async def _refresh_at(self, token_id: int) -> RefreshOutcome:
         """Coalesce concurrent AT refresh calls for the same token."""
@@ -1005,6 +1209,19 @@ class TokenManager:
             return "st_expired"
         return "unknown"
 
+    async def validate_and_promote(self, token_id: int, st: str, source: str = "push") -> RefreshOutcome:
+        """Public entry for credential PUSHES (worker extension / admin import): verify the
+        session's access token against the API and only then commit st/at. Serialized
+        with the refresh path via the per-token lock. ``at_stale`` ⇒ nothing stored —
+        the caller must not re-enable and should tell the device to re-login."""
+        refresh_lock = await self._get_token_lock(self._refresh_locks, self._refresh_lock_guard, token_id)
+        async with refresh_lock:
+            token = await self.db.get_token(token_id)
+            outcome = await self._do_refresh_at(token_id, st, token)
+            if outcome.success:
+                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: credential promoted via {source}")
+            return outcome
+
     async def _do_refresh_at(self, token_id: int, st: str, token: Optional[Token] = None) -> RefreshOutcome:
         """执行 AT 刷新的核心逻辑
 
@@ -1013,9 +1230,13 @@ class TokenManager:
             st: Session Token
 
         Returns:
-            RefreshOutcome(success, reason). success=True iff a valid AT was
-            obtained. On failure, reason distinguishes st_expired / network /
-            unknown so callers can decide whether to disable the token.
+            RefreshOutcome(success, reason). success=True iff a VERIFIED AT was
+            obtained and promoted. VALIDATE-THEN-PROMOTE: the ST/AT pair is written
+            only after the API accepted the AT (or the verification merely hit a
+            transport blip). A session whose embedded AT the API rejects (401)
+            never overwrites the serving credentials — it is ``at_stale``, not
+            ``st_expired``: the cookie is alive, Google just stopped renewing the
+            access token inside it, and only a device re-login can fix that.
         """
         try:
             debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 开始刷新AT...")
@@ -1038,43 +1259,47 @@ class TokenManager:
                 except:
                     pass
 
-            # 更新数据库
-            await self.db.update_token(
-                token_id,
-                at=new_at,
-                at_expires=new_at_expires
-            )
-
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功")
-            debug_logger.log_info(f"  - 新过期时间: {new_at_expires}")
-
-            # 验证 AT 有效性：通过 get_credits 测试
+            # 验证 AT 有效性：通过 get_credits 测试 — BEFORE writing anything.
+            credits_fields: Dict[str, Any] = {}
             try:
                 credits_result = await (
                     self._get_credits_for_token(token, new_at)
                     if token is not None
                     else self.flow_client.get_credits(new_at)
                 )
-                await self.db.update_token(
-                    token_id,
-                    credits=credits_result.get("credits", 0),
-                    user_paygate_tier=credits_result.get("userPaygateTier"),
-                )
-                self._mark_at_valid(token_id)
+                credits_fields = {
+                    "credits": credits_result.get("credits", 0),
+                    "user_paygate_tier": credits_result.get("userPaygateTier"),
+                }
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT 验证成功（余额: {credits_result.get('credits', 0)}）")
-                record_token_refresh("at", "success")
-                return RefreshOutcome(True, "ok")
             except Exception as verify_err:
-                # AT 验证失败（可能返回 401），说明 ST 已过期
                 if self._is_auth_error(verify_err):
-                    debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证失败 (401)，ST 可能已过期")
+                    # Session alive (st_to_at returned a user) but the API rejects the AT
+                    # embedded in it: Google is not renewing the grant. Do NOT overwrite
+                    # the stored credentials; the caller applies the at_stale cooldown.
+                    debug_logger.op_warning(
+                        f"[AT_REFRESH] token={token_id} session alive but access token REJECTED "
+                        f"(expires={expires}); not promoting — at_stale"
+                    )
                     record_token_refresh("at", "failure")
-                    return RefreshOutcome(False, "st_expired")
-                else:
-                    # 其他错误（如网络问题），仍视为成功（AT 已写入，验证仅是网络抖动）
-                    debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {str(verify_err)}")
-                    record_token_refresh("at", "success")
-                    return RefreshOutcome(True, "ok")
+                    return RefreshOutcome(False, "at_stale")
+                # Transport blip during verification only: the AT is almost certainly fine.
+                # Keep long-standing behavior — promote it and report success.
+                debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {str(verify_err)}")
+
+            # Promote: ST + AT + expiry (+ credits when verified) in one write.
+            await self.db.update_token(
+                token_id,
+                st=st,
+                at=new_at,
+                at_expires=new_at_expires,
+                **credits_fields,
+            )
+            self._mark_at_valid(token_id)
+            await self._note_verified_at(token_id, new_at)
+            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功 (expires {new_at_expires})")
+            record_token_refresh("at", "success")
+            return RefreshOutcome(True, "ok")
 
         except Exception as e:
             reason = self._classify_refresh_error(e)
@@ -1200,7 +1425,7 @@ class TokenManager:
             record_token_refresh("st", "failure")
             return None
 
-    async def _try_refresh_st_via_extension(self, token_id: int, token) -> Optional[str]:
+    async def _try_refresh_st_via_extension(self, token_id: int, token, reload: bool = False) -> Optional[str]:
         """Extension mode ST auto-refresh: command the logged-in worker browser to
         read its live Google Labs cookie and push a fresh ST to /api/plugin/update-token
         (which writes token.st). On success we re-read the token and return the fresh ST
@@ -1212,8 +1437,18 @@ class TokenManager:
 
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 通过扩展刷新 ST...")
             service = await ExtensionCaptchaService.get_instance(self.db)
-            result = await service.request_session_refresh(token_id, timeout=30)
+            # reload=True forces a Labs navigation on the BOUND device before the push
+            # (Google may renew a stale access token on a real page load). The push
+            # endpoint validates+promotes, so a returned new ST is already verified.
+            result = await service.request_session_refresh(token_id, timeout=45 if reload else 30, reload=reload)
             status = (result or {}).get("status")
+            if status == "relogin_required":
+                debug_logger.op_warning(
+                    f"[ST_REFRESH] token={token_id} device reports Google grant dead even after reload — "
+                    f"human sign-out/sign-in required on that machine"
+                )
+                record_token_refresh("st", "failure")
+                return None
 
             if status == "refreshed":
                 updated = await self.db.get_token(token_id)
@@ -1474,6 +1709,8 @@ class TokenManager:
         # A success proves the account's reCAPTCHA/IP reputation is healthy again — reset
         # any progressive anti-bot cooldown so it isn't held back on the next request.
         await self.clear_recaptcha_cooldown(token_id)
+        # A generation succeeded → the access token in use is live → clear at_stale.
+        await self._note_verified_at(token_id, None)
 
     async def ban_token_for_429(self, token_id: int):
         """因429错误立即禁用token
