@@ -1086,8 +1086,9 @@ class Database:
                                    captcha_proxy_url, extension_route_key,
                                    protocol_mode, google_cookies, login_account, login_password,
                                    proxy_url, auto_refresh_enabled, refresh_interval_minutes,
-                                   last_st_refresh_at, last_st_refresh_result)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   last_st_refresh_at, last_st_refresh_result,
+                                   ban_reason, banned_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.st, token.at, token.at_expires, token.email, token.name, token.remark,
                   token.is_active, token.credits, token.user_paygate_tier,
                   token.current_project_id, token.current_project_name,
@@ -1097,7 +1098,8 @@ class Database:
                   token.protocol_mode, token.google_cookies, token.login_account,
                   token.login_password, token.proxy_url, token.auto_refresh_enabled,
                   token.refresh_interval_minutes, token.last_st_refresh_at,
-                  token.last_st_refresh_result))
+                  token.last_st_refresh_result,
+                  token.ban_reason, token.banned_at))
             await db.commit()
             token_id = cursor.lastrowid
 

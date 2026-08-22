@@ -1070,7 +1070,7 @@ async def refresh_at(
 
     try:
         # 调用token_manager的内部刷新方法（手动路径：永不禁用 token）
-        outcome = await token_manager._refresh_at(token_id)
+        outcome = await token_manager._refresh_at(token_id, escalate=False)  # manual: never strike/disable
 
         if outcome.success:
             # 获取更新后的token信息
@@ -2805,7 +2805,11 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 # Transport/unknown failure talking to Google: nothing stored; let the
                 # device retry next cycle (non-400 ⇒ extension treats it as network).
                 raise HTTPException(status_code=503, detail=f"Could not verify session with Google ({outcome.reason}); retry")
-            credential_ok = outcome.success
+            # Only a VERIFIED credential (API accepted the AT) may re-enable or signal the
+            # device 'healthy'. A transport-blip promotion (success but unverified) is
+            # stored, but treated as unknown for activation purposes.
+            credential_ok = outcome.success and outcome.verified
+            promoted_unverified = outcome.success and not outcome.verified
 
             # Non-credential fields (protocol-login settings) are independent of the AT.
             await token_manager.update_token(
@@ -2844,6 +2848,16 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                     f"proxy={mask_proxy_url(reported_proxy_url)} ua_set={reported_user_agent is not None} "
                     f"route_key={_redeem_updates.get('extension_route_key', '(kept)')}"
                 )
+
+            if promoted_unverified:
+                # Stored, but Google's API was unreachable for verification: no state
+                # changes that require proof (no re-enable, no 'healthy' signal).
+                return {
+                    "success": True,
+                    "message": f"Token updated for {email} (verification deferred — Google API unreachable)",
+                    "action": "updated",
+                    "credential_verified": False,
+                }
 
             if not credential_ok:
                 # at_stale: cookie alive, access token dead. Credentials untouched, no
@@ -2893,11 +2907,22 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to update token: {str(e)}")
     else:
-        # Add new token
+        # Add new token — verify the access token FIRST so a dead grant never gets an
+        # active window (add_token swallows get_credits failures and would otherwise
+        # insert an active row and create projects with a dead AT).
+        dead_grant = False
+        try:
+            await token_manager.flow_client.get_credits(at)
+        except Exception as probe_err:
+            if token_manager._is_auth_error(probe_err):
+                dead_grant = True
+            # transport blip: proceed as before (AT likely fine)
         try:
             new_token = await token_manager.add_token(
                 st=session_token,
                 remark="Added by Chrome Extension",
+                is_active=not dead_grant,
+                ban_reason=("auto_at_stale" if dead_grant else None),
                 protocol_mode=request.get("protocol_mode", "session"),
                 google_cookies=request.get("google_cookies"),
                 login_account=request.get("login_account"),
@@ -2924,27 +2949,18 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             if _redeem_updates:
                 await db.update_token(new_token.id, **_redeem_updates)
 
-            # add_token swallows a get_credits failure and creates an ACTIVE token. Verify
-            # the access token here: a dead grant becomes an INACTIVE row (auto_at_stale)
-            # so it is visible in the admin but never enters the pool, and the device is
-            # told to re-login.
-            try:
-                await token_manager.flow_client.get_credits(new_token.at)
-            except Exception as probe_err:
-                if token_manager._is_auth_error(probe_err):
-                    await token_manager.disable_token(new_token.id, reason="auto_at_stale")
-                    debug_logger.op_warning(
-                        f"[TOKEN] new token={new_token.id} ({new_token.email}) added with a DEAD access token "
-                        f"— created inactive (auto_at_stale); device re-login needed"
-                    )
-                    return {
-                        "success": True,
-                        "message": f"Account added but Google is not renewing its access token — sign out of Google Labs and back in, then Reconnect ({new_token.email})",
-                        "action": "relogin_required" if ext_supports_relogin else "added",
-                        "token_id": new_token.id,
-                        "credential_verified": False,
-                    }
-                # transport blip: keep the active token (AT likely fine)
+            if dead_grant:
+                debug_logger.op_warning(
+                    f"[TOKEN] new token={new_token.id} ({new_token.email}) has a DEAD access token "
+                    f"— created INACTIVE (auto_at_stale); device re-login needed"
+                )
+                return {
+                    "success": True,
+                    "message": f"Account added but Google is not renewing its access token — sign out of Google Labs and back in, then Reconnect ({new_token.email})",
+                    "action": "relogin_required" if ext_supports_relogin else "added",
+                    "token_id": new_token.id,
+                    "credential_verified": False,
+                }
 
             return {
                 "success": True,

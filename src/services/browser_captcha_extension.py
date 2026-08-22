@@ -346,21 +346,42 @@ class ExtensionCaptchaService:
 
         # Shared pool: bound each attempt so a stack of offline/busy browsers can't
         # blow the caller's overall timeout. Serialize to avoid multi-tab reload storms.
+        # ONE overall deadline for the whole fan-out (was N×per-conn). A cheap, non-reload
+        # pass identifies the browser holding this account (it answers refreshed or
+        # relogin_required; others answer account_mismatch). Only THAT browser is then
+        # asked to force-reload — never the whole pool.
         conns = list(self.active_connections)
-        per_conn_timeout = max(8, min(timeout, 15))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(8, timeout)
         debug_logger.event(
             f"[EXT_REFRESH] token={token_id} shared-pool fan-out over {len(conns)} browser(s)"
+            f"{' (locate-then-reload)' if reload else ''}"
         )
         last: dict = {"status": "no_browser", "token_id": token_id}
         saw_mismatch = False
         saw_logged_out = False
         for conn in conns:
+            remaining = deadline - loop.time()
+            if remaining <= 2:
+                last = {"status": "timeout", "token_id": token_id}
+                break
+            per_conn_timeout = max(2, min(15, int(remaining)))
             result = await self._dispatch_session_refresh_to(conn, token_id, per_conn_timeout)
             status = (result or {}).get("status")
             if status == "refreshed":
                 debug_logger.event(
                     f"[EXT_REFRESH] token={token_id} refreshed via label={conn.client_label or '-'}"
                 )
+                return result
+            if status == "relogin_required":
+                # Located the owner; give it (and only it) one forced reload if asked.
+                if reload and (deadline - loop.time()) > 5:
+                    debug_logger.event(
+                        f"[EXT_REFRESH] token={token_id} located on label={conn.client_label or '-'}; forced reload"
+                    )
+                    result = await self._dispatch_session_refresh_to(
+                        conn, token_id, max(5, int(deadline - loop.time())), reload=True
+                    )
                 return result
             if status == "account_mismatch":
                 saw_mismatch = True

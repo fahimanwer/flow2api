@@ -36,6 +36,13 @@ class RefreshOutcome:
 
     success: bool
     reason: str = "ok"
+    # verified: the AT was accepted by the API (get_credits OK). A transport blip during
+    # verification still PROMOTES the credential (legacy behavior) but is NOT verified —
+    # nothing that requires proof (validation cache, health clear, re-enable, the
+    # device's "healthy" signal) may key off an unverified success.
+    verified: bool = True
+    # fingerprint of the CANDIDATE access token the API rejected (at_stale only).
+    candidate_fp: str = ""
 
     def __bool__(self) -> bool:
         return self.success
@@ -440,7 +447,7 @@ class TokenManager:
             debug_logger.op_warning(f"[HEALTH_CD] could not clear at_stale: {e}")
         debug_logger.event(f"[HEALTH_CD] token={token_id} at_stale cleared (credential verified)")
 
-    async def _record_at_stale(self, token_id: int, failing_at: Optional[str]) -> dict:
+    async def _record_at_stale(self, token_id: int, candidate_fp: str) -> dict:
         """Leader-only: one strike for this failure round. Escalating pause; returns the
         entry plus `disable_due` = True when strikes reached the threshold inside the
         rolling window with no verified success in between (the window restarts whenever
@@ -448,7 +455,7 @@ class TokenManager:
         now = datetime.now(timezone.utc)
         key = (int(token_id), "at_stale")
         prev = self._health_cd.get(key)
-        fp = self._credential_fingerprint(failing_at)
+        fp = candidate_fp or ""
         if prev and prev.get("until") and now < prev["until"]:
             # Still inside the current pause → same round (concurrent straggler); no escalation.
             return {**prev, "disable_due": False, "escalated": False}
@@ -757,8 +764,12 @@ class TokenManager:
         proxy_url: Optional[str] = None,
         auto_refresh_enabled: bool = True,
         refresh_interval_minutes: int = 120,
+        is_active: bool = True,
+        ban_reason: Optional[str] = None,
     ) -> Token:
-        """Add a new token and prepare its pooled projects."""
+        """Add a new token and prepare its pooled projects. is_active=False creates the
+        row disabled from the start (caller verified the credential is dead) so a dead
+        access token never has an active window."""
         existing_token = await self.db.get_token_by_st(st)
         if existing_token:
             raise ValueError(f"Token ??????: {existing_token.email}?")
@@ -822,7 +833,9 @@ class TokenManager:
             email=email,
             name=name,
             remark=remark,
-            is_active=True,
+            is_active=is_active,
+            ban_reason=ban_reason,
+            banned_at=(datetime.now(timezone.utc) if (not is_active and ban_reason) else None),
             credits=credits,
             user_paygate_tier=user_paygate_tier,
             current_project_id=pooled_projects[0].project_id,
@@ -933,7 +946,10 @@ class TokenManager:
         # manually disabled accounts on every worker credential push.
         token = await self.db.get_token(token_id)
 
-        if token and token.ban_reason == "429_rate_limit":
+        # Legacy 429 clearing applies only to an EXPLICIT credential edit (admin saved a new
+        # ST). Metadata-only updates (plugin protocol fields) must not turn a 429 ban into a
+        # manual-looking one that a later push could lift.
+        if credential_updated and token and token.ban_reason == "429_rate_limit":
             # 检查token是否过期
             is_expired = False
             if token.at_expires:
@@ -1029,7 +1045,7 @@ class TokenManager:
                     f"[AT_CHECK] Token {token.id}: 本地判定未过期，但上游校验失败，准备刷新 AT/ST - {e}"
                 )
 
-        outcome = await self._refresh_at(token.id)
+        outcome = await self._refresh_at(token.id, escalate=disable_on_failure)
         if not outcome.success:
             # Only a confirmed credential failure removes the token from the
             # pool. Transient network errors leave it enabled to be retried.
@@ -1060,67 +1076,84 @@ class TokenManager:
         return valid_token is not None
 
 
-    async def _refresh_at_inner(self, token_id: int) -> RefreshOutcome:
-        """Perform exactly one real AT refresh attempt.
-
-        Side-effect-free with respect to enabling/disabling the token: the
-        disable decision belongs to the caller (automatic pool path disables on
-        credential failure; manual admin actions never disable). See
-        ``ensure_valid_token``.
-        """
-        refresh_lock = await self._get_token_lock(
-            self._refresh_locks,
-            self._refresh_lock_guard,
-            token_id,
-        )
+    async def _locked_refresh(self, token_id: int, st: str, token: Optional[Token]) -> RefreshOutcome:
+        """validate-then-promote under the per-token credential lock. The lock is held
+        ONLY for this call — never across a device round-trip, because the device's
+        push (/api/plugin/update-token → validate_and_promote) needs the same lock."""
+        refresh_lock = await self._get_token_lock(self._refresh_locks, self._refresh_lock_guard, token_id)
         async with refresh_lock:
-            token = await self.db.get_token(token_id)
-            if not token:
-                return RefreshOutcome(False, "unknown")
+            return await self._do_refresh_at(token_id, st, token)
 
-            outcome = await self._do_refresh_at(token_id, token.st, token)
+    async def _refresh_at_inner(self, token_id: int, escalate: bool = True) -> RefreshOutcome:
+        """Perform exactly one real AT refresh attempt (single-flight per token via
+        ``_refresh_at``).
+
+        Side-effect-free with respect to enabling/disabling on st_expired/network:
+        that decision belongs to the caller (``ensure_valid_token``). at_stale
+        escalation (strike → device reload → threshold disable) happens here, in the
+        leader, and ONLY when ``escalate`` is True (automatic pool path). Manual
+        callers (admin refresh, disable_on_failure=False) get recovery attempts but
+        never strikes or disables.
+        """
+        token = await self.db.get_token(token_id)
+        if not token:
+            return RefreshOutcome(False, "unknown")
+
+        outcome = await self._locked_refresh(token_id, token.st, token)
+        if outcome.success:
+            return outcome
+
+        # Only attempt a (browser/personal/protocol) ST refresh when the failure
+        # is an expired/invalid ST. A network blip must NOT trigger a session
+        # refresh nor be treated as a dead credential.
+        if outcome.reason == "st_expired":
+            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST expired, trying ST refresh...")
+            new_st = await self._try_refresh_st(token_id, token)   # lock NOT held (device round-trip)
+            if new_st:
+                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
+                latest_token = await self.db.get_token(token_id) or token
+                retry = await self._locked_refresh(token_id, new_st, latest_token)
+                if retry.success:
+                    return retry
+                outcome = retry
+
+        if outcome.reason == "at_stale":
+            outcome = await self._handle_at_stale(token_id, token, outcome, escalate=escalate)
             if outcome.success:
                 return outcome
 
-            # Only attempt a (browser/personal/protocol) ST refresh when the failure
-            # is an expired/invalid ST. A network blip must NOT trigger a session
-            # refresh nor be treated as a dead credential.
-            if outcome.reason == "st_expired":
-                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST expired, trying ST refresh...")
-                new_st = await self._try_refresh_st(token_id, token)
-                if new_st:
-                    debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
-                    latest_token = await self.db.get_token(token_id) or token
-                    retry = await self._do_refresh_at(token_id, new_st, latest_token)
-                    if retry.success:
-                        return retry
-                    outcome = retry
+        debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed ({outcome.reason})")
+        self._clear_at_validation_cache(token_id)
+        return outcome
 
-            if outcome.reason == "at_stale":
-                outcome = await self._handle_at_stale(token_id, token)
-                if outcome.success:
-                    return outcome
+    @staticmethod
+    def _snapshot_fp(token: Optional[Token]) -> str:
+        """Fingerprint of the serving (st, at) pair — the CAS key for a disable."""
+        if not token:
+            return ""
+        return hashlib.sha256(f"{token.st or ''}|{token.at or ''}".encode("utf-8")).hexdigest()[:16]
 
-            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed ({outcome.reason})")
-            self._clear_at_validation_cache(token_id)
-            return outcome
-
-    async def _handle_at_stale(self, token_id: int, token: Token) -> RefreshOutcome:
-        """Leader-only (runs under the per-token refresh lock, inside the coalesced
-        refresh task) so ONE failure round yields ONE strike / ONE forced reload / at
-        most ONE disable — concurrent waiters just receive the outcome.
+    async def _handle_at_stale(
+        self, token_id: int, token: Token, failed: RefreshOutcome, escalate: bool = True
+    ) -> RefreshOutcome:
+        """Leader-only (inside the coalesced refresh task) so ONE failure round yields ONE
+        strike / ONE forced reload / at most ONE disable — concurrent waiters just
+        receive the outcome. No lock is held across the device round-trip.
 
         Order: record the strike (pause) → try protocol refresh for protocol tokens →
         ask the bound worker device to reload Labs and push again (the push endpoint
         validates and promotes only a working credential) → re-verify. If still stale
         and the strike threshold is due, disable with ban_reason=auto_at_stale, guarded
-        by a credential CAS so a valid push that landed meanwhile is never disabled.
+        by a snapshot CAS so a valid push that landed meanwhile is never disabled.
         """
-        failing_at = token.at
-        strike = await self._record_at_stale(token_id, failing_at)
-        if not strike.get("escalated"):
-            # Concurrent straggler inside an active pause: nothing more to do.
-            return RefreshOutcome(False, "at_stale")
+        serving_fp = self._snapshot_fp(token)
+        candidate_fp = failed.candidate_fp or self._credential_fingerprint(token.at)
+        strike = None
+        if escalate:
+            strike = await self._record_at_stale(token_id, candidate_fp)
+            if not strike.get("escalated"):
+                # Concurrent straggler inside an active pause: nothing more to do.
+                return RefreshOutcome(False, "at_stale", verified=False, candidate_fp=candidate_fp)
 
         # Recovery attempt 1: protocol-mode ST refresh (no-op unless configured).
         try:
@@ -1129,46 +1162,52 @@ class TokenManager:
             protocol_st = None
         if protocol_st:
             latest = await self.db.get_token(token_id) or token
-            retry = await self._do_refresh_at(token_id, protocol_st, latest)
+            retry = await self._locked_refresh(token_id, protocol_st, latest)
             if retry.success:
                 return retry
 
         # Recovery attempt 2: bound worker device — forced Labs reload, then push. The
-        # push goes through validate_and_promote; a still-dead grant leaves st/at
-        # untouched and tells the device to show "sign out / sign in".
+        # push goes through validate_and_promote (its own lock acquisition — ours is
+        # NOT held here); a still-dead grant leaves st/at untouched and tells the
+        # device to show "sign out / sign in".
         if config.captcha_method == "extension":
             new_st = await self._try_refresh_st_via_extension(token_id, token, reload=True)
             if new_st:
                 latest = await self.db.get_token(token_id) or token
-                retry = await self._do_refresh_at(token_id, new_st, latest)
+                retry = await self._locked_refresh(token_id, new_st, latest)
                 if retry.success:
                     return retry
 
-        if strike.get("disable_due"):
-            # CAS: only disable if the credential that failed is STILL the serving one.
-            latest = await self.db.get_token(token_id)
-            if latest and latest.is_active and self._credential_fingerprint(latest.at) == strike.get("fingerprint"):
-                debug_logger.op_warning(
-                    f"[AT_REFRESH] token={token_id} access token dead for {strike.get('strikes')} "
-                    f"rounds within {self.AT_STALE_DISABLE_WINDOW} → disabling (auto_at_stale; "
-                    f"device must sign out/in to Google Labs)"
-                )
-                await self.disable_token(token_id, reason="auto_at_stale")
-            else:
-                debug_logger.log_info(
-                    f"[AT_REFRESH] token={token_id} at_stale disable skipped — credential changed or already inactive"
-                )
-        return RefreshOutcome(False, "at_stale")
+        if strike and strike.get("disable_due"):
+            # CAS under the lock: disable only if the serving (st, at) pair is STILL the
+            # one that failed — a verified push meanwhile changes it and wins.
+            refresh_lock = await self._get_token_lock(self._refresh_locks, self._refresh_lock_guard, token_id)
+            async with refresh_lock:
+                latest = await self.db.get_token(token_id)
+                if latest and latest.is_active and self._snapshot_fp(latest) == serving_fp:
+                    debug_logger.op_warning(
+                        f"[AT_REFRESH] token={token_id} access token dead for {strike.get('strikes')} "
+                        f"rounds within {self.AT_STALE_DISABLE_WINDOW} → disabling (auto_at_stale; "
+                        f"device must sign out/in to Google Labs)"
+                    )
+                    await self.disable_token(token_id, reason="auto_at_stale")
+                else:
+                    debug_logger.log_info(
+                        f"[AT_REFRESH] token={token_id} at_stale disable skipped — credential changed or already inactive"
+                    )
+        return RefreshOutcome(False, "at_stale", verified=False, candidate_fp=candidate_fp)
 
-    async def _refresh_at(self, token_id: int) -> RefreshOutcome:
-        """Coalesce concurrent AT refresh calls for the same token."""
+    async def _refresh_at(self, token_id: int, escalate: bool = True) -> RefreshOutcome:
+        """Coalesce concurrent AT refresh calls for the same token. The FIRST caller is
+        the leader and its ``escalate`` flag governs the round; later callers only
+        await the shared outcome (they never strike/reload/disable)."""
         existing_task = self._refresh_futures.get(token_id)
         if existing_task:
             return await existing_task
 
         async def runner() -> RefreshOutcome:
             try:
-                return await self._refresh_at_inner(token_id)
+                return await self._refresh_at_inner(token_id, escalate=escalate)
             finally:
                 current = self._refresh_futures.get(token_id)
                 if current is task:
@@ -1272,6 +1311,7 @@ class TokenManager:
                     "user_paygate_tier": credits_result.get("userPaygateTier"),
                 }
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT 验证成功（余额: {credits_result.get('credits', 0)}）")
+                verified = True
             except Exception as verify_err:
                 if self._is_auth_error(verify_err):
                     # Session alive (st_to_at returned a user) but the API rejects the AT
@@ -1282,9 +1322,11 @@ class TokenManager:
                         f"(expires={expires}); not promoting — at_stale"
                     )
                     record_token_refresh("at", "failure")
-                    return RefreshOutcome(False, "at_stale")
+                    return RefreshOutcome(False, "at_stale", verified=False,
+                                          candidate_fp=self._credential_fingerprint(new_at))
                 # Transport blip during verification only: the AT is almost certainly fine.
-                # Keep long-standing behavior — promote it and report success.
+                # Keep long-standing behavior — promote it — but report it UNVERIFIED.
+                verified = False
                 debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {str(verify_err)}")
 
             # Promote: ST + AT + expiry (+ credits when verified) in one write.
@@ -1295,11 +1337,12 @@ class TokenManager:
                 at_expires=new_at_expires,
                 **credits_fields,
             )
-            self._mark_at_valid(token_id)
-            await self._note_verified_at(token_id, new_at)
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功 (expires {new_at_expires})")
+            if verified:
+                self._mark_at_valid(token_id)
+                await self._note_verified_at(token_id, new_at)
+            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功 (expires {new_at_expires}, verified={verified})")
             record_token_refresh("at", "success")
-            return RefreshOutcome(True, "ok")
+            return RefreshOutcome(True, "ok", verified=verified)
 
         except Exception as e:
             reason = self._classify_refresh_error(e)
@@ -1440,7 +1483,7 @@ class TokenManager:
             # reload=True forces a Labs navigation on the BOUND device before the push
             # (Google may renew a stale access token on a real page load). The push
             # endpoint validates+promotes, so a returned new ST is already verified.
-            result = await service.request_session_refresh(token_id, timeout=45 if reload else 30, reload=reload)
+            result = await service.request_session_refresh(token_id, timeout=75 if reload else 30, reload=reload)
             status = (result or {}).get("status")
             if status == "relogin_required":
                 debug_logger.op_warning(
@@ -1482,7 +1525,7 @@ class TokenManager:
         )
         async with refresh_lock:
             latest = await self.db.get_token(token_id)
-            if not latest or not latest.is_active:
+            if not latest or (not latest.is_active and (latest.ban_reason or "") != "auto_at_stale"):
                 return
             if not latest.auto_refresh_enabled:
                 return
@@ -1528,6 +1571,10 @@ class TokenManager:
 
                 await self.db.update_token(token_id, **updates)
                 self._mark_at_valid(token_id)
+                await self._note_verified_at(token_id, new_at)
+                if not latest.is_active and (latest.ban_reason or "") == "auto_at_stale":
+                    await self.enable_token(token_id)
+                    debug_logger.event(f"[PROTOCOL_REFRESH] token={token_id} auto_at_stale healed via protocol login — re-enabled")
                 record_token_refresh("at", "success")
                 debug_logger.log_info(f"[PROTOCOL_REFRESH] Token {token_id}: 协议刷新 ST/AT 成功")
             except Exception as e:
@@ -1551,7 +1598,10 @@ class TokenManager:
         if not refresh_config or not refresh_config.enabled:
             return
 
-        tokens = await self.db.get_active_tokens()
+        # Active tokens PLUS inactive ones disabled for a dead access token (auto_at_stale):
+        # protocol login can mint a fresh grant, so those must not be stranded.
+        all_tokens = await self.db.get_all_tokens()
+        tokens = [t for t in all_tokens if t.is_active or (t.ban_reason or "") == "auto_at_stale"]
         now = datetime.now(timezone.utc)
         for token in tokens:
             try:
