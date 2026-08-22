@@ -35,6 +35,7 @@ const RELOAD_THRESHOLD_MS = 24 * 60 * 60 * 1000;  // reload when < 24h to expiry
 const RELOAD_MIN_GAP_MS   = 2 * 60 * 60 * 1000;   // never reload more than ~once / 2h
 const RELOAD_ACTIVE_MS    = 45 * 1000;            // skip reload if a mint started in last 45s (>= VIDEO 30s)
 const COOKIE_SETTLE_MS    = 1500;                 // let NextAuth write the rolled cookie
+const PUSH_TIMEOUT_MS     = 25 * 1000;            // hard bound on the session-push POST
 
 // WebSocket heartbeat: keep the MV3 service worker alive (Chrome 116+ resets the
 // idle timer on WS traffic). 15s gives margin under the ~30s idle limit + timer jitter.
@@ -1186,7 +1187,10 @@ async function refreshSession(token_id = null, opts = {}) {
     // under a mint — the caller (handleRefreshSession) already serializes via tokenQueue,
     // this is the belt to that suspender.
     if (opts.reload && settings.tabMode === "persistent") {
-      if (mintInFlight || (Date.now() - lastMintAt < RELOAD_ACTIVE_MS)) {
+      // Already serialized behind mints via tokenQueue, so only a truly in-flight mint
+      // vetoes; the "mint finished seconds ago" veto would make every queued reload
+      // return busy (the preceding mint just set lastMintAt).
+      if (mintInFlight) {
         return { success: false, error: "busy minting, retry next cycle", reason: "busy" };
       }
       const reloadedTab = await rollSessionTab(); // never throws; arms breaker on login bounce
@@ -1263,11 +1267,20 @@ async function refreshSession(token_id = null, opts = {}) {
     // Version visibility: report this build's version so the admin can see who's outdated.
     pushBody.ext_version = extVersion();
 
-    const resp = await fetch(updateUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.connectionToken}` },
-      body: JSON.stringify(pushBody)
-    });
+    // Bound the push so a hung request can't outlive the server's wait for our ack.
+    const pushAbort = new AbortController();
+    const pushTimer = setTimeout(() => pushAbort.abort(), PUSH_TIMEOUT_MS);
+    let resp;
+    try {
+      resp = await fetch(updateUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.connectionToken}` },
+        body: JSON.stringify(pushBody),
+        signal: pushAbort.signal
+      });
+    } finally {
+      clearTimeout(pushTimer);
+    }
     if (!resp.ok) {
       const txt = await resp.text();
       await log("ERROR", "Session push failed", { status: resp.status, body: txt.slice(0, 200) });

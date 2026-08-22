@@ -28,11 +28,13 @@ def _make_tm():
     tm.db.get_token = AsyncMock()
     tm._refresh_locks = {}
     tm._refresh_lock_guard = MagicMock()
-    tm._get_token_lock = AsyncMock(return_value=asyncio.Lock())
+    _lock = asyncio.Lock()
+    tm._get_token_lock = AsyncMock(return_value=_lock)
     # Post-merge state: upstream's AT-validation cache (set in __init__, which
     # this fixture bypasses via __new__).
     tm._at_validation_cache = {}
     tm._health_cd = {}
+    tm._refresh_futures = {}
     tm.db.delete_token_health_cooldown = AsyncMock()
     tm.db.upsert_token_health_cooldown = AsyncMock()
     return tm
@@ -213,7 +215,7 @@ class AtStaleLeaderTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import patch
         with patch("src.services.token_manager.config") as cfg:
             cfg.captcha_method = "extension"
-            out = await tm._handle_at_stale(20, tok)
+            out = await tm._handle_at_stale(20, tok, RefreshOutcome(False, "at_stale", verified=False, candidate_fp=tm._credential_fingerprint("DEADAT")))
         self.assertEqual(out.reason, "at_stale")
         self.assertTrue(tm.is_health_cooldown(20, "at_stale"))
         tm._try_refresh_st_via_extension.assert_awaited_once_with(20, tok, reload=True)
@@ -227,8 +229,9 @@ class AtStaleLeaderTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import patch
         with patch("src.services.token_manager.config") as cfg:
             cfg.captcha_method = "extension"
-            await tm._handle_at_stale(21, tok)
-            await tm._handle_at_stale(21, tok)
+            failed = RefreshOutcome(False, "at_stale", verified=False, candidate_fp=tm._credential_fingerprint("DEADAT"))
+            await tm._handle_at_stale(21, tok, failed)
+            await tm._handle_at_stale(21, tok, failed)
         self.assertEqual(tm._health_cd[(21, "at_stale")]["strikes"], 1)
         self.assertEqual(tm._try_refresh_st_via_extension.await_count, 1)
 
@@ -248,7 +251,7 @@ class AtStaleLeaderTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import patch
         with patch("src.services.token_manager.config") as cfg:
             cfg.captcha_method = "extension"
-            await tm._handle_at_stale(22, tok)
+            await tm._handle_at_stale(22, tok, RefreshOutcome(False, "at_stale", verified=False, candidate_fp=tm._credential_fingerprint("DEADAT")))
         self.assertEqual(tm.disable_token.await_count, 0)
         # Case B: same dead credential still serving → disable with auto_at_stale.
         tm2 = self._tm()
@@ -260,7 +263,7 @@ class AtStaleLeaderTests(unittest.IsolatedAsyncioTestCase):
         tm2.db.get_token = AsyncMock(return_value=tok2)
         with patch("src.services.token_manager.config") as cfg:
             cfg.captcha_method = "extension"
-            await tm2._handle_at_stale(23, tok2)
+            await tm2._handle_at_stale(23, tok2, RefreshOutcome(False, "at_stale", verified=False, candidate_fp=tm2._credential_fingerprint("DEADAT")))
         tm2.disable_token.assert_awaited_once_with(23, reason="auto_at_stale")
 
     async def test_old_window_resets_strikes(self):
@@ -270,7 +273,7 @@ class AtStaleLeaderTests(unittest.IsolatedAsyncioTestCase):
         tm._health_cd[(24, "at_stale")] = {"until": now - timedelta(hours=1), "strikes": 2,
                                            "first_failure_at": now - timedelta(hours=5),
                                            "last_failure_at": now - timedelta(hours=3), "fingerprint": "old"}
-        entry = await tm._record_at_stale(24, "AT")
+        entry = await tm._record_at_stale(24, tm._credential_fingerprint("AT"))
         self.assertEqual(entry["strikes"], 1)
         self.assertFalse(entry["disable_due"])
 
@@ -284,3 +287,76 @@ class AtStaleLeaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tm.is_health_cooldown(25, "at_stale"))
         await tm._note_verified_at(25, "FRESHAT")     # newer credential verified
         self.assertFalse(tm.is_health_cooldown(25, "at_stale"))
+
+
+class LockScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_device_push_during_refresh_round_trip_does_not_deadlock(self):
+        """Regression: the refresh leader must NOT hold the credential lock while waiting
+        for the worker device, because the device's push (validate_and_promote) needs
+        that same lock. Simulate the push happening INSIDE the extension round-trip."""
+        tm = _make_tm()
+        tm._health_cd = {}
+        tm.db.upsert_token_health_cooldown = AsyncMock()
+        tm.db.delete_token_health_cooldown = AsyncMock()
+        tm._try_protocol_refresh_st = AsyncMock(return_value=None)
+        tm.disable_token = AsyncMock()
+        tok = MagicMock(id=30, at="DEADAT", st="st_old", is_active=True)
+        tm.db.get_token = AsyncMock(return_value=tok)
+        # First refresh: session alive, AT rejected → at_stale.
+        tm.flow_client.st_to_at = AsyncMock(side_effect=[
+            {"access_token": "DEADAT", "expires": None},   # leader's first attempt
+            {"access_token": "FRESHAT", "expires": None},  # device push (inside round-trip)
+            {"access_token": "FRESHAT", "expires": None},  # leader's retry on new ST
+        ])
+        tm.flow_client.get_credits = AsyncMock(side_effect=[
+            FlowAPIError(401, "HTTP Error 401", "UNAUTHENTICATED"),
+            {"credits": 10, "userPaygateTier": "T"},
+            {"credits": 10, "userPaygateTier": "T"},
+        ])
+
+        async def fake_extension_refresh(token_id, token, reload=False):
+            # The device pushes while the leader is "waiting" for it.
+            out = await asyncio.wait_for(tm.validate_and_promote(30, "st_new", source="test"), timeout=2)
+            assert out.success and out.verified
+            tok.st = "st_new"; tok.at = "FRESHAT"
+            return "st_new"
+        tm._try_refresh_st_via_extension = fake_extension_refresh
+
+        from unittest.mock import patch
+        with patch("src.services.token_manager.config") as cfg:
+            cfg.captcha_method = "extension"
+            outcome = await asyncio.wait_for(tm._refresh_at_inner(30, escalate=True), timeout=5)
+        self.assertTrue(outcome.success)
+        self.assertEqual(tm.disable_token.await_count, 0)
+
+    async def test_manual_refresh_never_strikes(self):
+        tm = _make_tm()
+        tm._health_cd = {}
+        tm.db.upsert_token_health_cooldown = AsyncMock()
+        tm._try_protocol_refresh_st = AsyncMock(return_value=None)
+        tm._try_refresh_st_via_extension = AsyncMock(return_value=None)
+        tm.disable_token = AsyncMock()
+        tok = MagicMock(id=31, at="DEADAT", st="st", is_active=True)
+        tm.db.get_token = AsyncMock(return_value=tok)
+        tm.flow_client.st_to_at = AsyncMock(return_value={"access_token": "DEADAT", "expires": None})
+        tm.flow_client.get_credits = AsyncMock(side_effect=FlowAPIError(401, "HTTP Error 401", "UNAUTHENTICATED"))
+        from unittest.mock import patch
+        with patch("src.services.token_manager.config") as cfg:
+            cfg.captcha_method = "extension"
+            outcome = await tm._refresh_at(31, escalate=False)
+        self.assertEqual(outcome.reason, "at_stale")
+        self.assertFalse(tm.is_health_cooldown(31))          # no strike recorded
+        self.assertEqual(tm.db.upsert_token_health_cooldown.await_count, 0)
+
+    async def test_unverified_promotion_does_not_clear_health_or_mark_valid(self):
+        tm = _make_tm()
+        from datetime import datetime, timezone, timedelta
+        tm._health_cd[(32, "at_stale")] = {"until": datetime.now(timezone.utc) + timedelta(minutes=5), "strikes": 1,
+                                           "first_failure_at": None, "last_failure_at": None, "fingerprint": "x"}
+        tm.flow_client.st_to_at = AsyncMock(return_value={"access_token": "AT", "expires": None})
+        tm.flow_client.get_credits = AsyncMock(side_effect=Exception("temporary 500 blip"))
+        outcome = await tm._do_refresh_at(32, "st")
+        self.assertTrue(outcome.success)
+        self.assertFalse(outcome.verified)
+        self.assertTrue(tm.is_health_cooldown(32))            # NOT cleared
+        self.assertFalse(tm._has_recent_at_validation(32))   # NOT marked valid
