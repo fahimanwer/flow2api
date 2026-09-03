@@ -102,6 +102,7 @@ def _is_prompt_rejection(error_message: Optional[str]) -> bool:
 # re-picking the account every few seconds, no strike, no escalation.
 _MINT_FAILURE_MARKERS = (
     "failed to obtain recaptcha token",
+    "extension route paused after mint failure",
     "no chrome extension connection matches",
     "chrome extension not connected",
 )

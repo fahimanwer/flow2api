@@ -487,6 +487,16 @@ class Config:
             return 3.0
 
     @property
+    def extension_route_failure_pause_seconds(self) -> float:
+        """After a mint fails on a browser, how long queued/new mints for that route
+        fail fast (matches TokenManager.MINT_FAILURE_PAUSE_SECONDS)."""
+        value = self._config.get("captcha", {}).get("extension_route_failure_pause_seconds", 90.0)
+        try:
+            return max(5.0, min(3600.0, float(value)))
+        except Exception:
+            return 90.0
+
+    @property
     def extension_global_min_interval_seconds(self) -> float:
         """Minimum spacing between mints across ALL worker browsers (smooths bursts)."""
         value = self._config.get("captcha", {}).get("extension_global_min_interval_seconds", 1.0)

@@ -85,6 +85,7 @@ class _FakeWS:
 class MintThrottle(unittest.TestCase):
     def _svc(self, route):
         svc = ExtensionCaptchaService.__new__(ExtensionCaptchaService)
+        ExtensionCaptchaService.__init__(svc, db=None)
         svc.db = None
         svc.pending_requests = {}
         svc._rr_index = 0

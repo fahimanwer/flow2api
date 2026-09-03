@@ -30,6 +30,7 @@ from src.services.token_manager import (
 
 def _svc(*route_keys):
     svc = ExtensionCaptchaService.__new__(ExtensionCaptchaService)
+    ExtensionCaptchaService.__init__(svc, db=None)
     svc.db = None
     svc.active_connections = [ExtensionConnection(websocket=MagicMock(), route_key=k) for k in route_keys]
     svc.pending_requests = {}
@@ -44,10 +45,12 @@ class RouteStrictness(unittest.TestCase):
         # Offline bound account: must NOT be reported as connected just because others are.
         self.assertFalse(svc._has_connection_for_route_key("auto-zzz"))
 
-    def test_unbound_account_keeps_any_browser_fallback(self):
-        svc = _svc("auto-aaa")
+    def test_unbound_account_uses_shared_pool_browsers_only(self):
+        svc = _svc("auto-aaa")           # only a BOUND browser online
+        self.assertFalse(svc._has_connection_for_route_key(""))
+        self.assertFalse(svc._has_connection_for_route_key(None))
+        svc = _svc("auto-aaa", "")       # plus one shared-pool browser
         self.assertTrue(svc._has_connection_for_route_key(""))
-        self.assertTrue(svc._has_connection_for_route_key(None))
 
     def test_no_browsers_at_all(self):
         svc = _svc()
@@ -172,3 +175,70 @@ class PromptRejectionNotAccountError(unittest.TestCase):
         from src.services.token_manager import _is_prompt_rejection
         self.assertFalse(_is_prompt_rejection("HTTP Error 404: Requested entity was not found."))
         self.assertFalse(_is_prompt_rejection("PUBLIC_ERROR_UNUSUAL_ACTIVITY: reCAPTCHA evaluation failed"))
+
+
+class UnboundAccountsUseOnlySharedBrowsers(unittest.TestCase):
+    """An account with no route key may only mint on browsers that registered with
+    no route key (shared pool). Bound browsers belong to one employee's account."""
+
+    def test_unbound_account_with_only_bound_browsers_is_not_connected(self):
+        svc = _svc("auto-aaa", "auto-bbb")
+        self.assertFalse(svc._has_connection_for_route_key(""))
+        self.assertIsNone(svc._select_connection(""))
+
+    def test_unbound_account_uses_shared_browser(self):
+        svc = _svc("auto-aaa", "", "auto-bbb")
+        conn = svc._select_connection("")
+        self.assertIsNotNone(conn)
+        self.assertEqual(conn.route_key, "")
+        self.assertTrue(svc._has_connection_for_route_key(""))
+
+    def test_bound_offline_account_never_borrows_a_bound_browser(self):
+        svc = _svc("auto-aaa")
+        self.assertIsNone(svc._select_connection("auto-zzz"))          # non-strict path
+        self.assertIsNone(svc._select_connection("auto-zzz", strict=True))
+
+
+class RoutePauseAfterMintFailure(unittest.TestCase):
+    """After one mint fails on a browser, requests queued on that route fail fast
+    instead of reopening the Flow tab every few seconds."""
+
+    def test_queued_requests_fail_fast_after_a_failed_mint(self):
+        from src.core.config import config
+        captcha = config._config.setdefault("captcha", {})
+        saved = {k: captcha.get(k) for k in ("extension_route_min_interval_seconds", "extension_global_min_interval_seconds")}
+        captcha["extension_route_min_interval_seconds"] = 0
+        captcha["extension_global_min_interval_seconds"] = 0
+        try:
+            svc = _svc("auto-aaa")
+            svc._resolve_route_key = AsyncMock(return_value="auto-aaa")
+            svc._dispatch_token_request = AsyncMock(return_value=None)  # browser could not mint
+
+            async def run():
+                first = await svc.get_token("proj", token_id=7)
+                self.assertIsNone(first)
+                with self.assertRaises(RuntimeError) as ctx:
+                    await svc.get_token("proj", token_id=7)
+                self.assertIn("route paused after mint failure", str(ctx.exception))
+            asyncio.run(run())
+            self.assertEqual(svc._dispatch_token_request.await_count, 1)  # second never reached the browser
+            from src.services.token_manager import _is_captcha_mint_failure
+            self.assertTrue(_is_captcha_mint_failure("Extension route paused after mint failure (88s left)"))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    captcha.pop(k, None)
+                else:
+                    captcha[k] = v
+
+    def test_successful_mint_clears_the_pause(self):
+        svc = _svc("auto-aaa")
+        svc._route_paused_until["auto-aaa"] = 0.0
+        svc._resolve_route_key = AsyncMock(return_value="auto-aaa")
+        svc._dispatch_token_request = AsyncMock(return_value="tok")
+        from src.core.config import config
+        captcha = config._config.setdefault("captcha", {})
+        captcha["extension_route_min_interval_seconds"] = 0
+        captcha["extension_global_min_interval_seconds"] = 0
+        self.assertEqual(asyncio.run(svc.get_token("proj", token_id=7)), "tok")
+        self.assertNotIn("auto-aaa", svc._route_paused_until)
