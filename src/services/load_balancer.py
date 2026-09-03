@@ -398,6 +398,22 @@ class LoadBalancer:
                 "checks; they auto-recover shortly (progressive backoff)."
             )
 
+        # All otherwise-usable accounts have NO online worker browser for their route
+        # key (extension closed / disconnected). Say so — the generic message sends
+        # people chasing the wrong thing.
+        if supported_tokens:
+            offline = 0
+            for t in supported_tokens:
+                ok, _ = await self._check_extension_route(t)
+                if not ok:
+                    offline += 1
+            if offline == len(supported_tokens):
+                return (
+                    "No worker browser is online for any eligible account — every account's "
+                    "Chrome extension is disconnected or closed. Open/reconnect the browsers "
+                    "(the extension popup must show Connected for THAT account's route key)."
+                )
+
         # All otherwise-usable accounts are paused for a dead Google access token
         # (at_stale) — a human must sign out/in on those worker devices.
         if supported_tokens and all(

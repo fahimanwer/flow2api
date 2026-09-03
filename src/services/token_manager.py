@@ -68,6 +68,30 @@ def _is_environmental_token_error(error_message: Optional[str]) -> bool:
     return any(marker in lowered for marker in _ENVIRONMENTAL_ERROR_MARKERS)
 
 
+# The worker extension could not produce a reCAPTCHA token AT ALL (tab not on Flow,
+# frame removed mid-injection, empty result, browser offline). Google never saw a
+# request, so this says nothing about the ACCOUNT's anti-bot reputation — it is a
+# device problem. Before 2026-09-03 these matched _ENVIRONMENTAL_ERROR_MARKERS
+# ("recaptcha") and escalated the account's reCAPTCHA cooldown exactly like a Google
+# UNUSUAL_ACTIVITY rejection: six healthy, logged-in accounts sat at strike 6-12
+# (2 h benches, re-struck every time the bench lapsed) purely because their own
+# Chrome could not mint. Now: a short, FLAT device pause so the balancer stops
+# re-picking the account every few seconds, no strike, no escalation.
+_MINT_FAILURE_MARKERS = (
+    "failed to obtain recaptcha token",
+    "no chrome extension connection matches",
+    "chrome extension not connected",
+)
+
+
+def _is_captcha_mint_failure(error_message: Optional[str]) -> bool:
+    """True when the extension never delivered a token (device-side failure)."""
+    if not error_message:
+        return False
+    lowered = error_message.lower()
+    return any(marker in lowered for marker in _MINT_FAILURE_MARKERS)
+
+
 # Upstream capacity / captcha-SOLVER outages: not the account's fault AND not its
 # IP reputation either — so unlike environmental errors these get NO reCAPTCHA
 # cooldown (pausing an account for Flow being busy or a solver outage is wrong)
@@ -212,6 +236,9 @@ class TokenManager:
     # If the previous cooldown ended more than this ago, the next failure is treated as a
     # fresh strike-1 (an occasional blip) rather than a continuation of an old burst.
     RECAPTCHA_STRIKE_DECAY = timedelta(minutes=30)
+    # Flat pause after the extension failed to MINT a token (device problem, see
+    # _MINT_FAILURE_MARKERS). Never escalates and never touches the strike count.
+    MINT_FAILURE_PAUSE_SECONDS = 90
 
     def _next_pt_daily_reset(self) -> datetime:
         """Next Google-Flow daily-quota reset = next midnight America/Los_Angeles (PT),
@@ -393,6 +420,29 @@ class TokenManager:
         if not entry:
             return False
         return datetime.now(timezone.utc) < entry[0]
+
+    async def mark_mint_failure(self, token_id: int) -> None:
+        """Short, flat pause after the worker extension could not mint a reCAPTCHA token.
+
+        Not a reputation event (Google saw nothing), so: no strike, no escalation, and an
+        existing longer cooldown is never shortened. Strike memory is preserved so a real
+        Google rejection afterwards still escalates correctly.
+        """
+        now = datetime.now(timezone.utc)
+        until = now + timedelta(seconds=self.MINT_FAILURE_PAUSE_SECONDS)
+        prev = self._recaptcha_cd.get(token_id)
+        strikes = prev[1] if prev else 0
+        if prev and prev[0] > until:
+            return  # already resting longer than this pause would
+        self._recaptcha_cd[token_id] = (until, strikes)
+        try:
+            await self.db.upsert_recaptcha_cooldown(token_id, until, strikes)
+        except Exception as e:
+            debug_logger.op_warning(f"[MINT_CD] could not persist pause: {e}")
+        debug_logger.event(
+            f"[MINT_CD] token={token_id} extension could not mint a reCAPTCHA token; "
+            f"device paused {self.MINT_FAILURE_PAUSE_SECONDS}s (no account strike)"
+        )
 
     async def clear_recaptcha_cooldown(self, token_id: int) -> None:
         """Reset a token's reCAPTCHA strike/cooldown (called on a successful generation)."""
@@ -976,6 +1026,16 @@ class TokenManager:
 
     # ========== AT自动刷新逻辑 (核心) ==========
 
+    @staticmethod
+    def _at_already_expired(token: Token) -> bool:
+        """True when the token's access token expiry is in the past (or missing)."""
+        if not token.at or not token.at_expires:
+            return True
+        at_expires = token.at_expires
+        if at_expires.tzinfo is None:
+            at_expires = at_expires.replace(tzinfo=timezone.utc)
+        return at_expires <= datetime.now(timezone.utc)
+
     def _should_refresh_at(self, token: Token) -> bool:
         """根据当前 token 快照判断是否需要刷新 AT。"""
         if not token.at:
@@ -1058,6 +1118,23 @@ class TokenManager:
                 debug_logger.op_warning(
                     f"[AT_REFRESH] token={token.id} ST expired → disabling (auto_st_expired; "
                     f"auto-recovers on next session push)"
+                )
+                await self.disable_token(token.id, reason="auto_st_expired")
+            elif (
+                disable_on_failure
+                and outcome.reason in ("unknown", "st_refresh_unavailable")
+                and self._at_already_expired(token)
+            ):
+                # The access token is ALREADY past its expiry and the refresh did not
+                # produce a new one for a non-transient reason. Before 2026-09-03 only a
+                # classified st_expired disabled; an "unknown" failure left the token
+                # is_active=1 forever — counted in the dashboard, skipped on every
+                # request ("AT无效或已过期"). Same recoverable disable as st_expired:
+                # the next verified session push from the device re-enables it.
+                debug_logger.op_warning(
+                    f"[AT_REFRESH] token={token.id} AT expired and refresh failed "
+                    f"({outcome.reason}) → disabling (auto_st_expired; auto-recovers on next "
+                    f"verified session push)"
                 )
                 await self.disable_token(token.id, reason="auto_st_expired")
             return None
@@ -1692,6 +1769,17 @@ class TokenManager:
             debug_logger.log_info(
                 f"[TOKEN] Token {token_id} hit an upstream capacity/solver error; "
                 f"not counting toward auto-disable: {str(error_message)[:120]}"
+            )
+            return
+
+        if _is_captcha_mint_failure(error_message):
+            # The extension never produced a token — a DEVICE failure, not Google
+            # rejecting the account. Short flat pause, no strike (see mark_mint_failure).
+            await self.mark_mint_failure(token_id)
+            await self.db.update_token(token_id, last_error_at=datetime.now())
+            debug_logger.log_info(
+                f"[TOKEN] Token {token_id}: extension could not mint a reCAPTCHA token; "
+                f"device paused briefly (no account strike): {str(error_message)[:120]}"
             )
             return
 

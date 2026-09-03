@@ -409,8 +409,23 @@ async def metrics():
     """Prometheus metrics endpoint for the main Flow2API service."""
     payload = await render_main_metrics(db, concurrency_manager=concurrency_manager)
     return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
+
+
+_LOGIN_LOOP_BREAKER_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Flow2API</title></head>
+<body><script>
+// Admin page requested without a valid session cookie. Clear the bearer copy the
+// login page keys off (a stale localStorage token + no cookie = endless
+// /login -> /manage -> /login bounce), then go to /login once.
+try { localStorage.removeItem('adminToken'); } catch (e) {}
+location.replace('/login');
+</script><noscript><meta http-equiv="refresh" content="0;url=/login"></noscript></body></html>"""
+
+
 def _ensure_admin_page_session(request: Request):
     token = admin.get_admin_token_from_cookie(request)
     if not admin.is_admin_session_token_valid(token):
-        return RedirectResponse(url="/login", status_code=302)
+        # Not a 302: a redirect can't clear localStorage, and only manage.html's JS
+        # (never served on this path) used to do it. Serve a tiny page that does.
+        return HTMLResponse(content=_LOGIN_LOOP_BREAKER_HTML, status_code=401,
+                            headers={"Cache-Control": "no-store"})
     return None

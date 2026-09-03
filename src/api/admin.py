@@ -48,6 +48,11 @@ captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 # Store active admin session tokens (in production, use Redis or database)
 active_admin_tokens = set()
 ADMIN_SESSION_COOKIE_NAME = "admin_session"
+# Persistent, not a browser-session cookie. Without max_age the cookie died when
+# Chrome closed while the bearer copy in localStorage lived on, and /login (bearer
+# says logged in → go to /manage) and /manage (cookie says not → back to /login)
+# bounced forever. See _ensure_admin_page_session in main.py for the loop breaker.
+ADMIN_SESSION_COOKIE_MAX_AGE = 7 * 24 * 3600
 SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
 
 
@@ -742,6 +747,7 @@ async def admin_login(request: LoginRequest, response: Response):
     response.set_cookie(
         key=ADMIN_SESSION_COOKIE_NAME,
         value=session_token,
+        max_age=ADMIN_SESSION_COOKIE_MAX_AGE,
         httponly=True,
         samesite="lax",
         secure=False,
@@ -799,6 +805,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
     token_rows = await db.get_all_tokens_with_stats()
     to_iso = lambda value: value.isoformat() if hasattr(value, "isoformat") else value
     now = datetime.now(timezone.utc)
+    skip_reasons = await _compute_skip_reasons(token_rows, now)
 
     def normalize_dt(value):
         if not value:
@@ -860,7 +867,66 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "last_error_at": to_iso(row.get("last_error_at")) if row.get("last_error_at") else None,
         "ban_reason": row.get("ban_reason"),
         "banned_at": to_iso(row.get("banned_at")) if row.get("banned_at") else None,
+        # Why the load balancer would skip this token RIGHT NOW ("" = eligible). The
+        # balancer only logs its filter reasons at debug level, so "active but never
+        # used" was undiagnosable from the UI/API. Same checks, same order, as
+        # LoadBalancer.select_token.
+        "skip_reason": skip_reasons.get(row.get("id"), ""),
     } for row in token_rows]  # 直接返回数组,兼容前端
+
+
+_QUOTA_FAMILIES = ("gemini-3.0-pro-image", "gemini-3.1-flash-image", "nano-banana-2-lite")
+
+
+async def _compute_skip_reasons(token_rows, now) -> Dict[int, str]:
+    """Mirror LoadBalancer.select_token's filters for every ACTIVE token, read-only."""
+    reasons: Dict[int, str] = {}
+    if token_manager is None:
+        return reasons
+    try:
+        await token_manager._ensure_quota_loaded()
+    except Exception:
+        pass
+    service = None
+    if config.captcha_method == "extension":
+        try:
+            from ..services.browser_captcha_extension import ExtensionCaptchaService
+            service = await ExtensionCaptchaService.get_instance(db)
+        except Exception:
+            service = None
+    for row in token_rows:
+        tid = row.get("id")
+        if not row.get("is_active"):
+            continue
+        parts: List[str] = []
+        try:
+            cd = token_manager._recaptcha_cd.get(tid)
+            if cd and now < cd[0]:
+                mins = int((cd[0] - now).total_seconds() // 60) + 1
+                parts.append(f"recaptcha cooldown {mins}m (strike {cd[1]})")
+            if token_manager.is_health_cooldown(tid):
+                parts.append(token_manager.health_cooldown_reason(tid) or "health cooldown")
+            exhausted = [f for f in _QUOTA_FAMILIES if token_manager.is_model_quota_exhausted(tid, f)]
+            if exhausted:
+                parts.append("quota: " + ", ".join(exhausted))
+            if service is not None:
+                ok, route_key = await service.has_connection_for_token(tid)
+                if not ok:
+                    parts.append("no browser online for route key" if route_key else "no route key / no browser")
+            at_exp = row.get("at_expires")
+            if isinstance(at_exp, str):
+                try:
+                    at_exp = datetime.fromisoformat(at_exp.replace("Z", "+00:00"))
+                except Exception:
+                    at_exp = None
+            if at_exp is not None and getattr(at_exp, "tzinfo", None) is None:
+                at_exp = at_exp.replace(tzinfo=timezone.utc)
+            if not row.get("at") or (at_exp is not None and at_exp <= now):
+                parts.append("access token expired")
+        except Exception as e:  # never let diagnostics break the token list
+            parts.append(f"(diag error: {e})")
+        reasons[tid] = "; ".join(parts)
+    return reasons
 
 
 @router.post("/api/tokens")
