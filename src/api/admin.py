@@ -867,20 +867,28 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "last_error_at": to_iso(row.get("last_error_at")) if row.get("last_error_at") else None,
         "ban_reason": row.get("ban_reason"),
         "banned_at": to_iso(row.get("banned_at")) if row.get("banned_at") else None,
-        # Why the load balancer would skip this token RIGHT NOW ("" = eligible). The
-        # balancer only logs its filter reasons at debug level, so "active but never
-        # used" was undiagnosable from the UI/API. Same checks, same order, as
-        # LoadBalancer.select_token.
-        "skip_reason": skip_reasons.get(row.get("id"), ""),
+        # Why the load balancer would skip this token RIGHT NOW for EVERY model
+        # ("" = eligible): reCAPTCHA cooldown, health cooldown, no browser online for
+        # its route key, expired access token. The balancer only logs its filter
+        # reasons at debug level, so "active but never used" was undiagnosable.
+        "skip_reason": skip_reasons.get(row.get("id"), {}).get("blocking", ""),
+        # Model families whose daily quota is exhausted on this account. Per-model:
+        # the token still serves every other family, so this is NOT a skip reason.
+        "quota_exhausted": skip_reasons.get(row.get("id"), {}).get("quota", []),
     } for row in token_rows]  # 直接返回数组,兼容前端
 
 
 _QUOTA_FAMILIES = ("gemini-3.0-pro-image", "gemini-3.1-flash-image", "nano-banana-2-lite")
 
 
-async def _compute_skip_reasons(token_rows, now) -> Dict[int, str]:
-    """Mirror LoadBalancer.select_token's filters for every ACTIVE token, read-only."""
-    reasons: Dict[int, str] = {}
+async def _compute_skip_reasons(token_rows, now) -> Dict[int, Dict[str, Any]]:
+    """Mirror LoadBalancer.select_token's filters for every ACTIVE token, read-only.
+
+    Returns {token_id: {"blocking": "reason; reason", "quota": [family, ...]}}.
+    Blocking reasons take the token out of the pool for every model; quota is
+    per family and only removes it for that family.
+    """
+    reasons: Dict[int, Dict[str, Any]] = {}
     if token_manager is None:
         return reasons
     try:
@@ -899,6 +907,7 @@ async def _compute_skip_reasons(token_rows, now) -> Dict[int, str]:
         if not row.get("is_active"):
             continue
         parts: List[str] = []
+        exhausted: List[str] = []
         try:
             cd = token_manager._recaptcha_cd.get(tid)
             if cd and now < cd[0]:
@@ -907,8 +916,6 @@ async def _compute_skip_reasons(token_rows, now) -> Dict[int, str]:
             if token_manager.is_health_cooldown(tid):
                 parts.append(token_manager.health_cooldown_reason(tid) or "health cooldown")
             exhausted = [f for f in _QUOTA_FAMILIES if token_manager.is_model_quota_exhausted(tid, f)]
-            if exhausted:
-                parts.append("quota: " + ", ".join(exhausted))
             if service is not None:
                 ok, route_key = await service.has_connection_for_token(tid)
                 if not ok:
@@ -925,7 +932,7 @@ async def _compute_skip_reasons(token_rows, now) -> Dict[int, str]:
                 parts.append("access token expired")
         except Exception as e:  # never let diagnostics break the token list
             parts.append(f"(diag error: {e})")
-        reasons[tid] = "; ".join(parts)
+        reasons[tid] = {"blocking": "; ".join(parts), "quota": exhausted}
     return reasons
 
 
