@@ -28,6 +28,10 @@ IMAGE_BASE_MODELS = {
     "nano-banana-2-lite": "nano-banana-2-lite",
     # Imagen 4.0 (IMAGEN_3_5)
     "imagen-4.0-generate-preview": "imagen-4.0-generate-preview",
+    # Friendly public aliases (Google's marketing names). Resolve to the same base
+    # model, so they share its quota bookkeeping. Adapted from Danborad/flow2api.
+    "nano-banana-pro": "gemini-3.0-pro-image",
+    "nano-banana-2": "gemini-3.1-flash-image",
 }
 
 # ──────────────────────────────────────────────
@@ -274,6 +278,11 @@ VIDEO_BASE_MODELS = {
     "omni": {
         "landscape": "omni",
         "portrait": "omni_portrait",
+    },
+    # Same abra_t2v_8s model with the output pinned to 720p (faster/cheaper).
+    "omni-flash": {
+        "landscape": "omni-flash",
+        "portrait": "omni-flash-portrait",
     },
     # I2V models
     "veo_3_1_i2v_s_fast_fl": {

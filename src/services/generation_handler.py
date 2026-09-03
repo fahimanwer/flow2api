@@ -740,6 +740,39 @@ MODEL_CONFIG = {
         "reference_duration": 8,
         "reference_model_display_name": "Omni Flash",
     },
+    # Omni Flash pinned to 720p output (outputSpec.resolution). Same upstream model
+    # key as "omni"; only the requested output resolution differs. Adapted from
+    # Gurumigun/flow2api 4093385a.
+    "omni-flash": {
+        "type": "video",
+        "video_type": "omni",
+        "model_key": "abra_t2v_8s",
+        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+        "supports_images": True,
+        "min_images": 0,
+        "max_images": 3,
+        "use_v2_model_config": True,
+        "allow_tier_upgrade": False,
+        "output_resolution": "VIDEO_RESOLUTION_720P",
+        "reference_model_key": "abra_r2v_8s",
+        "reference_duration": 8,
+        "reference_model_display_name": "Omni Flash",
+    },
+    "omni-flash-portrait": {
+        "type": "video",
+        "video_type": "omni",
+        "model_key": "abra_t2v_8s",
+        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+        "supports_images": True,
+        "min_images": 0,
+        "max_images": 3,
+        "use_v2_model_config": True,
+        "allow_tier_upgrade": False,
+        "output_resolution": "VIDEO_RESOLUTION_720P",
+        "reference_model_key": "abra_r2v_8s",
+        "reference_duration": 8,
+        "reference_model_display_name": "Omni Flash",
+    },
 }
 
 
@@ -1299,21 +1332,26 @@ class GenerationHandler:
         }
         debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}...")
 
+        # Create the request log BEFORE any network work, for streaming and
+        # non-streaming callers alike, so in-flight requests (status 102) are visible
+        # in the admin log while they run. Previously only streaming requests were
+        # logged at start; n8n/CLI callers appeared only once finished.
+        request_log_state["id"] = await self._log_request(
+            token_id=None,
+            operation=request_operation,
+            request_data=request_payload,
+            response_data={"status": "processing", "status_text": "started", "progress": 0, "request_id": request_id},
+            status_code=102,
+            duration=0,
+            status_text="started",
+            progress=0,
+        )
+
         # 向用户展示开始信息
         if stream:
             yield self._create_stream_chunk(
                 f"✨ {'Video' if generation_type == 'video' else 'Image'} generation task started\n",
                 role="assistant"
-            )
-            request_log_state["id"] = await self._log_request(
-                token_id=None,
-                operation=request_operation,
-                request_data=request_payload,
-                response_data={"status": "processing", "status_text": "started", "progress": 0, "request_id": request_id},
-                status_code=102,
-                duration=0,
-                status_text="started",
-                progress=0,
             )
 
         # 2. 选择Token
@@ -2168,6 +2206,7 @@ class GenerationHandler:
                     project_id=project_id,
                     prompt=prompt,
                     model_key=model_config["model_key"],
+                    output_resolution=model_config.get("output_resolution"),
                     aspect_ratio=model_config["aspect_ratio"],
                     use_v2_model_config=use_v2_model_config,
                     user_paygate_tier=normalized_tier,
