@@ -22,6 +22,11 @@
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 const LABS_URL = "https://labs.google/fx/tools/flow";
+// 2026-09-03: Google moved Flow to flow.google.com. Opening LABS_URL now redirects
+// there, so a tab "on Flow" may sit on EITHER origin. Every URL check below accepts
+// both; the session cookie may live on either domain too.
+const FLOW_ORIGINS = ["https://labs.google/fx/tools/flow", "https://flow.google.com"];
+const COOKIE_DOMAINS = ["labs.google", "flow.google.com"];
 const SESSION_COOKIE = "__Secure-next-auth.session-token";
 
 const ALARM_SESSION = "flow2api_session_refresh";
@@ -336,6 +341,7 @@ async function applyProxy(settings) {
     "function FindProxyForURL(url, host) {",
     "  var P = '" + P + "';",
     "  if (dnsDomainIs(host, 'labs.google')) return P;",                 // the Flow site + its session
+    "  if (dnsDomainIs(host, 'flow.google.com')) return P;",             // Flow's new home (2026-09)
     "  if (shExpMatch(url, '*://www.google.com/recaptcha/*')) return P;", // reCAPTCHA mint
     "  if (shExpMatch(url, '*://www.gstatic.com/recaptcha/*')) return P;",// reCAPTCHA assets
     "  if (dnsDomainIs(host, 'recaptcha.net')) return P;",               // reCAPTCHA fallback domain
@@ -582,7 +588,7 @@ function getTab(tabId) {
 }
 
 function tabUrlOf(tab) { return (tab && (tab.url || tab.pendingUrl)) || ""; }
-function isFlowUrl(u) { return !!u && u.startsWith(LABS_URL); }
+function isFlowUrl(u) { return !!u && FLOW_ORIGINS.some((o) => u.startsWith(o)); }
 
 // A tab counts as "on Flow" if EITHER its committed url OR its pending (loading)
 // url is the Flow URL — checked independently so an about:blank-then-Flow tab
@@ -620,13 +626,23 @@ function waitForTabComplete(tabId, timeoutMs = 15000) {
   });
 }
 
-async function hasSessionCookie() {
-  try {
-    let c = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
+// The NextAuth session cookie, from whichever Flow domain holds it (labs.google
+// first, then flow.google.com). Returns the cookie object or null.
+async function readSessionCookie() {
+  for (const domain of COOKIE_DOMAINS) {
+    let c = await chrome.cookies.get({ url: "https://" + domain, name: SESSION_COOKIE });
     if (!c) {
-      const all = await chrome.cookies.getAll({ domain: "labs.google" });
+      const all = await chrome.cookies.getAll({ domain });
       c = all.find((x) => x.name === SESSION_COOKIE) || null;
     }
+    if (c && c.value) return c;
+  }
+  return null;
+}
+
+async function hasSessionCookie() {
+  try {
+    const c = await readSessionCookie();
     return !!(c && c.value);
   } catch (_) {
     return true; // don't block on cookie API errors
@@ -1087,11 +1103,7 @@ async function dropOwnedTab(tabId) {
 // but session-scoped (no expirationDate) -> treat as roll-eligible on cadence so
 // the proactive feature never silently no-ops. Mirrors hasSessionCookie's read.
 async function sessionCookieTimeToExpiry() {
-  let c = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
-  if (!c) {
-    const all = await chrome.cookies.getAll({ domain: "labs.google" });
-    c = all.find((x) => x.name === SESSION_COOKIE) || null;
-  }
+  const c = await readSessionCookie();
   if (!c || !c.value) return null;
   if (!c.expirationDate) return 0; // session cookie, no expiry -> eligible to roll
   return c.expirationDate * 1000 - Date.now();
@@ -1204,11 +1216,7 @@ async function refreshSession(token_id = null, opts = {}) {
       await log("INFO", "Forced Labs reload before session push (server reported a dead access token)");
     }
     // Read the session-token cookie directly (no extra tab needed).
-    let cookie = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
-    if (!cookie) {
-      const all = await chrome.cookies.getAll({ domain: "labs.google" });
-      cookie = all.find((c) => c.name === SESSION_COOKIE) || null;
-    }
+    let cookie = await readSessionCookie();
     if (!cookie || !cookie.value) {
       // FALLBACK: the cookie read came back empty even though Google may still be
       // logged in. In persistent mode, force a navigation (reload existing tab, or
@@ -1232,11 +1240,7 @@ async function refreshSession(token_id = null, opts = {}) {
           };
         }
         await sleep(COOKIE_SETTLE_MS); // let NextAuth write the rolled cookie
-        cookie = await chrome.cookies.get({ url: "https://labs.google", name: SESSION_COOKIE });
-        if (!cookie) {
-          const all2 = await chrome.cookies.getAll({ domain: "labs.google" });
-          cookie = all2.find((c) => c.name === SESSION_COOKIE) || null;
-        }
+        cookie = await readSessionCookie();
         if (!cookie || !cookie.value) {
           // On Flow but still no cookie: unhealthy, not necessarily logged out.
           // Fail soft — next ALARM_SESSION retries; do NOT setLoginRequired here.
