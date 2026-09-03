@@ -126,7 +126,17 @@ class ExtensionCaptchaService:
         return ""
 
     def _has_connection_for_route_key(self, route_key: str) -> bool:
-        return self._select_connection(route_key) is not None
+        """Eligibility check used by the load balancer.
+
+        A BOUND account (non-empty route_key) is only eligible when ITS OWN browser is
+        online (strict). Before 2026-09-03 this used the non-strict lookup, which falls
+        back to "any online browser" — so the check was true for every account as long
+        as one extension was connected. Accounts whose Chrome was closed kept getting
+        picked, their reCAPTCHA was minted in another employee's browser, and both that
+        account (mint failures → strikes) and the other employee's device (tab thrash)
+        paid for it. Unbound accounts (empty route_key) keep the any-browser fallback.
+        """
+        return self._select_connection(route_key, strict=bool((route_key or "").strip())) is not None
 
     async def has_connection_for_token(self, token_id: Optional[int]) -> tuple[bool, str]:
         route_key = await self._resolve_route_key(token_id)
@@ -236,7 +246,11 @@ class ExtensionCaptchaService:
             raise RuntimeError("Chrome Extension not connected or Google Labs tab not open.")
 
         route_key = await self._resolve_route_key(token_id)
-        conn = self._select_connection(route_key)
+        # Bound account → mint ONLY on its own browser (same device/IP that redeems).
+        # Minting on a random other employee's browser produces tokens Google rejects
+        # (UNUSUAL_ACTIVITY) and hammers that other device; fail fast instead so the
+        # caller records a mint failure (short device pause, not an account strike).
+        conn = self._select_connection(route_key, strict=bool((route_key or "").strip()))
         if conn is None:
             available = self._describe_routes() or "none"
             raise RuntimeError(
