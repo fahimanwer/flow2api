@@ -35,6 +35,12 @@ class ExtensionCaptchaService:
         # Adapted from Gurumigun/flow2api 61e2d013.
         self._route_locks: dict[str, asyncio.Lock] = {}
         self._route_last_dispatch_at: dict[str, float] = {}
+        # route -> monotonic deadline: after a mint FAILS on a browser, every request
+        # already queued behind that route's lock fails fast instead of reopening the
+        # Flow tab every 3 s. 2026-09-03 night: one online account, ~8,400 req/h from
+        # the fleet, each 90 s pause expiry let a burst of requests queue on the route
+        # and hammer the owner's browser ("extension keeps reopening the Flow page").
+        self._route_paused_until: dict[str, float] = {}
         self._global_dispatch_lock = asyncio.Lock()
         self._global_last_dispatch_at = 0.0
 
@@ -98,13 +104,20 @@ class ExtensionCaptchaService:
                     return conn
             if strict:
                 return None
-            # else fall through to the any-browser fallback below
-        # Round-robin across ALL connected browsers (spreads minting load; each IP stays
-        # under Google's per-IP rate limit).
-        if not self.active_connections:
+            # else fall through to the shared-pool fallback below
+        # Fallback: round-robin across SHARED-POOL browsers only (connections that
+        # registered with an EMPTY route key). A browser bound to a specific account
+        # is that employee's Google session; minting another account's reCAPTCHA in
+        # it reopens their Flow tab every few seconds and yields tokens Google
+        # rejects. 2026-09-03 night: one unbound account (no route key) was the only
+        # eligible token once staff browsers closed, and its mints were round-robined
+        # onto the two browsers still open — "the extension keeps reopening the Flow
+        # page". Bound browsers are never borrowed.
+        shared = [c for c in self.active_connections if not (c.route_key or "").strip()]
+        if not shared:
             return None
-        self._rr_index = (self._rr_index + 1) % len(self.active_connections)
-        return self.active_connections[self._rr_index]
+        self._rr_index = (self._rr_index + 1) % len(shared)
+        return shared[self._rr_index]
 
     def _describe_routes(self) -> str:
         labels = []
@@ -271,6 +284,12 @@ class ExtensionCaptchaService:
         route_guard_key = route_key or "(empty)"
         route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
         async with route_lock:
+            paused_left = self._route_paused_until.get(route_guard_key, 0.0) - time.monotonic()
+            if paused_left > 0:
+                raise RuntimeError(
+                    f"Extension route paused after mint failure ({paused_left:.0f}s left) "
+                    f"for route_key='{route_key}'"
+                )
             min_interval = config.extension_route_min_interval_seconds
             last_dispatch_at = self._route_last_dispatch_at.get(route_guard_key, 0.0)
             wait_seconds = max(0.0, min_interval - (time.monotonic() - last_dispatch_at))
@@ -302,7 +321,17 @@ class ExtensionCaptchaService:
                 self._global_last_dispatch_at = time.monotonic()
 
             self._route_last_dispatch_at[route_guard_key] = time.monotonic()
-            return await self._dispatch_token_request(conn, route_key, project_id, action, timeout)
+            token_value = await self._dispatch_token_request(conn, route_key, project_id, action, timeout)
+            if token_value:
+                self._route_paused_until.pop(route_guard_key, None)
+            else:
+                pause = config.extension_route_failure_pause_seconds
+                self._route_paused_until[route_guard_key] = time.monotonic() + pause
+                debug_logger.op_warning(
+                    f"[Extension Captcha] mint failed on route_key={route_key or '-'}; "
+                    f"route paused {pause:.0f}s (queued requests fail fast)"
+                )
+            return token_value
 
     async def _dispatch_token_request(
         self,
