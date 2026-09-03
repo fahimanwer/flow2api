@@ -2186,8 +2186,12 @@ class FlowClient:
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        output_resolution: Optional[str] = None,
     ) -> dict:
         """文生视频,返回task_id
+
+        output_resolution: optional upstream outputSpec.resolution (e.g.
+        VIDEO_RESOLUTION_720P for the omni-flash models).
 
         Args:
             at: Access Token
@@ -2280,6 +2284,8 @@ class FlowClient:
                 "videoModelKey": model_key,
                 "metadata": {}
             }
+            if output_resolution:
+                request_data["outputSpec"] = {"resolution": output_resolution}
             json_data = {
                 "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
                 "clientContext": client_context,
