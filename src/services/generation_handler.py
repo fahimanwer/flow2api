@@ -776,6 +776,45 @@ MODEL_CONFIG = {
 }
 
 
+# ── Omni 1.1: first-frame (1 image) / first+last frame (2 images) use abra_i2v_*s;
+#    3+ images stay on the reference-images route (abra_r2v_*s). Adapted from
+#    Danborad/flow2api 7059fe14 + f9b8e8e2.
+for _omni_key in ("omni", "omni_portrait", "omni-flash", "omni-flash-portrait"):
+    MODEL_CONFIG[_omni_key].setdefault("first_frame_model_key", "abra_i2v_8s")
+    MODEL_CONFIG[_omni_key].setdefault("start_end_model_key", "abra_i2v_8s")
+    MODEL_CONFIG[_omni_key]["reference_model_display_name"] = "Omni 1.1 Flash"
+
+# ── Duration families: omni_4s / omni_6s / omni_8s / omni_10s (+ _portrait), and the
+#    720p omni-flash_{d}s twins. Each duration is its own upstream model key.
+for _duration in (4, 6, 8, 10):
+    for _base_key, _new_key in (
+        ("omni", f"omni_{_duration}s"),
+        ("omni_portrait", f"omni_{_duration}s_portrait"),
+        ("omni-flash", f"omni-flash_{_duration}s"),
+        ("omni-flash-portrait", f"omni-flash_{_duration}s_portrait"),
+    ):
+        _cfg = dict(MODEL_CONFIG[_base_key])
+        _cfg["model_key"] = f"abra_t2v_{_duration}s"
+        _cfg["first_frame_model_key"] = f"abra_i2v_{_duration}s"
+        _cfg["start_end_model_key"] = f"abra_i2v_{_duration}s"
+        _cfg["reference_model_key"] = f"abra_r2v_{_duration}s"
+        _cfg["reference_duration"] = _duration
+        MODEL_CONFIG[_new_key] = _cfg
+
+
+def _estimate_video_credit_cost_for_log(model: str, model_config: Dict[str, Any]) -> int:
+    """Flow credit cost of a video request, for the request log only."""
+    if model_config.get("type") != "video":
+        return 0
+    model_text = f"{model} {model_config.get('model_key', '')}".lower()
+    if "veo_3_1" in model_text and "lite" in model_text:
+        return 10
+    if model_config.get("video_type") == "omni" or "abra_" in model_text:
+        duration = int(model_config.get("reference_duration") or 8)
+        return {4: 7, 6: 10, 8: 12, 10: 15}.get(duration, 12)
+    return 0
+
+
 def _make_t2v_config(
     model_key: str,
     aspect_ratio: str,
@@ -1330,6 +1369,9 @@ class GenerationHandler:
             "prompt": prompt_for_log,
             "has_images": images is not None and len(images) > 0,
         }
+        if generation_type == "video":
+            request_payload["video_duration_seconds"] = model_config.get("reference_duration")
+            request_payload["video_credit_cost"] = _estimate_video_credit_cost_for_log(model, model_config)
         debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}...")
 
         # Create the request log BEFORE any network work, for streaming and
@@ -2086,20 +2128,30 @@ class GenerationHandler:
                     })
                 debug_logger.log_info(f"[R2V] 上传了 {len(reference_images)} 张参考图片")
 
-            # Omni R2V: 参考图上传到 project，随后直接走 batchAsyncGenerateVideoReferenceImages
+            # Omni 1.1: 1 image = first frame, 2 images = first + last frame (abra_i2v_*s);
+            # 3+ images = reference-images route (abra_r2v_*s).
             elif video_type == "omni" and images:
                 if stream:
-                    yield self._create_stream_chunk(f"上传 {image_count} 张 Omni 参考图片...\n")
+                    yield self._create_stream_chunk(f"Uploading {image_count} Omni 1.1 image(s)...\n")
 
-                for img in images:
+                uploaded_ids = []
+                for img in (images[:2] if image_count <= 2 else images):
                     media_id = await self.flow_client.upload_image(
                         token.at, img, model_config["aspect_ratio"], project_id=project_id
                     )
-                    reference_images.append({
-                        "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
-                        "mediaId": media_id
-                    })
-                debug_logger.log_info(f"[VIDEO OMNI-R2V] 上传了 {len(reference_images)} 张参考图片")
+                    uploaded_ids.append(media_id)
+                if image_count <= 2:
+                    start_media_id = uploaded_ids[0]
+                    end_media_id = uploaded_ids[1] if image_count == 2 else None
+                    debug_logger.log_info(
+                        f"[VIDEO OMNI-I2V] uploaded first{'+last' if end_media_id else ''} frame: {uploaded_ids}"
+                    )
+                else:
+                    reference_images = [
+                        {"imageUsageType": "IMAGE_USAGE_TYPE_ASSET", "mediaId": media_id}
+                        for media_id in uploaded_ids
+                    ]
+                    debug_logger.log_info(f"[VIDEO OMNI-R2V] uploaded {len(reference_images)} reference images")
 
             # ========== 调用生成API ==========
             if stream:
@@ -2159,6 +2211,42 @@ class GenerationHandler:
                 )
 
             # Omni: 有图走 Reference Images 直连链路，无图走纯文本链路
+            # Omni 1.1: single image = first frame, two images = first + last frame.
+            elif video_type == "omni" and start_media_id:
+                if stream:
+                    yield self._create_stream_chunk(
+                        "Submitting Omni 1.1 first+last-frame video task...\n" if end_media_id
+                        else "Submitting Omni 1.1 first-frame video task...\n"
+                    )
+                if end_media_id:
+                    result = await self.flow_client.generate_video_start_end(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_key=model_config.get("start_end_model_key", "abra_i2v_8s"),
+                        aspect_ratio=model_config["aspect_ratio"],
+                        start_media_id=start_media_id,
+                        end_media_id=end_media_id,
+                        use_v2_model_config=True,
+                        user_paygate_tier=normalized_tier,
+                        token_id=token.id,
+                        token_video_concurrency=token.video_concurrency,
+                    )
+                else:
+                    result = await self.flow_client.generate_video_start_image(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_key=model_config.get("first_frame_model_key", "abra_i2v_8s"),
+                        aspect_ratio=model_config["aspect_ratio"],
+                        start_media_id=start_media_id,
+                        use_v2_model_config=True,
+                        user_paygate_tier=normalized_tier,
+                        token_id=token.id,
+                        token_video_concurrency=token.video_concurrency,
+                    )
+
+            # Omni 1.1: three or more images → reference-images route.
             elif video_type == "omni" and reference_images:
                 if stream:
                     yield self._create_stream_chunk("提交 Omni 参考图视频任务...\n")
@@ -2301,6 +2389,11 @@ class GenerationHandler:
         consecutive_poll_errors = 0
         last_poll_error: Optional[Exception] = None
         max_consecutive_poll_errors = 3
+        # Upstream sometimes reports the video as done before its download URL is
+        # resolvable. Keep polling (bounded) instead of failing with 502.
+        # Adapted from Danborad/flow2api f9b8e8e2.
+        successful_without_url_count = 0
+        max_successful_without_url_count = 40
 
         for attempt in range(max_attempts):
             await asyncio.sleep(poll_interval)
@@ -2341,6 +2434,17 @@ class GenerationHandler:
                         debug_logger.log_warning(
                             f"[VIDEO POLL] 获取视频URL失败: media={media_name}, error={redirect_error}"
                         )
+                        successful_without_url_count += 1
+                        await self._update_request_log_progress(
+                            request_log_state,
+                            token_id=token.id,
+                            status_text="video_waiting_url",
+                            progress=min(95, 45 + successful_without_url_count),
+                        )
+                        if stream and successful_without_url_count == 1:
+                            yield self._create_stream_chunk("Video generated, waiting for upstream download URL...\n")
+                        if successful_without_url_count < max_successful_without_url_count:
+                            continue
                         await self._fail_video_task(checked_operations, error_msg)
                         self._mark_generation_failed(generation_result, error_msg)
                         yield self._create_error_response(error_msg, status_code=502)

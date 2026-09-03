@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
 
+from ..core.config import config
 from ..core.logger import debug_logger
 
 
@@ -27,6 +28,15 @@ class ExtensionCaptchaService:
         self.active_connections: list[ExtensionConnection] = []
         self.pending_requests: dict[str, asyncio.Future] = {}
         self._rr_index = 0  # round-robin cursor for empty-route (shared pool) browsers
+        # One Chrome profile = one Google account. Serialize mints per route and space
+        # them out so a burst cannot open many hidden Flow tabs in one browser at once
+        # (that thrash shows up in extension logs as "Swept extra owned Labs tabs",
+        # "Frame with ID 0 was removed", "labs tab did not reach Flow URL").
+        # Adapted from Gurumigun/flow2api 61e2d013.
+        self._route_locks: dict[str, asyncio.Lock] = {}
+        self._route_last_dispatch_at: dict[str, float] = {}
+        self._global_dispatch_lock = asyncio.Lock()
+        self._global_last_dispatch_at = 0.0
 
     @classmethod
     async def get_instance(cls, db=None) -> "ExtensionCaptchaService":
@@ -258,6 +268,51 @@ class ExtensionCaptchaService:
                 f"Available route keys: {available}"
             )
 
+        route_guard_key = route_key or "(empty)"
+        route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
+        async with route_lock:
+            min_interval = config.extension_route_min_interval_seconds
+            last_dispatch_at = self._route_last_dispatch_at.get(route_guard_key, 0.0)
+            wait_seconds = max(0.0, min_interval - (time.monotonic() - last_dispatch_at))
+            if wait_seconds > 0:
+                debug_logger.log_info(
+                    f"[Extension Captcha] Throttling route_key={route_key or '-'} for {wait_seconds:.2f}s"
+                )
+                await asyncio.sleep(wait_seconds)
+
+            # The browser may have disconnected while we waited for the previous mint
+            # on this route. Same strictness as above: a bound account mints only on
+            # its own browser.
+            conn = self._select_connection(route_key, strict=bool((route_key or "").strip()))
+            if conn is None:
+                available = self._describe_routes() or "none"
+                raise RuntimeError(
+                    f"Chrome Extension disconnected while waiting for route_key='{route_key}'. "
+                    f"Available route keys: {available}"
+                )
+
+            async with self._global_dispatch_lock:
+                global_interval = config.extension_global_min_interval_seconds
+                global_wait = max(0.0, global_interval - (time.monotonic() - self._global_last_dispatch_at))
+                if global_wait > 0:
+                    debug_logger.log_info(
+                        f"[Extension Captcha] Smoothing global dispatch for {global_wait:.2f}s"
+                    )
+                    await asyncio.sleep(global_wait)
+                self._global_last_dispatch_at = time.monotonic()
+
+            self._route_last_dispatch_at[route_guard_key] = time.monotonic()
+            return await self._dispatch_token_request(conn, route_key, project_id, action, timeout)
+
+    async def _dispatch_token_request(
+        self,
+        conn: "ExtensionConnection",
+        route_key: str,
+        project_id: str,
+        action: str,
+        timeout: int,
+    ) -> Optional[str]:
+        """Send one get_token request; the caller holds the per-route lock."""
         req_id = f"req_{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
         self.pending_requests[req_id] = future

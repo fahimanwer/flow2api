@@ -465,11 +465,35 @@ class Config:
     @property
     def browser_captcha_generation_retries(self) -> int:
         """生成接口因 reCAPTCHA 评估失败时允许的总重试次数。"""
-        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 6)
+        # 2 (was 6): a reCAPTCHA evaluation failure is a risk signal on the account;
+        # retrying six times makes it look worse and burned ~55 s per failed image.
+        # Adapted from Gurumigun/flow2api 61e2d013.
+        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 2)
         try:
             return max(1, min(20, int(value)))
         except Exception:
-            return 6
+            return 2
+
+    @property
+    def extension_route_min_interval_seconds(self) -> float:
+        """Minimum spacing between two reCAPTCHA mints on the SAME worker browser.
+        One Chrome profile = one Google account; a burst of parallel mints opens
+        several hidden Flow tabs at once and produces "Frame with ID 0 was removed"
+        / "labs tab did not reach Flow URL". Adapted from Gurumigun/flow2api."""
+        value = self._config.get("captcha", {}).get("extension_route_min_interval_seconds", 3.0)
+        try:
+            return max(0.0, min(30.0, float(value)))
+        except Exception:
+            return 3.0
+
+    @property
+    def extension_global_min_interval_seconds(self) -> float:
+        """Minimum spacing between mints across ALL worker browsers (smooths bursts)."""
+        value = self._config.get("captcha", {}).get("extension_global_min_interval_seconds", 1.0)
+        try:
+            return max(0.0, min(10.0, float(value)))
+        except Exception:
+            return 1.0
 
     @property
     def personal_max_resident_tabs(self) -> int:

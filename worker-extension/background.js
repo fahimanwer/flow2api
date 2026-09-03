@@ -908,7 +908,8 @@ async function handleGetToken(data, settings, responseSocket = ws) {
 
 async function _handleGetToken(data, settings, responseSocket = ws) {
   const action = data.action || "IMAGE_GENERATION";
-  const timeoutMs = action === "VIDEO_GENERATION" ? 30000 : 20000;
+  // Video mints take longer (server waits 75 s for VIDEO_GENERATION).
+  const timeoutMs = action === "VIDEO_GENERATION" ? 60000 : 20000;
 
   // Try up to twice: a stale persistent tab is recreated on the second attempt.
   for (let attempt = 1; attempt <= 2; attempt++) {
