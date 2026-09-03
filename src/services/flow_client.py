@@ -987,7 +987,9 @@ class FlowClient:
         error_str = str(error)
         error_lower = error_str.lower()
         if "recaptcha evaluation failed" in error_lower or "recaptcha 验证失败" in error_str:
-            return max(effective_max_retries, int(config.browser_captcha_generation_retries or 6))
+            # Dedicated (smaller) budget — do NOT inherit the generic upstream retry
+            # count. Each retry on a flagged account lowers its score further.
+            return max(1, int(config.browser_captcha_generation_retries or 2))
         return effective_max_retries
 
     def _build_realistic_video_submit_headers(self) -> Dict[str, str]:
@@ -4750,7 +4752,9 @@ class FlowClient:
             try:
                 from .browser_captcha_extension import ExtensionCaptchaService
                 service = await ExtensionCaptchaService.get_instance(self.db)
-                extension_timeout = 45 if action == "VIDEO_GENERATION" else 25
+                # Video mints take longer in the browser (extension waits up to 60 s for
+                # VIDEO_GENERATION since ext 3.3.6); give the server side headroom.
+                extension_timeout = 75 if action == "VIDEO_GENERATION" else 25
                 token = await service.get_token(
                     project_id,
                     action,
