@@ -153,3 +153,22 @@ class DeadSessionDisable(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromptRejectionNotAccountError(unittest.TestCase):
+    """Google safety-filter rejections are prompt faults: no strike, no disable count."""
+
+    def test_unsafe_generation_not_counted(self):
+        from src.services.token_manager import _is_prompt_rejection
+        msg = "Generation failed: PUBLIC_ERROR_UNSAFE_GENERATION: Request contains an invalid argument."
+        self.assertTrue(_is_prompt_rejection(msg))
+        tm = _make_tm()
+        asyncio.run(tm.record_error(30, msg, "gemini-3.1-flash-image-landscape"))
+        tm.db.increment_token_stats.assert_not_called()
+        self.assertNotIn(30, tm._recaptcha_cd)
+        tm.db.update_token.assert_awaited()  # last_error_at stamped
+
+    def test_real_errors_still_count(self):
+        from src.services.token_manager import _is_prompt_rejection
+        self.assertFalse(_is_prompt_rejection("HTTP Error 404: Requested entity was not found."))
+        self.assertFalse(_is_prompt_rejection("PUBLIC_ERROR_UNUSUAL_ACTIVITY: reCAPTCHA evaluation failed"))

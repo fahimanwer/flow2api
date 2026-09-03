@@ -68,6 +68,29 @@ def _is_environmental_token_error(error_message: Optional[str]) -> bool:
     return any(marker in lowered for marker in _ENVIRONMENTAL_ERROR_MARKERS)
 
 
+# Google rejected the PROMPT (safety filter / invalid argument), not the account.
+# Adapted from Danborad/flow2api cae263c7 ("avoid banning tokens for prompt
+# rejections"). 708 such rejections on 2026-09-03 alone ("woman wearing a leather
+# blazer" style false positives) were each incrementing consecutive_error_count,
+# marching healthy accounts toward the auto-disable threshold. Not counted, no
+# cooldown: the same prompt fails on any account, and the account is fine.
+_PROMPT_REJECTION_MARKERS = (
+    "unsafe_generation",
+    "invalid argument",
+    "invalid_argument",
+    "safety policy",
+    "content policy",
+)
+
+
+def _is_prompt_rejection(error_message: Optional[str]) -> bool:
+    """True when Google refused the prompt itself (account is healthy)."""
+    if not error_message:
+        return False
+    lowered = error_message.lower()
+    return any(marker in lowered for marker in _PROMPT_REJECTION_MARKERS)
+
+
 # The worker extension could not produce a reCAPTCHA token AT ALL (tab not on Flow,
 # frame removed mid-injection, empty result, browser offline). Google never saw a
 # request, so this says nothing about the ACCOUNT's anti-bot reputation — it is a
@@ -1769,6 +1792,16 @@ class TokenManager:
             debug_logger.log_info(
                 f"[TOKEN] Token {token_id} hit an upstream capacity/solver error; "
                 f"not counting toward auto-disable: {str(error_message)[:120]}"
+            )
+            return
+
+        if _is_prompt_rejection(error_message):
+            # Google refused the prompt (safety filter). Stamp last_error_at so the
+            # UI shows the attempt, but no strike, no cooldown, no disable count.
+            await self.db.update_token(token_id, last_error_at=datetime.now())
+            debug_logger.log_info(
+                f"[TOKEN] Token {token_id}: prompt rejected by Google (not an account "
+                f"fault; not counted): {str(error_message)[:120]}"
             )
             return
 
