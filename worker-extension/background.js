@@ -21,11 +21,20 @@
  */
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
-const LABS_URL = "https://labs.google/fx/tools/flow";
-// 2026-09-03: Google moved Flow to flow.google.com. Opening LABS_URL now redirects
-// there, so a tab "on Flow" may sit on EITHER origin. Every URL check below accepts
-// both; the session cookie may live on either domain too.
-const FLOW_ORIGINS = ["https://labs.google/fx/tools/flow", "https://flow.google.com"];
+// Where the worker tab is opened to mint. 2026-09-04: Google now bounces migrated
+// accounts from labs.google/fx/tools/flow to flow.google.com (client-side, ~1.5 s
+// after load). The new flow.google.com Angular app does NOT load grecaptcha at
+// all, and its CSP (Trusted Types + nonce) blocks injecting it, so a tab there can
+// never mint ("Failed to set the 'src' property ... TrustedScriptURL"). The Labs
+// FX home page does not redirect, loads grecaptcha.enterprise itself with the
+// SAME site key, and keeps the same NextAuth session alive (/fx/api/auth/session)
+// for migrated and non-migrated accounts alike — so that is where we mint.
+const MINT_URL = "https://labs.google/fx";
+// A tab is "on Flow" (not bounced to login/consent) on either origin, so a
+// redirect to flow.google.com is never mistaken for a sign-out ...
+const FLOW_ORIGINS = ["https://labs.google/fx", "https://flow.google.com"];
+// ... but only a labs.google tab can actually mint (see above).
+const MINT_ORIGINS = ["https://labs.google/fx"];
 const COOKIE_DOMAINS = ["labs.google", "flow.google.com"];
 const SESSION_COOKIE = "__Secure-next-auth.session-token";
 
@@ -589,6 +598,7 @@ function getTab(tabId) {
 
 function tabUrlOf(tab) { return (tab && (tab.url || tab.pendingUrl)) || ""; }
 function isFlowUrl(u) { return !!u && FLOW_ORIGINS.some((o) => u.startsWith(o)); }
+function isMintUrl(u) { return !!u && MINT_ORIGINS.some((o) => u.startsWith(o)); }
 
 // A tab counts as "on Flow" if EITHER its committed url OR its pending (loading)
 // url is the Flow URL — checked independently so an about:blank-then-Flow tab
@@ -597,8 +607,10 @@ function tabOnFlow(tab) {
   return !!tab && (isFlowUrl(tab.url || "") || isFlowUrl(tab.pendingUrl || ""));
 }
 
-// A tab is "usable" (ready to mint) only when navigation has COMMITTED to Flow.
-function tabUsable(tab) { return !!tab && isFlowUrl(tab.url || ""); }
+// A tab is "usable" (ready to mint) only when navigation has COMMITTED to a
+// labs.google page — a flow.google.com tab is on Flow but cannot mint, so it is
+// never reused; the caller drops it and opens MINT_URL instead.
+function tabUsable(tab) { return !!tab && isMintUrl(tab.url || ""); }
 
 function isLoginTab(tab) {
   const u = tabUrlOf(tab);
@@ -767,7 +779,7 @@ async function openLabsTab() {
   await chrome.storage.local.set({ creationLease: { state: "creating", expiresAt: Date.now() + LEASE_MS } });
   let tab;
   try {
-    tab = await chrome.tabs.create({ url: LABS_URL, active: false });
+    tab = await chrome.tabs.create({ url: MINT_URL, active: false });
   } catch (e) {
     await chrome.storage.local.remove("creationLease");
     throw e;
@@ -785,6 +797,13 @@ async function openLabsTab() {
       await removeOwned(tab.id);
       if (isLoginTab(settled)) await setLoginRequired("Labs redirected to " + tabUrlOf(settled));
       throw new Error("labs tab did not reach Flow URL (" + (tabUrlOf(settled) || "gone") + ")");
+    }
+    if (!tabUsable(settled)) {
+      // On Flow, but on a page with no reCAPTCHA (flow.google.com). Don't keep it:
+      // every mint there fails, and the retry would just reuse it.
+      try { await chrome.tabs.remove(tab.id); } catch (_) {}
+      await removeOwned(tab.id);
+      throw new Error("labs tab was redirected to " + tabUrlOf(settled) + " where reCAPTCHA cannot be minted");
     }
     await sleep(1200); // let grecaptcha settle
     return tab.id;
@@ -901,15 +920,24 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
               .catch((e) => fail(e && e.message ? e.message : "recaptcha execute failed"));
           });
         };
-        if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
-          run();
-        } else {
+        const inject = () => {
           const s = document.createElement("script");
           s.src = "https://www.google.com/recaptcha/enterprise.js?render=" + siteKey;
           s.onload = run;
           s.onerror = () => fail("failed to load enterprise.js");
           document.head.appendChild(s);
-        }
+        };
+        // The page loads grecaptcha itself (labs.google/fx does so within ~250 ms of
+        // load). Give it up to 8 s before falling back to injecting the script — on a
+        // Trusted-Types page (flow.google.com) injection is blocked and fails loudly.
+        const started = Date.now();
+        const waitForPage = () => {
+          if (settled) return;
+          if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) { run(); return; }
+          if (Date.now() - started > 8000) { inject(); return; }
+          setTimeout(waitForPage, 200);
+        };
+        waitForPage();
         setTimeout(() => fail("timeout minting recaptcha token"), timeoutMs);
       } catch (e) {
         fail(e && e.message ? e.message : e);

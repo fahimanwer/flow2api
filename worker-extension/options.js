@@ -29,7 +29,7 @@ function refreshStatus() {
       // real sign-out/sign-in fixes it — say exactly that, above everything else.
       setStatus("disconnected", "⚠️ Google needs you to sign in again: sign OUT of Google Labs, sign back IN, then click Reconnect");
     } else if (r && r.loginRequired) {
-      setStatus("disconnected", "Signed out of Google Labs — open flow.google.com, sign in, then click Reconnect");
+      setStatus("disconnected", "Signed out of Google Labs — open labs.google/fx, sign in with this account, then click Reconnect");
     } else if (r && r.connected) {
       setStatus("connected", "✅ Connected — working automatically");
     } else {
