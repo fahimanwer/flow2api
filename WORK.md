@@ -1,6 +1,6 @@
 # Shared Agent Status
 
-Last updated: 2026-09-04 04:40 UTC
+Last updated: 2026-09-04 12:30 UTC
 
 ## Active
 
@@ -19,6 +19,14 @@ Last updated: 2026-09-04 04:40 UTC
 - The fleet-wide zero successes 20:00-03:00 UTC were 503 fast-fails (no eligible account: staff offline, others out of daily quota), not reCAPTCHA. Content Factory keeps firing all night; backing off when no browser is online would be a content-factory change (owner has not decided).
 - Server-side defences from 2026-09-03 (PRs #1-#6) stand: strict route binding, 90 s route pause after a failed mint with queued requests failing fast, no account strike for mint failures, dead sessions auto-disabled, UNSAFE_GENERATION not counted as an account error.
 - Tests: `pytest` runs from `.venv` on the command-center box (see Coordination). 1 pre-existing failure (`test_api_captcha_fingerprint`), unrelated.
+
+- **2026-09-04 12:04-12:20 UTC, owner's browser on 3.3.9: mints succeed (65x 200 in 15 min) but the Labs tab still reloads/reopens and the Chrome window sometimes vanishes.** Root causes CONFIRMED from the pasted extension log + code, fixed in **3.3.10** (PR #10, `worker-extension/background.js`):
+  1. Remove-before-create. The mint-retry path, the sweep and `dropOwnedTab` removed the old tab and only then opened a new one. The worker tab is normally the ONLY tab in its window (dedicated staff profile); removing it closes the window, and with no window left `chrome.tabs.create` fails with `No current window` (the exact error in the owner's log 2026-09-03 21:39:40). Now: `createTabSafely` opens the replacement first, in the same window; `removeOwnedTabSafely` never closes the last tab of a window (deregisters it and logs instead); on `No current window` an unfocused window is created so the profile self-heals.
+  2. `rollSessionTab` counted a reload that landed on `flow.google.com` as success (`tabOnFlow` true, `tabUsable` false), so the tab silently became unmintable and the next mint replaced it with no log line. Now steered back to `labs.google/fx` in place via `tabs.update`.
+  3. No log said WHY a tab was replaced. A swap at 12:04:58 (tab kept at 12:04:39, replaced 19 s later while alive) is UNKNOWN for that reason. Now every replacement logs the old tab's `{url,status,discarded,win}` plus the attempt-1 error; the popup shows only the newest 25 lines (`options.js` `slice(0,25)`), so ask for a paste soon after the event.
+  - Also: a Chrome-discarded (memory saver) tab is reloaded in place instead of failing the mint. Sweep log now includes kept/closed URLs.
+  - NOT verified on a live browser before merge: owner asked to push before testing. `node --check` passes. Rollback: copy `worker-3.3.9.backup.zip` over `worker-latest.zip` on the data volume.
+- **Owner's account is over-subscribed, not failing.** 12:20 UTC: token 55 `inflight=73`, 215 requests parked at `102 solving_image_captcha` vs 65 done in 15 min; every other 3.3.9 account single-digit backlog. Cause: `image_concurrency=-1` (unlimited) + most credits -> balancer stacks it, but one browser mints ~1 captcha / 3 s. Recommended: set token 55 `image_concurrency` ~8. Owner not yet decided.
 
 ## Open
 
