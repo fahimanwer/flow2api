@@ -876,19 +876,29 @@ async function maybeEnsurePersistentTab() {
 /* ------------------------------- minting ----------------------------- */
 
 // Run grecaptcha.enterprise.execute in the given tab's MAIN world.
+//
+// The injected function NEVER rejects. A rejected promise does not survive the
+// executeScript boundary — Chrome hands back `result: undefined` and the reason is
+// gone — so every failure used to surface as the useless "empty token result" and
+// Google's actual verdict was lost (2026-09-03: hours spent guessing why minting
+// broke after the flow.google.com move). Resolve a verdict object instead, then
+// re-throw it here with the page context that explains it.
 async function mintTokenInTab(tabId, action, timeoutMs) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: (siteKey, action, timeoutMs) => new Promise((resolve, reject) => {
+    func: (siteKey, action, timeoutMs) => new Promise((resolve) => {
       let settled = false;
-      const finish = (fn, v) => { if (!settled) { settled = true; fn(v); } };
+      const ctx = () => ({ url: location.href, hadGrecaptcha: typeof grecaptcha !== "undefined" });
+      const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+      const ok = (t) => done(Object.assign({ ok: true, token: t }, ctx()));
+      const fail = (err) => done(Object.assign({ ok: false, err: String(err || "unknown") }, ctx()));
       try {
         const run = () => {
           grecaptcha.enterprise.ready(() => {
             grecaptcha.enterprise.execute(siteKey, { action })
-              .then((t) => finish(resolve, t))
-              .catch((e) => finish(reject, e && e.message ? e.message : "recaptcha execute failed"));
+              .then((t) => (t ? ok(t) : fail("recaptcha returned an empty token")))
+              .catch((e) => fail(e && e.message ? e.message : "recaptcha execute failed"));
           });
         };
         if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
@@ -897,18 +907,22 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
           const s = document.createElement("script");
           s.src = "https://www.google.com/recaptcha/enterprise.js?render=" + siteKey;
           s.onload = run;
-          s.onerror = () => finish(reject, "failed to load enterprise.js");
+          s.onerror = () => fail("failed to load enterprise.js");
           document.head.appendChild(s);
         }
-        setTimeout(() => finish(reject, "timeout minting recaptcha token"), timeoutMs);
+        setTimeout(() => fail("timeout minting recaptcha token"), timeoutMs);
       } catch (e) {
-        finish(reject, e.message);
+        fail(e && e.message ? e.message : e);
       }
     }),
     args: [RECAPTCHA_SITE_KEY, action, timeoutMs]
   });
-  if (results && results[0] && results[0].result) return results[0].result;
-  throw new Error("empty token result");
+  const r = results && results[0] ? results[0].result : null;
+  if (r && r.ok && r.token) return r.token;
+  // No verdict at all means the injection itself failed (tab navigated away, no
+  // host permission) — say that rather than blaming reCAPTCHA.
+  if (!r) throw new Error("mint injection returned nothing (tab gone or not injectable)");
+  throw new Error(`${r.err} [url=${r.url}, grecaptcha=${r.hadGrecaptcha ? "present" : "absent"}]`);
 }
 
 async function handleGetToken(data, settings, responseSocket = ws) {
