@@ -734,9 +734,12 @@ async function sweepOwnedTabs(keepId = null) {
 
   let closed = 0;
   const survivors = [];
+  const closedUrls = [];
   for (const x of live) {
     if (keep && x.id === keep.id) { survivors.push(x.id); continue; }
-    try { await chrome.tabs.remove(x.id); closed++; } catch (_) {}
+    // Window-safe: a tab that is the last in its window is left open and merely
+    // deregistered (removeOwnedTabSafely logs it) — closing it closes the window.
+    if (await removeOwnedTabSafely(x.id, "extra owned tab")) { closed++; closedUrls.push(shortUrl(x.tab.url)); }
   }
   await mutateOwned((cur) => cur.filter((id) => survivors.includes(id)));
 
@@ -747,7 +750,7 @@ async function sweepOwnedTabs(keepId = null) {
     persistentTabId = null;
     await chrome.storage.local.remove("persistentTabId");
   }
-  if (closed > 0) await log("INFO", "Swept extra owned Labs tabs", { kept: keep ? keep.id : null, closed });
+  if (closed > 0) await log("INFO", "Swept extra owned Labs tabs", { kept: keep ? keep.id : null, keptUrl: keep ? shortUrl(keep.tab.url) : null, closed, closedUrls });
   return keep ? keep.id : null;
 }
 
@@ -762,6 +765,76 @@ async function findUsableLabsTab() {
   return null;
 }
 
+/* ------------------------ window-safe tab handling ------------------- */
+//
+// 2026-09-04: the worker tab is usually the ONLY tab in its Chrome window (staff run
+// it in a dedicated profile). Chrome closes a window when its last tab closes, and a
+// profile with no window left makes the next chrome.tabs.create fail with
+// "No current window" (seen 2026-09-03 21:39:40). Every path below that used to
+// remove-then-recreate did exactly that: the window vanished, the replacement could
+// not be opened, and the account went dark until a human clicked the profile.
+// Rules now: (1) create the replacement FIRST, in the same window, then remove the
+// old tab; (2) never close the last tab of a window, deregister it instead;
+// (3) a tab that drifted off labs.google/fx is navigated back, not killed.
+
+function shortUrl(u) { u = String(u || ""); return u.length > 90 ? u.slice(0, 90) + "…" : u; }
+
+// Compact picture of every owned tab, for the log line that explains a replacement.
+async function snapshotOwnedTabs() {
+  const out = [];
+  for (const id of await getOwned()) {
+    const t = await getTab(id);
+    out.push(t
+      ? { id, url: shortUrl(t.url), pending: t.pendingUrl ? shortUrl(t.pendingUrl) : undefined, status: t.status, discarded: !!t.discarded, win: t.windowId }
+      : { id, gone: true });
+  }
+  return out;
+}
+
+async function isLastTabInWindow(tab) {
+  if (!tab || tab.windowId == null) return false;
+  try { const tabs = await chrome.tabs.query({ windowId: tab.windowId }); return tabs.length <= 1; }
+  catch (_) { return false; }
+}
+
+// Remove an owned tab without ever closing its window. Returns true if the tab was
+// actually closed; false if it was left open (last in window) or already gone. In
+// both false cases it is deregistered so the extension stops managing it.
+async function removeOwnedTabSafely(tabId, why) {
+  const tab = await getTab(tabId);
+  if (tab && await isLastTabInWindow(tab)) {
+    await log("INFO", "Left tab open: it is the last tab in its window (closing it would close the window)", { tabId, url: shortUrl(tab.url), why: why || null });
+    await removeOwned(tabId);
+    return false;
+  }
+  let closed = false;
+  try { await chrome.tabs.remove(tabId); closed = true; } catch (_) {}
+  await removeOwned(tabId);
+  return closed;
+}
+
+// chrome.tabs.create that survives the two ways it fails in a worker profile: the
+// preferred window is gone (retry without it) and the profile has NO window at all
+// ("No current window") -> open one, unfocused, so the account self-heals instead
+// of waiting for a human to click the profile.
+async function createTabSafely(url, preferWindowId) {
+  const noWindow = (e) => /no current window/i.test(String(e && e.message || e));
+  if (preferWindowId != null) {
+    try { return await chrome.tabs.create({ url, active: false, windowId: preferWindowId }); }
+    catch (e) { if (noWindow(e)) { /* fall through to windows.create */ } else { /* window gone: retry below */ } }
+  }
+  try {
+    return await chrome.tabs.create({ url, active: false });
+  } catch (e) {
+    if (!noWindow(e)) throw e;
+    const win = await chrome.windows.create({ url, focused: false, type: "normal" });
+    const tab = win && win.tabs && win.tabs[0];
+    if (!tab) throw new Error("no Chrome window was open and creating one failed");
+    await log("WARN", "No Chrome window was open for this profile; opened one for the Labs tab", { windowId: win.id, tabId: tab.id });
+    return tab;
+  }
+}
+
 /* --------------------------- tab creation ---------------------------- */
 
 // Open ONE hidden Labs tab, wait for it to settle, and verify it actually reached
@@ -770,7 +843,9 @@ async function findUsableLabsTab() {
 // or let a respawned worker create a second tab. Throws on login redirect (and
 // trips the circuit breaker). Used for BOTH persistent and ephemeral modes; it
 // does NOT itself assign persistentTabId (callers own that policy).
-async function openLabsTab() {
+// opts.windowId: open the tab in that window (the one the tab it replaces lives in),
+// so a later removal of the old tab can never close the window the user is watching.
+async function openLabsTab(opts = {}) {
   // Absolute create ceiling: enforced at the single creation chokepoint, so NO
   // caller (persistent, ephemeral, warm, retry) can push owned tabs past the cap.
   const liveOwned = await queryOwnedLiveTabs();
@@ -779,7 +854,7 @@ async function openLabsTab() {
   await chrome.storage.local.set({ creationLease: { state: "creating", expiresAt: Date.now() + LEASE_MS } });
   let tab;
   try {
-    tab = await chrome.tabs.create({ url: MINT_URL, active: false });
+    tab = await createTabSafely(MINT_URL, opts.windowId);
   } catch (e) {
     await chrome.storage.local.remove("creationLease");
     throw e;
@@ -792,17 +867,16 @@ async function openLabsTab() {
     const settled = await getTab(tab.id);
     if (!tabOnFlow(settled)) {
       // Redirected away from Flow (login/consent) or vanished — don't keep it,
-      // and don't let it be recreated forever.
-      try { await chrome.tabs.remove(tab.id); } catch (_) {}
-      await removeOwned(tab.id);
+      // and don't let it be recreated forever. (Left open, unowned, if it is the
+      // last tab in its window: a login page the user can actually sign in on.)
+      await removeOwnedTabSafely(tab.id, "did not reach Flow");
       if (isLoginTab(settled)) await setLoginRequired("Labs redirected to " + tabUrlOf(settled));
       throw new Error("labs tab did not reach Flow URL (" + (tabUrlOf(settled) || "gone") + ")");
     }
     if (!tabUsable(settled)) {
       // On Flow, but on a page with no reCAPTCHA (flow.google.com). Don't keep it:
       // every mint there fails, and the retry would just reuse it.
-      try { await chrome.tabs.remove(tab.id); } catch (_) {}
-      await removeOwned(tab.id);
+      await removeOwnedTabSafely(tab.id, "landed on a page without reCAPTCHA");
       throw new Error("labs tab was redirected to " + tabUrlOf(settled) + " where reCAPTCHA cannot be minted");
     }
     await sleep(1200); // let grecaptcha settle
@@ -834,11 +908,26 @@ async function _ensurePersistentTab() {
   // 1) Already have a live, usable tab -> adopt + collapse any extras to one.
   const usable = await findUsableLabsTab();
   if (usable != null) {
+    // Chrome's memory saver can discard a background tab: url is kept (so it still
+    // looks usable) but the page is gone and a mint in it fails. Reload it in place
+    // rather than letting the retry throw the tab away.
+    const t = await getTab(usable);
+    if (t && t.discarded) {
+      await log("INFO", "Labs tab was discarded by Chrome (memory saver); reloading it in place", { tabId: usable });
+      try { await chrome.tabs.reload(usable, { bypassCache: false }); await waitForTabComplete(usable); await sleep(1200); } catch (_) {}
+    }
     persistentTabId = usable;
     await chrome.storage.local.set({ persistentTabId: usable });
     await sweepOwnedTabs(usable);
     return persistentTabId;
   }
+
+  // Nothing usable. Record WHY before creating, so a replacement is never a mystery
+  // in the log again (2026-09-04: a tab was swapped 19 s after being kept, and
+  // nothing said what the old tab's URL was).
+  const before = await snapshotOwnedTabs();
+  const liveBefore = before.filter((x) => !x.gone);
+  const preferWindowId = liveBefore.length ? liveBefore[0].win : undefined;
 
   // 2) Honor an in-flight creation lease (possibly from a prior SW life): wait a
   //    beat and re-check instead of starting a second creation.
@@ -865,14 +954,47 @@ async function _ensurePersistentTab() {
     throw new Error("login_required");
   }
 
-  // 5) Create exactly one.
-  const id = await openLabsTab();
+  // 5) Create exactly one — in the same window as whatever we had, so the sweep
+  //    that follows removes a tab from a window that still has ours in it.
+  const id = await openLabsTab({ windowId: preferWindowId });
   await clearLoginRequired();
   persistentTabId = id;
   await chrome.storage.local.set({ persistentTabId: id });
   await sweepOwnedTabs(id); // close anything that snuck in during the load window
-  await log("INFO", "Persistent Labs tab opened", { tabId: persistentTabId });
+  await log("INFO", "Persistent Labs tab opened", {
+    tabId: persistentTabId,
+    why: liveBefore.length ? "owned tab(s) were not on labs.google/fx" : (before.length ? "owned tab(s) were gone" : "no owned tab"),
+    previous: before,
+  });
   return persistentTabId;
+}
+
+// Swap the persistent tab for a fresh one because a mint failed IN it. Order matters:
+// the new tab is created first, in the SAME window, and only then is the old one
+// removed — so the window survives even when the old tab was its last tab (the
+// 2026-09-03 "No current window" failure). Serialized on ensureChain like ensure.
+function replacePersistentTab(why) {
+  const run = () => _replacePersistentTab(why);
+  ensureChain = ensureChain.then(run, run);
+  return ensureChain;
+}
+
+async function _replacePersistentTab(why) {
+  const cur = await findUsableLabsTab();
+  if (cur == null) return _ensurePersistentTab(); // nothing to replace: normal path (logs its own reason)
+  const curTab = await getTab(cur);
+  const fresh = await openLabsTab({ windowId: curTab ? curTab.windowId : undefined });
+  await clearLoginRequired();
+  persistentTabId = fresh;
+  await chrome.storage.local.set({ persistentTabId: fresh });
+  await removeOwnedTabSafely(cur, why);
+  await sweepOwnedTabs(fresh);
+  await log("WARN", "Replaced the Labs tab", {
+    why,
+    old: curTab ? { id: cur, url: shortUrl(curTab.url), status: curTab.status, discarded: !!curTab.discarded, win: curTab.windowId } : { id: cur, gone: true },
+    new: fresh,
+  });
+  return fresh;
 }
 
 // Warm/keep the persistent tab, respecting the login circuit breaker. Recovers
@@ -968,6 +1090,7 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
   const action = data.action || "IMAGE_GENERATION";
   // Video mints take longer (server waits 75 s for VIDEO_GENERATION).
   const timeoutMs = action === "VIDEO_GENERATION" ? 60000 : 20000;
+  let lastMintError = null; // attempt 1's failure, carried into the replacement log line
 
   // Try up to twice: a stale persistent tab is recreated on the second attempt.
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -981,16 +1104,12 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
         if (attempt === 2) {
           // First mint failed. If the current tab isn't a usable Flow tab, the
           // breaker/auth gate will handle it; if it IS Flow but still failing,
-          // drop that owned tab so a fresh one is created (no sticky bad tab).
-          const cur = await findUsableLabsTab();
-          if (cur != null) {
-            try { await chrome.tabs.remove(cur); } catch (_) {}
-            await removeOwned(cur);
-            persistentTabId = null;
-            await chrome.storage.local.remove("persistentTabId");
-          }
+          // swap it for a fresh one (no sticky bad tab). Create-then-remove, same
+          // window — never the old remove-then-create that closed the window.
+          tabId = await replacePersistentTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
+        } else {
+          tabId = await ensurePersistentTab();
         }
-        tabId = await ensurePersistentTab();
       }
 
       await paceMint(settings.mintIntervalMs);
@@ -999,6 +1118,7 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
       return;
     } catch (e) {
       const msg = String(e && e.message || e);
+      lastMintError = msg;
       await log("ERROR", `token attempt ${attempt} failed`, { error: msg });
       if (msg === "login_required") {
         // No point retrying — surface immediately so the backend can route elsewhere.
@@ -1131,14 +1251,27 @@ function closeSocket() {
 
 /* --------------------------- session refresh ------------------------- */
 
-// Drop an owned tab (best-effort remove + deregister + clear persistent pointer).
-async function dropOwnedTab(tabId) {
-  try { await chrome.tabs.remove(tabId); } catch (_) {}
-  await removeOwned(tabId);
+// Drop an owned tab (window-safe remove + deregister + clear persistent pointer).
+async function dropOwnedTab(tabId, why) {
+  await removeOwnedTabSafely(tabId, why);
   if (tabId === persistentTabId) {
     persistentTabId = null;
     await chrome.storage.local.remove("persistentTabId");
   }
+}
+
+// Bring an owned tab that drifted off labs.google/fx back there, in place. Returns
+// true if it is mintable afterwards. Used instead of killing the tab, because
+// killing it is what closed the user's window.
+async function steerTabBackToMintPage(tabId) {
+  try {
+    await chrome.tabs.update(tabId, { url: MINT_URL });
+    await waitForTabComplete(tabId);
+  } catch (_) { return false; }
+  const t = await getTab(tabId);
+  if (!tabUsable(t)) return false;
+  await sleep(1200); // grecaptcha settle
+  return true;
 }
 
 // Time-to-expiry (ms) of the session-token cookie. null = no cookie; 0 = present
@@ -1160,23 +1293,47 @@ async function sessionCookieTimeToExpiry() {
 async function rollSessionTab() {
   let tabId = await findUsableLabsTab();
   if (tabId != null) {
+    const beforeTab = await getTab(tabId);
     try {
       await chrome.tabs.reload(tabId, { bypassCache: false });
     } catch (_) {
-      await dropOwnedTab(tabId); // tab vanished mid-reload -> fall through to fresh open
+      await dropOwnedTab(tabId, "vanished mid-reload"); // -> fall through to fresh open
       tabId = null;
     }
     if (tabId != null) {
       await waitForTabComplete(tabId);
       const settled = await getTab(tabId);
-      if (!tabOnFlow(settled)) {
-        if (isLoginTab(settled)) await setLoginRequired("reload bounced to " + tabUrlOf(settled));
-        else await log("WARN", "Reload settled off-Flow (non-login)", { url: tabUrlOf(settled) });
-        await dropOwnedTab(tabId);
+      if (isLoginTab(settled)) {
+        // Real sign-out. Arm the breaker; leave the login page where the user can
+        // see it (dropOwnedTab keeps a last-in-window tab open, unowned).
+        await setLoginRequired("reload bounced to " + tabUrlOf(settled));
+        await dropOwnedTab(tabId, "login bounce");
         return null;
       }
-      await sleep(1200); // grecaptcha settle, mirror openLabsTab
-      return tabId;
+      if (!tabUsable(settled)) {
+        // Off labs.google/fx (or on flow.google.com, which has no reCAPTCHA).
+        // 3.3.9 returned this tab as "fine" in the flow.google.com case, so the
+        // next mint quietly replaced it. Steer it back in place instead.
+        await log("WARN", "Reload landed off the mint page; steering the tab back to labs.google/fx", { url: tabUrlOf(settled) });
+        if (await steerTabBackToMintPage(tabId)) return tabId;
+        await log("WARN", "Could not steer the tab back; opening a fresh one", { url: tabUrlOf(await getTab(tabId)) });
+        await dropOwnedTab(tabId, "stuck off the mint page");
+        tabId = null;
+      } else {
+        await sleep(1200); // grecaptcha settle, mirror openLabsTab
+        return tabId;
+      }
+    }
+    // Fresh open goes in the same window the old tab was in.
+    try {
+      const id = await openLabsTab({ windowId: beforeTab ? beforeTab.windowId : undefined });
+      persistentTabId = id;
+      await chrome.storage.local.set({ persistentTabId: id });
+      await sweepOwnedTabs(id);
+      return id;
+    } catch (e) {
+      await log("WARN", "rollSessionTab fresh open failed", { error: e && e.message });
+      return null;
     }
   }
   // No usable tab to reload -> open one fresh. openLabsTab enforces the ceiling,
