@@ -1,6 +1,7 @@
 """Database storage layer for Flow2API"""
 import asyncio
 import aiosqlite
+import anyio
 import json
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone, timedelta
@@ -20,7 +21,7 @@ class Database:
     # Hard-delete assignment rows for devices not seen in this many days (housekeeping).
     DEVICE_PRUNE_DAYS = 7
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, *, max_connections: int = 32):
         if db_path is None:
             # Store database in data directory
             data_dir = Path(__file__).parent.parent.parent / "data"
@@ -30,6 +31,9 @@ class Database:
         self._write_lock = asyncio.Lock()
         self._connect_timeout = 30
         self._busy_timeout_ms = 30000
+        if max_connections < 1:
+            raise ValueError("max_connections must be positive")
+        self._connection_slots = asyncio.Semaphore(max_connections)
 
     def db_exists(self) -> bool:
         """Check if database file exists"""
@@ -46,17 +50,55 @@ class Database:
 
     @asynccontextmanager
     async def _connect(self, *, write: bool = False):
-        """Open a configured SQLite connection and optionally serialize writes."""
+        """Bound connection threads and finish acquisition/cleanup before cancelling.
+
+        aiosqlite 0.20 starts a thread before awaiting the SQLite connection. If
+        that await is cancelled, __aexit__ never runs and the thread is leaked.
+        Keep acquisition in an owned task so finally can close the real connection.
+        Streaming disconnects use AnyIO cancellation scopes; shutdown/timeouts can
+        also cancel asyncio tasks directly, including more than once.
+        """
         if write:
             async with self._write_lock:
-                async with aiosqlite.connect(self.db_path, timeout=self._connect_timeout) as db:
-                    await self._configure_connection(db)
+                async with self._connect() as db:
                     yield db
             return
 
-        async with aiosqlite.connect(self.db_path, timeout=self._connect_timeout) as db:
-            await self._configure_connection(db)
-            yield db
+        async with self._connection_slots:
+            db = aiosqlite.connect(self.db_path, timeout=self._connect_timeout)
+            try:
+                await self._finish_connection_task(asyncio.ensure_future(db))
+                await self._configure_connection(db)
+                yield db
+            finally:
+                await self._finish_connection_task(
+                    asyncio.create_task(self._close_connection(db))
+                )
+
+    @staticmethod
+    async def _finish_connection_task(task):
+        """Defer cancellation until an owned lifecycle task has finished."""
+        cancelled = False
+        with anyio.CancelScope(shield=True):
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            result = task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    @staticmethod
+    async def _close_connection(db):
+        try:
+            await db.close()
+        finally:
+            # close() enqueues thread shutdown. Do not release the concurrency
+            # permit until the worker actually exits; no executor thread needed.
+            while db.is_alive():
+                await asyncio.sleep(0.001)
 
     async def _table_exists(self, db, table_name: str) -> bool:
         """Check if a table exists in the database"""
