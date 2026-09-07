@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow2API Worker",
-  "version": "3.3.10",
+  "version": "3.4.0",
   "description": "Flow2API worker for staff: install once, stay signed in to Google Labs, done. Supplies real-browser reCAPTCHA tokens, keeps the login fresh, and mints+redeems from the same residential IP automatically. No setup.",
   "permissions": [
     "storage",
@@ -24,5 +24,6 @@
   "action": {
     "default_title": "Flow2API Worker",
     "default_popup": "options.html"
-  }
+  },
+  "minimum_chrome_version": "116"
 }

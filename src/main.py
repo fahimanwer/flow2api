@@ -20,7 +20,8 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
-from .api import routes, admin, ext_update
+from .api import routes, admin, ext_update, creaa
+from .services.creaa_bridge import CreaaBridge
 
 
 _LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -262,7 +263,11 @@ async def lifespan(app: FastAPI):
     print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
-    yield
+    await creaa_bridge.start()
+    try:
+        yield
+    finally:
+        await creaa_bridge.close()
 
     # Shutdown
     print("Flow2API Shutting down...")
@@ -294,6 +299,8 @@ async def lifespan(app: FastAPI):
 
 # Initialize components
 db = Database()
+creaa_bridge = CreaaBridge(db_path=Path(db.db_path).with_name("creaa.db"))
+creaa.set_service(creaa_bridge)
 proxy_manager = ProxyManager(db)
 flow_client = FlowClient(proxy_manager, db)
 token_manager = TokenManager(db, flow_client)
@@ -334,6 +341,7 @@ app.add_middleware(
 app.include_router(routes.router)
 app.include_router(admin.router)
 app.include_router(ext_update.router)
+app.include_router(creaa.router)
 
 # Static files - serve tmp directory for cached files
 tmp_dir = Path(__file__).parent.parent / "tmp"

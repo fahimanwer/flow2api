@@ -1,0 +1,1281 @@
+{
+  "image_models": [
+    {
+      "model_id": "openai/gpt-image-2",
+      "provider": "chatgpt2api_priority",
+      "display_name": "GPT Image 2",
+      "capabilities": [
+        "text_to_image",
+        "image_to_image",
+        "multi_image_edit"
+      ],
+      "pricing": {
+        "type": "paid",
+        "cost_per_image": 12,
+        "currency": "credits",
+        "quality_pricing": {
+          "1k": 12,
+          "2k": 18,
+          "4k": 30
+        },
+        "image_quality_pricing": {
+          "1k": {
+            "low": 8,
+            "medium": 12,
+            "auto": 12,
+            "high": 30
+          },
+          "2k": {
+            "low": 12,
+            "medium": 18,
+            "auto": 18,
+            "high": 35
+          },
+          "4k": {
+            "low": 15,
+            "medium": 30,
+            "auto": 30,
+            "high": 60
+          }
+        },
+        "description": "\u6309\u5206\u8fa8\u7387\u6863\u4f4d\u4e0e\u56fe\u7247\u8d28\u91cf\u4e8c\u7ef4\u8ba1\u8d39\uff1a1K 8/12/30\uff0c2K 12/18/35\uff0c4K 15/30/60\u3002"
+      },
+      "params": {
+        "max_images": 4,
+        "min_images": 1,
+        "default_images": 1,
+        "supported_sizes": [
+          "1024x1024",
+          "1024x1536",
+          "1536x1024",
+          "2048x2048",
+          "2048x1152",
+          "1536x2048",
+          "2048x1536",
+          "1152x2048",
+          "864x1536",
+          "1536x864",
+          "2048x1024",
+          "2688x1344",
+          "2688x1152",
+          "3840x1920",
+          "2880x2880",
+          "3072x2048",
+          "2048x3072",
+          "3072x2304",
+          "2304x3072",
+          "2304x2880",
+          "2880x2304",
+          "3584x1536",
+          "3840x2160",
+          "2160x3840",
+          "672x1568",
+          "960x2240",
+          "1632x3808"
+        ],
+        "default_size": "1024x1024",
+        "supports_batch": true,
+        "supports_multi_upload": true,
+        "max_upload_images": 10,
+        "aspect_ratios": [
+          "auto",
+          "1:1",
+          "2:3",
+          "3:2",
+          "3:4",
+          "4:3",
+          "4:5",
+          "5:4",
+          "9:16",
+          "16:9",
+          "2:1",
+          "21:9",
+          "9:21"
+        ],
+        "default_aspect_ratio": "1:1",
+        "quality_options": [
+          "Low",
+          "Medium",
+          "High"
+        ],
+        "default_quality": "Medium",
+        "image_size_options": [
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "supported_resolutions": [
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "default_image_size": "1K",
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "additional_params": {
+          "async_only": true,
+          "max_edge": 3840,
+          "size_multiple_of": 16,
+          "max_aspect_ratio": "3:1",
+          "min_pixels": 655360,
+          "max_pixels": 8294400
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "gemini-3.1-flash-image",
+      "provider": "gemini",
+      "display_name": "Nano Banana 2",
+      "capabilities": [
+        "text_to_image",
+        "image_to_image",
+        "multi_image_edit"
+      ],
+      "pricing": {
+        "type": "freemium",
+        "cost_per_image": 10,
+        "currency": "credits",
+        "free_limit": 5,
+        "free_limit_period": "daily",
+        "quality_pricing": {
+          "512px": 6,
+          "1k": 10,
+          "2k": 15,
+          "4k": 25
+        },
+        "description": "512px/1K/2K/4K supported; designed for lower-latency, high-volume image workflows"
+      },
+      "params": {
+        "max_images": 4,
+        "min_images": 1,
+        "default_images": 1,
+        "supported_sizes": [
+          "Auto",
+          "512x512",
+          "512x2048",
+          "2048x512",
+          "512x4096",
+          "4096x512",
+          "768x1344",
+          "1344x768",
+          "1024x1024",
+          "1248x832",
+          "832x1248",
+          "864x1184",
+          "1184x864",
+          "896x1152",
+          "1152x896",
+          "1536x672",
+          "768x1376",
+          "1376x768",
+          "848x1264",
+          "1264x848",
+          "896x1200",
+          "1200x896",
+          "928x1152",
+          "1152x928",
+          "1584x672",
+          "1696x2528",
+          "2528x1696",
+          "1792x2400",
+          "2400x1792",
+          "1856x2304",
+          "2304x1856",
+          "1536x2752",
+          "2752x1536",
+          "3168x1344",
+          "2048x2048",
+          "3392x5056",
+          "5056x3392",
+          "3584x4800",
+          "4800x3584",
+          "3712x4608",
+          "4608x3712",
+          "3072x5504",
+          "5504x3072",
+          "2160x3840",
+          "3840x2160",
+          "4096x4096",
+          "6336x2688"
+        ],
+        "default_size": "Auto",
+        "supports_batch": false,
+        "supports_multi_upload": true,
+        "max_upload_images": 14,
+        "supported_resolutions": [
+          "512px",
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "supports_google_search_grounding": true,
+        "supports_image_search_grounding": true,
+        "thinking_levels": [
+          "minimal",
+          "high"
+        ],
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "watermark": true
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "gemini-3.1-flash-image-lite",
+      "provider": "gemini",
+      "display_name": "Nano Banana 2 Lite",
+      "capabilities": [
+        "text_to_image",
+        "image_to_image",
+        "multi_image_edit"
+      ],
+      "pricing": {
+        "type": "freemium",
+        "cost_per_image": 5,
+        "currency": "credits",
+        "free_limit": 5,
+        "free_limit_period": "daily",
+        "quality_pricing": {
+          "1k": 5,
+          "2k": 10,
+          "4k": 20
+        },
+        "description": "1K/2K/4K supported; each tier costs 5 credits less than Nano Banana 2"
+      },
+      "params": {
+        "max_images": 4,
+        "min_images": 1,
+        "default_images": 1,
+        "supported_sizes": [
+          "Auto",
+          "768x1344",
+          "1344x768",
+          "1024x1024",
+          "1248x832",
+          "832x1248",
+          "864x1184",
+          "1184x864",
+          "896x1152",
+          "1152x896",
+          "1536x672",
+          "768x1376",
+          "1376x768",
+          "848x1264",
+          "1264x848",
+          "896x1200",
+          "1200x896",
+          "928x1152",
+          "1152x928",
+          "1584x672",
+          "1696x2528",
+          "2528x1696",
+          "1792x2400",
+          "2400x1792",
+          "1856x2304",
+          "2304x1856",
+          "1536x2752",
+          "2752x1536",
+          "3168x1344",
+          "2048x2048",
+          "3392x5056",
+          "5056x3392",
+          "3584x4800",
+          "4800x3584",
+          "3712x4608",
+          "4608x3712",
+          "3072x5504",
+          "5504x3072",
+          "2160x3840",
+          "3840x2160",
+          "4096x4096",
+          "6336x2688"
+        ],
+        "default_size": "Auto",
+        "supports_batch": false,
+        "supports_multi_upload": true,
+        "max_upload_images": 14,
+        "supported_resolutions": [
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "supports_google_search_grounding": true,
+        "supports_image_search_grounding": true,
+        "thinking_levels": [
+          "minimal",
+          "high"
+        ],
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "watermark": true
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "gemini-3-pro-image",
+      "provider": "gemini",
+      "display_name": "Nano Banana Pro",
+      "capabilities": [
+        "text_to_image",
+        "image_to_image",
+        "multi_image_edit"
+      ],
+      "pricing": {
+        "type": "paid",
+        "cost_per_image": 20,
+        "currency": "credits",
+        "free_limit": 1,
+        "free_limit_period": "daily",
+        "quality_pricing": {
+          "1k": 20,
+          "2k": 25,
+          "4k": 30
+        },
+        "description": "1K costs 20 credits, 2K costs 25 credits, 4K costs 30 credits"
+      },
+      "params": {
+        "max_images": 4,
+        "min_images": 1,
+        "default_images": 1,
+        "supported_sizes": [
+          "Auto",
+          "768x1344",
+          "1344x768",
+          "1024x1024",
+          "1248x832",
+          "832x1248",
+          "864x1184",
+          "1184x864",
+          "896x1152",
+          "1152x896",
+          "1536x672",
+          "768x1376",
+          "1376x768",
+          "848x1264",
+          "1264x848",
+          "896x1200",
+          "1200x896",
+          "928x1152",
+          "1152x928",
+          "1584x672",
+          "1696x2528",
+          "2528x1696",
+          "1792x2400",
+          "2400x1792",
+          "1856x2304",
+          "2304x1856",
+          "1536x2752",
+          "2752x1536",
+          "3168x1344",
+          "2048x2048",
+          "3392x5056",
+          "5056x3392",
+          "3584x4800",
+          "4800x3584",
+          "3712x4608",
+          "4608x3712",
+          "3072x5504",
+          "5504x3072",
+          "2160x3840",
+          "3840x2160",
+          "4096x4096",
+          "6336x2688"
+        ],
+        "default_size": "Auto",
+        "supports_batch": false,
+        "supports_multi_upload": true,
+        "max_upload_images": 10,
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp"
+        ]
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "doubao-seedream-5-0-pro-260628",
+      "provider": "volcano_ark",
+      "display_name": "Seedream-5.0-Pro",
+      "capabilities": [
+        "text_to_image",
+        "image_to_image",
+        "multi_image_edit"
+      ],
+      "pricing": {
+        "type": "paid",
+        "cost_per_image": 15,
+        "currency": "credits",
+        "description": "15 credits per image (2K)"
+      },
+      "params": {
+        "max_images": 1,
+        "min_images": 1,
+        "default_images": 1,
+        "supported_sizes": [
+          "1K",
+          "2K"
+        ],
+        "default_size": "2K",
+        "image_size_options": [
+          "1K",
+          "2K"
+        ],
+        "supported_resolutions": [
+          "1K",
+          "2K"
+        ],
+        "default_image_size": "2K",
+        "aspect_ratios": [
+          "auto",
+          "1:1",
+          "3:4",
+          "4:3",
+          "16:9",
+          "9:16",
+          "2:3",
+          "3:2",
+          "21:9"
+        ],
+        "default_aspect_ratio": "1:1",
+        "supports_batch": false,
+        "supports_multi_upload": true,
+        "max_upload_images": 10,
+        "sequential_image_generation": "disabled",
+        "watermark": false
+      },
+      "is_enabled": true
+    }
+  ],
+  "video_models": [
+    {
+      "model_id": "seedance-2.5",
+      "provider": "openai_video_proxy",
+      "display_name": "Seedance 2.5",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video",
+        "video_editing"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "Billed per second",
+        "cost_per_second": 23
+      },
+      "params": {
+        "supported_durations": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30
+        ],
+        "min_duration": 4,
+        "max_duration": 30,
+        "duration_step": 1,
+        "default_duration": 6,
+        "supported_resolutions": [
+          "720p",
+          "720x720",
+          "960x720",
+          "720x960",
+          "1280x720",
+          "1680x720",
+          "720x1280"
+        ],
+        "default_resolution": "720p",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": true,
+          "multiple_frames": true,
+          "input_video": true
+        },
+        "max_upload_images": 50,
+        "max_upload_videos": 3,
+        "max_upload_audios": 3,
+        "supports_input_video": true,
+        "supports_smart_edit": true,
+        "supports_reference_modes": true,
+        "reference_modes": [
+          "omni_reference",
+          "first_last_frames",
+          "smart_edit"
+        ],
+        "max_prompt_length": 5000,
+        "supports_negative_prompt": false,
+        "fps_options": [
+          24
+        ],
+        "default_fps": 24,
+        "quality_options": [
+          "standard"
+        ],
+        "default_quality": "standard",
+        "aspect_ratios": [
+          "21:9",
+          "16:9",
+          "4:3",
+          "1:1",
+          "3:4",
+          "9:16"
+        ],
+        "default_aspect_ratio": "9:16",
+        "input_formats": [
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "additional_params": {
+          "default_rs": "720p",
+          "resolution_credit_multipliers": {
+            "720p": 2
+          },
+          "supported_fps": [
+            24
+          ],
+          "supports_audio": true,
+          "supports_reference_video": true,
+          "generate_audio": true
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "seedance-2.0",
+      "provider": "openai_video_proxy",
+      "display_name": "Seedance 2.0",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "Billed per second",
+        "cost_per_second": 23
+      },
+      "params": {
+        "supported_durations": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "min_duration": 4,
+        "max_duration": 15,
+        "duration_step": 1,
+        "default_duration": 4,
+        "supported_resolutions": [
+          "1680x720",
+          "720x1280",
+          "1280x720",
+          "2520x1080",
+          "1080x1920",
+          "1920x1080",
+          "1440x1080",
+          "1080x1080",
+          "1080x1440",
+          "5040x2160",
+          "3840x2160",
+          "2880x2160",
+          "2160x2160",
+          "2160x2880",
+          "2160x3840",
+          "720p",
+          "1080p",
+          "1024x1024",
+          "864x1184",
+          "1184x864"
+        ],
+        "default_resolution": "720x1280",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": false,
+          "multiple_frames": true
+        },
+        "max_upload_images": 9,
+        "max_prompt_length": 2000,
+        "supports_negative_prompt": false,
+        "fps_options": [
+          24
+        ],
+        "default_fps": 24,
+        "quality_options": [
+          "standard"
+        ],
+        "default_quality": "standard",
+        "aspect_ratios": [
+          "21:9",
+          "16:9",
+          "4:3",
+          "1:1",
+          "3:4",
+          "9:16"
+        ],
+        "default_aspect_ratio": "9:16",
+        "input_formats": [
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "additional_params": {
+          "default_rs": "720p",
+          "resolution_credit_multipliers": {
+            "720p": 1,
+            "1080p": 2,
+            "4k": 3
+          },
+          "supported_fps": [
+            24
+          ],
+          "generate_audio": true
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "seedance-2.0-fast",
+      "provider": "openai_video_proxy",
+      "display_name": "Seedance 2.0 Fast",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "Billed per second",
+        "cost_per_second": 22
+      },
+      "params": {
+        "supported_durations": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "min_duration": 4,
+        "max_duration": 15,
+        "duration_step": 1,
+        "default_duration": 4,
+        "supported_resolutions": [
+          "1680x720",
+          "720x1280",
+          "1280x720",
+          "2520x1080",
+          "1080x1920",
+          "1920x1080",
+          "1440x1080",
+          "1080x1080",
+          "1080x1440",
+          "5040x2160",
+          "3840x2160",
+          "2880x2160",
+          "2160x2160",
+          "2160x2880",
+          "2160x3840",
+          "720p",
+          "1080p",
+          "1024x1024",
+          "864x1184",
+          "1184x864"
+        ],
+        "default_resolution": "720x1280",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": false,
+          "multiple_frames": true
+        },
+        "max_upload_images": 9,
+        "max_prompt_length": 2000,
+        "supports_negative_prompt": false,
+        "fps_options": [
+          24
+        ],
+        "default_fps": 24,
+        "quality_options": [
+          "standard"
+        ],
+        "default_quality": "standard",
+        "aspect_ratios": [
+          "21:9",
+          "16:9",
+          "4:3",
+          "1:1",
+          "3:4",
+          "9:16"
+        ],
+        "default_aspect_ratio": "16:9",
+        "input_formats": [
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "additional_params": {
+          "default_rs": "720p",
+          "resolution_credit_multipliers": {
+            "720p": 1,
+            "1080p": 2,
+            "4k": 3
+          },
+          "supported_fps": [
+            24
+          ],
+          "generate_audio": true
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "seedance-2.0-mini",
+      "provider": "openai_video_proxy",
+      "display_name": "Seedance 2 Mini",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "Billed per second",
+        "cost_per_second": 18
+      },
+      "params": {
+        "supported_durations": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "min_duration": 4,
+        "max_duration": 15,
+        "duration_step": 1,
+        "default_duration": 4,
+        "supported_resolutions": [
+          "1680x720",
+          "720x1280",
+          "1280x720",
+          "720p"
+        ],
+        "default_resolution": "720x1280",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": false,
+          "multiple_frames": true
+        },
+        "max_upload_images": 9,
+        "max_prompt_length": 2000,
+        "supports_negative_prompt": false,
+        "fps_options": [
+          24
+        ],
+        "default_fps": 24,
+        "quality_options": [
+          "standard"
+        ],
+        "default_quality": "standard",
+        "aspect_ratios": [
+          "21:9",
+          "16:9",
+          "4:3",
+          "1:1",
+          "3:4",
+          "9:16"
+        ],
+        "default_aspect_ratio": "16:9",
+        "input_formats": [
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "additional_params": {
+          "default_rs": "720p",
+          "supported_fps": [
+            24
+          ],
+          "generate_audio": true
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "minimax-h3",
+      "provider": "minimax",
+      "display_name": "MiniMax H3",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "Billed per second (720P 20 credits/s, 2K 30 credits/s)",
+        "cost_per_second": 20
+      },
+      "params": {
+        "supported_durations": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "min_duration": 4,
+        "max_duration": 15,
+        "duration_step": 1,
+        "default_duration": 5,
+        "max_upload_images": 6,
+        "supported_resolutions": [
+          "720P",
+          "2K"
+        ],
+        "default_resolution": "2K",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": true,
+          "multiple_frames": true
+        },
+        "max_prompt_length": 2500,
+        "supports_negative_prompt": false,
+        "fps_options": [
+          24
+        ],
+        "default_fps": 24,
+        "quality_options": [
+          "standard"
+        ],
+        "default_quality": "standard",
+        "aspect_ratios": [
+          "16:9",
+          "9:16",
+          "1:1",
+          "4:3",
+          "3:4",
+          "21:9"
+        ],
+        "default_aspect_ratio": "16:9",
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp",
+          "heic",
+          "heif"
+        ],
+        "additional_params": {
+          "api_resolution": "2K",
+          "api_default_ratio": "16:9",
+          "max_reference_images": 5,
+          "supports_reference_modes": true,
+          "supports_audio": true,
+          "supports_reference_video": true,
+          "watermark_default": false,
+          "credit_rate": 20,
+          "credit_rate_2k": 30,
+          "task_query_endpoint": "https://api.minimaxi.com/v2/query/video_generation"
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "omni-flash",
+      "provider": "veo31_proxy",
+      "display_name": "Omni flash",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video",
+        "video_editing"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "Billed per second.",
+        "cost_per_second": 18
+      },
+      "params": {
+        "supported_durations": [
+          4,
+          6,
+          8,
+          10
+        ],
+        "default_duration": 4,
+        "supported_resolutions": [
+          "1280x720",
+          "720x1280"
+        ],
+        "default_resolution": "1280x720",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": false,
+          "multiple_frames": true,
+          "input_video": true
+        },
+        "max_upload_images": 3,
+        "max_upload_videos": 1,
+        "supports_input_video": true,
+        "supports_reference_modes": true,
+        "reference_modes": [
+          "omni_reference"
+        ],
+        "supports_negative_prompt": false,
+        "fps_options": [
+          24
+        ],
+        "default_fps": 24,
+        "quality_options": [
+          "standard"
+        ],
+        "default_quality": "standard",
+        "aspect_ratios": [
+          "16:9",
+          "9:16"
+        ],
+        "default_aspect_ratio": "16:9",
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "additional_params": {
+          "flow_t2v_model_prefix": "abra_t2v",
+          "flow_r2v_model_prefix": "abra_r2v",
+          "flow_edit_model": "abra_edit"
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "wan3.0-video",
+      "provider": "dashscope",
+      "display_name": "Wan 3.0",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "720P 20 credits/s, 1080P 30 credits/s",
+        "cost_per_second": 20
+      },
+      "params": {
+        "supported_durations": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30
+        ],
+        "min_duration": 2,
+        "max_duration": 30,
+        "duration_step": 1,
+        "default_duration": 5,
+        "max_upload_images": 10,
+        "max_upload_videos": 5,
+        "max_upload_audios": 5,
+        "supported_resolutions": [
+          "720P",
+          "1080P"
+        ],
+        "default_resolution": "720P",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": true,
+          "multiple_frames": true,
+          "input_video": true
+        },
+        "supports_input_video": true,
+        "supports_reference_modes": true,
+        "reference_modes": [
+          "omni_reference",
+          "first_last_frames"
+        ],
+        "max_prompt_length": 20000,
+        "supports_negative_prompt": false,
+        "fps_options": [
+          30
+        ],
+        "default_fps": 30,
+        "quality_options": [
+          "standard"
+        ],
+        "default_quality": "standard",
+        "aspect_ratios": [
+          "16:9",
+          "4:3",
+          "1:1",
+          "3:4",
+          "9:16"
+        ],
+        "default_aspect_ratio": "16:9",
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp",
+          "bmp"
+        ],
+        "additional_params": {
+          "api_model_name": "wan3.0-video",
+          "api_default_ratio": "adaptive",
+          "max_reference_images": 10,
+          "max_reference_videos": 5,
+          "max_reference_audios": 5,
+          "supports_reference_modes": true,
+          "supports_audio": true,
+          "supports_reference_video": true,
+          "audio_default": true,
+          "prompt_extend_default": true,
+          "watermark_default": false,
+          "requires_workspace_base_url": true,
+          "workspace_base_url_redis_key": "dashscope:wan30_base_url",
+          "resolution_credit_multipliers": {
+            "720p": 1,
+            "1080p": 1.5
+          }
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "happyhorse-1.1",
+      "provider": "dashscope",
+      "display_name": "HappyHorse 1.1",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "Billed per second",
+        "cost_per_second": 20
+      },
+      "params": {
+        "supported_durations": [
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "min_duration": 3,
+        "max_duration": 15,
+        "duration_step": 1,
+        "default_duration": 5,
+        "max_upload_images": 10,
+        "supported_resolutions": [
+          "720P"
+        ],
+        "default_resolution": "720P",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": false,
+          "multiple_frames": true
+        },
+        "max_prompt_length": 2500,
+        "supports_negative_prompt": false,
+        "fps_options": [
+          24
+        ],
+        "default_fps": 24,
+        "quality_options": [
+          "standard"
+        ],
+        "default_quality": "standard",
+        "aspect_ratios": [
+          "16:9",
+          "9:16",
+          "1:1",
+          "4:3",
+          "3:4"
+        ],
+        "default_aspect_ratio": "16:9",
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "additional_params": {
+          "api_model_names": {
+            "t2v": "happyhorse-1.1-t2v",
+            "i2v": "happyhorse-1.1-i2v",
+            "r2v": "happyhorse-1.1-r2v"
+          },
+          "api_resolution": "720P",
+          "api_default_ratio": "16:9",
+          "max_reference_images": 9,
+          "supports_reference_modes": true,
+          "supports_audio": true,
+          "watermark_default": false,
+          "task_query_endpoint": "https://dashscope.aliyuncs.com/api/v1/tasks"
+        }
+      },
+      "is_enabled": true
+    },
+    {
+      "model_id": "veo-3.1-generate-001",
+      "provider": "veo3",
+      "display_name": "Veo 3.1",
+      "capabilities": [
+        "text_to_video",
+        "image_to_video",
+        "first_last_frame_video"
+      ],
+      "pricing": {
+        "type": "paid",
+        "currency": "credits",
+        "description": "High-quality video generation, billed by resolution and duration",
+        "cost_per_second": 20
+      },
+      "params": {
+        "supported_durations": [
+          8
+        ],
+        "default_duration": 8,
+        "supported_resolutions": [
+          "1280x720",
+          "720x1280",
+          "1920x1080",
+          "1080x1920"
+        ],
+        "default_resolution": "720x1280",
+        "frame_upload_support": {
+          "first_frame_only": true,
+          "first_last_frame": true,
+          "multiple_frames": true
+        },
+        "max_upload_images": 3,
+        "supports_reference_modes": true,
+        "reference_modes": [
+          "omni_reference",
+          "first_last_frames"
+        ],
+        "max_prompt_length": 20000,
+        "supports_negative_prompt": false,
+        "fps_options": [
+          24
+        ],
+        "default_fps": 24,
+        "quality_options": [
+          "high"
+        ],
+        "default_quality": "high",
+        "input_formats": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "additional_params": {
+          "enhance_prompt": true,
+          "supports_aspect_ratio": true
+        }
+      },
+      "is_enabled": true
+    }
+  ]
+}

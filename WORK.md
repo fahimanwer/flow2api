@@ -1,11 +1,15 @@
 # Shared Agent Status
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 ## Active
 
-- Production currently runs `5247d6c` (PR #10), extension package **3.3.10**. `feat/async-submit-status` remains unmerged; leave it alone.
-- Owner authorized the permanent repository fix and normal Coolify deployment for database thread exhaustion. Branch: `codex/fix-database-thread-leak`. PR #11 merged as `04befb0`; first rollout retained the prior container because Coolify overrides the Docker health command with curl/wget, absent from python:slim. PR #12 added curl to the standard Dockerfile. Coolify production is configured for `/Dockerfile.headed`; follow-up adds curl and the image health check to that file as well. No container patch. Deployment verification pending.
+- 2026-09-08: Owner requested direct Creaa image/video API integration into Flow2API, same backend `flow.ashuthefire.com` and existing key; staff-access decisions deferred, no new owner-only restriction. Branch `codex/creaa-browser-provider`. Built jointly with Fable 5.1 via `claude -p`; backend broker/router, optional Chrome module and protocol documentation are implemented. Review fixes cover real namespaced model IDs, provider resolution values, acknowledgement ambiguity, stale attempts and reconnect recovery.
+- Validation: 22 Creaa Python tests + 19 Node extension tests pass; full Python suite 128 pass / 1 pre-existing `test_api_captcha_fingerprint` failure. No live Creaa generation has succeeded yet; production rollout/browser verification pending. Existing deployed Flow paths unchanged. Creaa extension is opt-in; models come from the connected website account.
+- Owner manually loaded extension 3.4.0 during build. Automated opening/reloading of Chrome extension management was blocked by browser policy; final service-worker changes may require another manual reload. Settings default to existing Flow backend/key. API documentation: `docs/creaa-api.md`.
+
+- Production before Creaa rollout runs `3272911` (PR #13), verified Coolify deployment `45l7guxjxbl0hrmfq0acsjzr` finished healthy, extension package **3.3.10**. `feat/async-submit-status` remains unmerged; leave it alone.
+- Owner authorized the permanent repository fix and normal Coolify deployment for database thread exhaustion. Branch: `codex/fix-database-thread-leak`. PR #11 merged as `04befb0`; first rollout retained the prior container because Coolify overrides the Docker health command with curl/wget, absent from python:slim. PR #12 added curl to the standard Dockerfile. Coolify production is configured for `/Dockerfile.headed`; follow-up adds curl and the image health check to that file as well. No container patch. PR #13 rollout verified finished on 2026-09-07 11:53 UTC.
 - Fix: defer request cancellation until SQLite acquisition/cleanup finishes; shield AnyIO scope cancellation and repeated asyncio task cancellation; allow at most 32 simultaneous connections per Database instance, holding permits until worker threads exit. Writer serialization stays intact.
 - Health: `/health` returns HTTP 503 on DB failure; Dockerfile includes a health check. Coolify application health check is enabled for `/health`.
 - Validation: 10 new regression tests pass with asyncio and uvloop. Original connection code fails the new cancellation-during-open regression. Full suite: 106 pass, 1 pre-existing failure in `test_api_captcha_fingerprint` (unchanged FlowClient code). Tests cover open/query/close cancellation, repeated cancellation, AnyIO disconnect scopes, 100 competing requests, 200 repeated disconnects, failed opening/configuration, capacity reuse and HTTP health status.
