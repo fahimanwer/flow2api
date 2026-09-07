@@ -37,3 +37,43 @@ async def test_ack_send_error_after_bytes_sent_never_requeues_generation(tmp_pat
     await send_event(bridge,socket,job['id'],job['attempt_id'],'submitting')
     assert bridge.get_job(job['id'])['state'] == 'needs_review'
     await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_parallel_lanes_and_total_limit_persist_across_restart(tmp_path):
+    bridge = CreaaBridge(tmp_path/'creaa.db',housekeeping_interval=0)
+    await bridge.start()
+    models = [{'id':'openai/gpt-image-2','media_type':'image'}, {'id':'seedance-2.5','media_type':'video'}]
+    socket = await register(bridge,'dev1','account1',models=models)
+    assert bridge.parallel_limits('account1') == {'images':1,'videos':1,'total':1}
+    await bridge.set_parallel_limits('account1',2,1,3,'Owner requested bounded concurrency test')
+    first_video,_=await bridge.submit('video',{'model':'seedance-2.5','prompt':'camera move'})
+    second_video,_=await bridge.submit('video',{'model':'seedance-2.5','prompt':'another camera move'})
+    images=[(await bridge.submit('image',{'model':'openai/gpt-image-2','prompt':f'cup {i}'}))[0] for i in range(3)]
+    await bridge.dispatch_now()
+    assert bridge.get_job(first_video['id'])['state']=='claimed'
+    assert bridge.get_job(second_video['id'])['state']=='queued'
+    assert [bridge.get_job(j['id'])['state'] for j in images]==['claimed','claimed','queued']
+    assert len(socket.of_type('execute'))==3
+    await bridge.close()
+    restarted=CreaaBridge(tmp_path/'creaa.db',housekeeping_interval=0)
+    await restarted.start()
+    assert restarted.parallel_limits('account1')=={'images':2,'videos':1,'total':3}
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held_state", ["needs_review", "needs_login"])
+async def test_uncertain_task_blocks_both_lanes_even_with_higher_caps(tmp_path, held_state):
+    bridge=CreaaBridge(tmp_path/'creaa.db',housekeeping_interval=0)
+    await bridge.start()
+    socket=await register(bridge,'dev1','account1')
+    job=await submit_and_dispatch(bridge,socket)
+    await send_event(bridge,socket,job['id'],job['attempt_id'],'submitting')
+    await send_event(bridge,socket,job['id'],job['attempt_id'],held_state,error='reply lost')
+    await bridge.set_parallel_limits('account1',3,2,5,'Bounded test')
+    queued,_=await bridge.submit('image',{'model':'gpt-image-2','prompt':'second cup'})
+    await bridge.dispatch_now()
+    assert bridge.get_job(queued['id'])['state']=='queued'
+    assert len(socket.of_type('execute'))==1
+    await bridge.close()
