@@ -1677,3 +1677,6 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   connectWS();
   checkForUpdate();   // fire-and-forget: refresh the update banner state on boot
 })();
+
+// Separate optional provider: no effect on Flow when Creaa is disabled.
+importScripts('creaa-worker.js');

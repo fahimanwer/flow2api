@@ -37,3 +37,12 @@ site-level, not account-bound). Set a unique Route Key per laptop + the matching
 Persistent tab is recreated if closed; token requests retry once on a fresh tab;
 the WebSocket auto-reconnects; a 1-minute keepalive alarm revives the socket and
 tab if Chrome suspends the service worker.
+
+## Creaa provider (3.4.0)
+
+The popup now has **Creaa images & videos**. Enable it and save to connect the
+same Flow2API backend/key by default (`https://flow.ashuthefire.com`). It uses its
+own Creaa tab and WebSocket, independent of the existing Google Flow worker.
+No new staff-access policy is introduced. See `docs/creaa-api.md` in the repository
+for the image/video endpoints, reference formats, billing checks and recovery.
+Creaa website authentication stays in Chrome; you do not enter a Creaa API key.

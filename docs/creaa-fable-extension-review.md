@@ -1,0 +1,23 @@
+> Review of the initial extension draft. The listed reconnect, attempt and polling issues were addressed afterward; see current tests and docs/creaa-api.md. Backend serialization already prevented concurrent fresh jobs per account; a page-operation mutex was also added.
+
+Reviewed both files without running anything. Six real problems, ranked by damage.
+
+**1. Concurrent jobs corrupt each other's page settings** (`creaaPageOperation`, prepare/submit).
+Sequence: backend sends two jobs for one account, `run()` starts both. Job A (video) sets `app.currentMode` and `app.currentParams`, then awaits refreshUnlimitedConfig/upload/preflight. Job B (image) runs in the gap and overwrites both. A resumes: `getVideoCostForCurrentParams` and `hasUnlimitedAccessForModel` are judged on B's params, and `generateMediaTask` runs while the page is in B's mode. Then B's `finally` restores A's params, and A's `finally` restores the originals. Result: wrong billing gate, possible wrong-mode or wrong-ratio generation, credits spent. Fix: hold a worker-side mutex around prepare and submit so only one runs in the tab at a time.
+
+**2. Stale local `pending` is never cleared after a hard rejection** (`event`, `run`, `flushPending`).
+Sequence: extension sends needs_review for job J attempt A1, socket drops before the ack, pending stays saved. Backend still had J as claimed, restarts, requeues J as A2. On reconnect flushPending resends A1 needs_review, backend rejects (job_state claimed), catch sends A1 needs_review again, rejected again, pending never cleared. This repeats on every register_ack forever. Same for any job the backend has closed (terminal job_state). Fix: when an ack rejection carries a job_state that is terminal or an attempt mismatch, clear pending and stop.
+
+**3. `active` is keyed by job id, so a newer attempt is silently dropped** (`run`).
+Sequence: continuing from finding 2, the backend's execute for J/A2 arrives while the flushed A1 task is still in `active` (each ack wait is up to 15 s, twice). `active.has(J)` returns early with no event and no log. Backend believes the device holds the job. Same when an operator creates a tracking attempt while the old attempt's poll loop is alive. Fix: key by job plus attempt, and cancel the older attempt's task when a newer one arrives.
+
+**4. `restart()` leaves ack waiters hanging, and alarm reconnects can double up** (`restart`, `connect`).
+Sequence: a job is polling and `event(running)` is waiting for an ack on ws1. User clicks Reconnect. `restart()` sets `socket = null` before `ws1.close()`, so ws1's onclose sees `socket !== ws` and returns without rejecting acks. The event waits the full 15 s, throws, the catch sees ws2 open and sends needs_review for a healthy task. The alarm has the same hole: if it fires while ws1 is CLOSING after onerror, `connect()` opens ws2, ws1's onclose bails, and its acks plus its ping interval leak. Fix: reject and clear acks in `restart()`, and treat CLOSING like connecting.
+
+**5. Thrown `page()` errors in the poll loop skip the retry counter** (`run` poll loop, `ensureTab`).
+Sequence: executeScript rejects or returns no result (tab closed, tab mid-navigation, tab reloaded by ensureTab and script runs before the app object exists). `page('poll')` throws, which is not counted in consecutiveErrors, so a single hiccup sends needs_review. A common trigger: if Creaa's router or a login redirect drops `flow2api_worker=1` from the URL, ensureTab rejects the stored tab, creates a new one on every call, and each poll waits for a full page load. Fix: count thrown page errors like `ok:false`, and trust the stored tab id without requiring the query marker.
+
+**6. Resuming a running attempt without a local record sends the wrong event** (`run`).
+Sequence: backend sends resume for J/A1 with provider_task_id and its state is running. This profile has no `creaaJob:J` (storage cleared, or the job first ran on another device). `!local?.provider_task_id` is true, so the worker sends `submitted`. Backend rejects (job_state running), catch sends needs_review. A perfectly trackable task now needs an operator. Fix: on resume with a backend-supplied task id, skip `submitted` and go straight to polling. Also note that the `else if` never checks `local.job.attempt_id`, so it reads the old attempt's flag for a new attempt.
+
+One thing to verify rather than a finding: the paused check and failed submits send `failed` or `needs_login` straight from `submitting`. Your transition list only allows submitting to submitted. If the backend is strict, those jobs sit in submitting until a backend restart moves them to needs_review.

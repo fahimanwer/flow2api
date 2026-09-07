@@ -30,6 +30,8 @@
     summary { font-size: 11px; color: #6b7280; cursor: pointer; outline: none; }
     .logs { margin-top: 8px; max-height: 150px; overflow: auto; background: #0b0d12; border: 1px solid #2a2f3a; border-radius: 8px; padding: 8px; font-size: 10.5px; line-height: 1.5; }
     .logs .l-SUCCESS { color: #46d369; } .logs .l-ERROR { color: #f06262; } .logs .l-INFO, .logs .l-WARN { color: #9aa0a6; }
+    .creaa-label { display:block; font-size:11px; margin-top:10px; color:#b6bcc4; }
+    .creaa-label input { box-sizing:border-box; display:block; width:100%; margin-top:5px; padding:8px; border:1px solid #2a2f3a; border-radius:5px; background:#161922; color:#e8eaed; }
   </style>
 </head>
 <body>
@@ -53,6 +55,21 @@
   <p class="switchhint">Turn ON while you fix failed images — this account is then used <b>only</b> for failed images and kept out of the automatic article generation.</p>
 
   <button id="reconnectBtn">Reconnect</button>
+
+  <details id="creaaSettings">
+    <summary>Creaa images &amp; videos</summary>
+    <label class="switchrow"><input type="checkbox" id="creaaEnabled" />Enable Creaa worker</label>
+    <p class="switchhint" id="creaaStatus">Disabled</p>
+    <label class="creaa-label">Flow2API server
+      <input id="creaaServerBase" type="url" placeholder="https://flow.ashuthefire.com" />
+    </label>
+    <label class="creaa-label">Flow2API API key
+      <input id="creaaApiKey" type="password" autocomplete="off" />
+    </label>
+    <button id="creaaSave">Save &amp; connect Creaa</button>
+    <button id="creaaOpen">Open Creaa worker tab</button>
+    <p class="switchhint">Keep Chrome open and signed into Creaa. Website challenges appear in the worker tab. Pausing disconnects Creaa; accepted jobs resume tracking when re-enabled.</p>
+  </details>
 
   <div id="verLine"></div>
 

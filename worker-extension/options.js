@@ -99,3 +99,31 @@ document.addEventListener("DOMContentLoaded", () => {
   setInterval(() => { refreshStatus(); renderLogs(); }, 4000);
   setInterval(loadUpdateInfo, 12000);   // re-check so the banner appears even if the popup is left open
 });
+
+// Optional provider configuration; existing Flow account and proxy settings are untouched.
+document.addEventListener('DOMContentLoaded', async () => {
+  const stored = await chrome.storage.local.get(['creaaEnabled', 'creaaServerBase', 'creaaApiKey']);
+  $('creaaEnabled').checked = stored.creaaEnabled === true;
+  $('creaaServerBase').value = stored.creaaServerBase || 'https://flow.ashuthefire.com';
+  $('creaaApiKey').value = stored.creaaApiKey || '';
+  chrome.runtime.sendMessage({action: 'creaaDefaults'}, effective => {
+    if (chrome.runtime.lastError || !effective) return;
+    if (!stored.creaaServerBase) $('creaaServerBase').value = effective.server;
+    if (!stored.creaaApiKey) $('creaaApiKey').value = effective.key;
+  });
+  const status = () => chrome.runtime.sendMessage({action: 'creaaStatus'}, r => {
+    if (chrome.runtime.lastError || !r) return;
+    $('creaaStatus').textContent = r.error || (r.connected ? `Connected · account ${r.account_id} · ${r.active_jobs} active` : r.enabled ? 'Connecting…' : 'Disabled');
+  });
+  $('creaaSave').addEventListener('click', async () => {
+    const server = $('creaaServerBase').value.trim();
+    if (server) {
+      try { if (!['http:', 'https:'].includes(new URL(server).protocol)) throw new Error(); }
+      catch { $('creaaStatus').textContent = 'Enter an http:// or https:// server URL.'; return; }
+    }
+    await chrome.storage.local.set({creaaEnabled: $('creaaEnabled').checked, creaaServerBase: server, creaaApiKey: $('creaaApiKey').value.trim()});
+    chrome.runtime.sendMessage({action: 'creaaReconnect'}, status);
+  });
+  $('creaaOpen').addEventListener('click', () => chrome.runtime.sendMessage({action: 'creaaOpenTab'}));
+  status(); setInterval(status, 3000);
+});
