@@ -82,3 +82,13 @@ test('worker-owned tab may lose its query marker without creating a replacement'
  assert.equal(h.sent.some(m=>m.state==='succeeded'),true);
  assert.equal(h.createdTabs,0);
 });
+test('distinct jobs share one page executor but both reach their own task and result',async()=>{
+ let inPage=0, peak=0;
+ const h=await harness({responses:{submit:async args=>{inPage++;peak=Math.max(peak,inPage);await new Promise(setImmediate);inPage--;return {ok:true,provider_task_id:'task-'+args.job_id};}}});
+ await Promise.all([h.send('execute',job),h.send('execute',{...job,id:'job2',attempt_id:'b1'})]);
+ await spin();
+ assert.equal(peak,1);
+ const completed=h.sent.filter(m=>m.state==='succeeded');
+ assert.deepEqual(completed.map(m=>m.job_id).sort(),['job1','job2']);
+ assert.deepEqual(completed.map(m=>m.provider_task_id).sort(),['task-job1','task-job2']);
+});

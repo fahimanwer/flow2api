@@ -4,7 +4,7 @@ Responsibilities
 ----------------
 * keep every job in SQLite so a restart never loses or blindly re-runs work;
 * hold exactly one worker WebSocket per device_id and remember which account it serves;
-* serialise ONE active generation per account (independent accounts run concurrently);
+* enforce persisted per-media and total account caps (default one total);
 * persist ``claimed`` BEFORE an ``execute`` message leaves the server, and persist
   ``submitting`` BEFORE acknowledging it - the worker must not click "generate"
   until it has that ack, so an interruption can always be classified;
@@ -148,6 +148,14 @@ CREATE TABLE IF NOT EXISTS creaa_accounts (
     login_required INTEGER NOT NULL DEFAULT 0,
     first_seen_at REAL,
     last_seen_at REAL
+);
+CREATE TABLE IF NOT EXISTS creaa_parallel_limits (
+    account_id TEXT PRIMARY KEY,
+    images INTEGER NOT NULL,
+    videos INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    note TEXT NOT NULL,
+    updated_at REAL NOT NULL
 );
 """
 
@@ -435,6 +443,33 @@ class CreaaBridge:
                     item["accounts"].append(conn.account_id)
         return sorted(merged.values(), key=lambda m: (m["media_type"], m["id"]))
 
+    def parallel_limits(self, account_id: str) -> Dict[str, int]:
+        with self._db() as conn:
+            row = conn.execute("SELECT images, videos, total FROM creaa_parallel_limits WHERE account_id = ?", (account_id,)).fetchone()
+        return dict(row) if row else {"images": 1, "videos": 1, "total": 1}
+
+    async def set_parallel_limits(self, account_id: str, images: int, videos: int, total: int, note: str) -> Dict[str, Any]:
+        self._ensure_started()
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in (images, videos, total)):
+            raise CreaaValidationError("invalid_parallel_limits", "parallel limits must be integers")
+        if not (1 <= images <= 3 and 1 <= videos <= 2 and 1 <= total <= 5):
+            raise CreaaValidationError("invalid_parallel_limits", "images: 1..3, videos: 1..2, total: 1..5")
+        if not isinstance(note, str) or not note.strip() or len(note) > 500:
+            raise CreaaValidationError("note_required", "Record a reason for this parallelism change (1..500 characters)")
+        async with self._state_lock:
+            if account_id not in self._accounts:
+                raise CreaaValidationError("account_not_found", "Register the account first", status=404)
+            old = self.parallel_limits(account_id)
+            with self._db() as conn:
+                conn.execute("INSERT INTO creaa_parallel_limits VALUES (?, ?, ?, ?, ?, ?) "
+                             "ON CONFLICT(account_id) DO UPDATE SET images=excluded.images, videos=excluded.videos, "
+                             "total=excluded.total, note=excluded.note, updated_at=excluded.updated_at",
+                             (account_id, images, videos, total, note.strip(), time.time()))
+        new = {"images": images, "videos": videos, "total": total}
+        debug_logger.log_info(f"[Creaa] parallel limits account={account_id} {old} -> {new}; {note.strip()}")
+        self._schedule_dispatch()
+        return {"account_id": account_id, "previous": old, "limits": new}
+
     def list_accounts(self) -> List[Dict[str, Any]]:
         out = []
         for record in self._accounts.values():
@@ -453,6 +488,8 @@ class CreaaBridge:
                 "models": (devices[-1].models if devices else record.models),
                 "capabilities": (devices[-1].capabilities if devices else record.capabilities),
                 "active_job": ({"id": active[0]["id"], "state": active[0]["state"]} if active else None),
+                "active_jobs": [{"id": j["id"], "state": j["state"], "media_type": j["media_type"]} for j in active],
+                "parallel_limits": self.parallel_limits(record.account_id),
                 "queued_jobs": queued,
                 "last_seen_at": iso_utc(record.last_seen_at),
             })
@@ -932,21 +969,28 @@ class CreaaBridge:
                     record = self._accounts.get(account_id)
                     if record is not None and record.login_required:
                         continue
-                    if self._count_jobs(account_id, ACTIVE_STATES) > 0:
-                        continue  # one active generation per account
-                    queued = self._jobs_in_states((QUEUED,), account_id=account_id)
-                    if not queued:
-                        continue
+                    active = self._jobs_in_states(ACTIVE_STATES, account_id=account_id)
+                    if any(j["state"] in (NEEDS_REVIEW, NEEDS_LOGIN) for j in active):
+                        continue  # unknown upstream work holds the whole account, regardless of configured caps
+                    limits = self.parallel_limits(account_id)
+                    counts = {kind: sum(j["media_type"] == kind for j in active) for kind in ("image", "video")}
+                    used = len(active)
                     worker = self._pick_worker(account_id)
                     if worker is None:
                         continue
-                    job = queued[0]
-                    attempt_id = new_attempt_id()
-                    # Durable claim BEFORE the execute message leaves the process.
-                    self._update_job(job["id"], state=CLAIMED, device_id=worker.device_id,
-                                     attempt_id=attempt_id, claimed_at=now, updated_at=now,
-                                     error_code=None, error_message=None)
-                    claimed.append((self._fetch_job(job["id"]), worker))
+                    for job in self._jobs_in_states((QUEUED,), account_id=account_id):
+                        if used >= limits["total"]:
+                            break
+                        kind = job["media_type"]
+                        if counts[kind] >= limits["images" if kind == "image" else "videos"]:
+                            continue  # a saturated video lane must not block otherwise available images
+                        attempt_id = new_attempt_id()
+                        self._update_job(job["id"], state=CLAIMED, device_id=worker.device_id,
+                                         attempt_id=attempt_id, claimed_at=now, updated_at=now,
+                                         error_code=None, error_message=None)
+                        claimed.append((self._fetch_job(job["id"]), worker))
+                        used += 1
+                        counts[kind] += 1
             sent = 0
             for job, worker in claimed:
                 ok = await self._send_job_message(worker, "execute", job)

@@ -16,7 +16,8 @@ All requests below require `Authorization: Bearer $FLOW2API_KEY` (the existing b
 
 | Method | Path | Result |
 |---|---|---|
-| GET | `/v1/creaa/accounts` | Account IDs, online devices, active job and queue |
+| GET | `/v1/creaa/accounts` | Account IDs, online devices, active jobs, parallel limits and queue |
+| PUT | `/v1/creaa/accounts/{id}/parallel-limits` | Persist image/video/total dispatch caps with a change note |
 | GET | `/v1/creaa/models` | Live website catalog with `creaa/` IDs, parameters and account associations |
 | POST | `/v1/creaa/images/generations` | HTTP 202 job |
 | POST | `/v1/creaa/videos/generations` | HTTP 202 job |
@@ -54,7 +55,7 @@ A repeated Idempotency-Key and identical request returns the same job. Changing 
 
 `unlimited_only` is the default: the worker refreshes website eligibility for the exact selected model/settings and rejects combinations not marked eligible. `allow_credits` requires a positive integer `max_credits`; the local estimate must fit that value. These checks do not create an upstream atomic spending cap. Website billing is authoritative and can change between preflight and submission. There is no fallback to the separately billed official API.
 
-The adapter uses direct generation, not Canvas Agent. The site still enforces its account quotas and challenges. One active Creaa generation per account initially means a long video can delay image jobs on that same account. A queue full or ambiguous account returns an explicit error.
+The adapter uses direct generation, not Canvas Agent. The site still enforces its account quotas and challenges. The default is one active Creaa generation total per account. Separate image/video/total caps can be configured using the parallel-limits endpoint; unknown upstream work still holds the entire account. These are local dispatch caps, not claims about Creaa's own concurrency. A queue full or ambiguous account returns an explicit error.
 
 Successful jobs return `result.urls`, containing original provider media URLs, and `result.media_type`. Download outputs while their provider URLs are valid. Flow2API does not yet copy Creaa assets into permanent local storage. A job is not marked successful until at least one usable URL appears. The image/video model list is capability discovery, not a claim that all models were live-tested or included in the subscription.
 
@@ -89,3 +90,7 @@ Run:
 python -m pytest tests/test_creaa_bridge.py tests/test_creaa_integration_regressions.py -q
 node --test tests/test_creaa_page.cjs tests/test_creaa_worker.cjs
 ```
+
+## Controlled parallelism
+
+`PUT /v1/creaa/accounts/{id}/parallel-limits` accepts e.g. `{"images":2,"videos":1,"total":3,"note":"Owner-approved concurrency verification"}`. Changes are recorded in SQLite and apply immediately to new dispatches; they do not cancel existing jobs. Wait for current jobs to finish before changing caps when a clean timing test is required. The endpoint uses the existing API key, with no staff-role changes. Probe bounds are 3 images, 2 videos and 5 total, sufficient to test one beyond the advertised 2-image/1-video allowances. Provider quotas still apply; an accepted request may be queued upstream and is not proof of concurrent processing.

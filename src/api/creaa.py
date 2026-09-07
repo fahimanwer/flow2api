@@ -72,6 +72,22 @@ async def creaa_accounts(_: str = Depends(verify_api_key_flexible)):
     return {"object": "list", "data": service.list_accounts()}
 
 
+class ParallelLimitsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    images: int = Field(ge=1, le=3)
+    videos: int = Field(ge=1, le=2)
+    total: int = Field(ge=1, le=5)
+    note: str = Field(min_length=1, max_length=500)
+
+
+@router.put("/v1/creaa/accounts/{account_id}/parallel-limits")
+async def creaa_parallel_limits(account_id: str, body: ParallelLimitsRequest, _: str = Depends(verify_api_key_flexible)):
+    try:
+        return await _svc().set_parallel_limits(account_id, body.images, body.videos, body.total, body.note)
+    except CreaaValidationError as exc:
+        raise _http_error(exc)
+
+
 # ---------------------------------------------------------------------- generations
 
 async def _create_job(media_type: str, body: Dict[str, Any], idempotency_key: Optional[str]) -> JSONResponse:
