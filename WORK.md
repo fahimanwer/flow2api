@@ -5,11 +5,13 @@ Last updated: 2026-09-07
 ## Active
 
 - Production currently runs `5247d6c` (PR #10), extension package **3.3.10**. `feat/async-submit-status` remains unmerged; leave it alone.
-- Owner authorized the permanent repository fix and normal Coolify deployment for database thread exhaustion. Branch: `codex/fix-database-thread-leak`. Deployment verification pending.
+- Owner authorized the permanent repository fix and normal Coolify deployment for database thread exhaustion. Branch: `codex/fix-database-thread-leak`. PR #11 merged as `04befb0`; first rollout retained the prior container because Coolify overrides the Docker health command with curl/wget, absent from python:slim. Follow-up adds curl to the repository Dockerfile; no container patch. Deployment verification pending.
 - Fix: defer request cancellation until SQLite acquisition/cleanup finishes; shield AnyIO scope cancellation and repeated asyncio task cancellation; allow at most 32 simultaneous connections per Database instance, holding permits until worker threads exit. Writer serialization stays intact.
-- Health: `/health` returns HTTP 503 on DB failure; Dockerfile includes a health check. Coolify application health check will be enabled for `/health` during rollout.
+- Health: `/health` returns HTTP 503 on DB failure; Dockerfile includes a health check. Coolify application health check is enabled for `/health`.
 - Validation: 10 new regression tests pass with asyncio and uvloop. Original connection code fails the new cancellation-during-open regression. Full suite: 106 pass, 1 pre-existing failure in `test_api_captcha_fingerprint` (unchanged FlowClient code). Tests cover open/query/close cancellation, repeated cancellation, AnyIO disconnect scopes, 100 competing requests, 200 repeated disconnects, failed opening/configuration, capacity reuse and HTTP health status.
 - Upstream `origin/main` contains a README-only chart fix since the production fork; merged before deployment to satisfy the ancestor requirement.
+
+- Linux image verification: 200 isolated disconnects against deployed fix code returned thread count to baseline (1 -> 1).
 
 ## September 7 incident
 
