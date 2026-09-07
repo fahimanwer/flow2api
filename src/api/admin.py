@@ -1832,7 +1832,11 @@ async def health_check():
     try:
         return await build_public_health_snapshot(db)
     except Exception:
-        return {"backend_running": True, "has_active_tokens": False}
+        return JSONResponse(
+            status_code=503,
+            content={"backend_running": True, "database_available": False,
+                     "has_active_tokens": False},
+        )
 
 
 @router.get("/api/stats")
