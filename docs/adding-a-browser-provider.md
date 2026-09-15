@@ -14,6 +14,22 @@ export, no login/paywall/quota/challenge bypass.
 
 ---
 
+## Which kind of provider is it? (decide this first)
+
+Added 2026-09-15 after the Flow Music investigation. Before following the rest of this
+page, classify the site by reading its public JavaScript bundle (no login needed: fetch the
+landing page, list the `<script src>` chunks, grep them for the API base URL, the auth
+library, and any anti-bot names such as turnstile/recaptcha/appcheck):
+
+| Signal in the bundle | Provider kind | Pattern to follow |
+|---|---|---|
+| A server-holdable session credential (Supabase/Firebase/OAuth refresh token, long-lived cookie) **and** requests carry only a bearer token, no captcha or signature header | **Token-row provider** (like Google Flow, like Flow Music) | Backend calls the site's API directly; accounts are rows with refresh logic; no extension work. Keep the job state machine from section 2 (uncertain submissions still exist). |
+| Submit requires a reCAPTCHA/Turnstile token, a browser-only "submit ticket", or the session cannot be exported | **Browser-bridge provider** (like Creaa) | Everything below. |
+
+A token-row provider is roughly a quarter of the work of a browser bridge. Flow Music is
+the reference for the token-row kind: `wb.flowmusic.app` API, Supabase auth at
+`sb.flowmusic.app`, bearer-only requests (see the Flow Music plan/spike docs).
+
 ## 0. Go / no-go gates (answer these before writing code)
 
 1. **Terms.** Does the site's ToS/payment terms forbid scripts or automated use? Creaa's
