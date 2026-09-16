@@ -49,6 +49,21 @@ class Database:
         return date.today().isoformat()
 
     @asynccontextmanager
+    async def connect(self, *, write: bool = False):
+        """Public view of the pooled connection, for provider modules.
+
+        Provider code (e.g. the Suno job store) keeps its own SQL but must run
+        it on this instance so it inherits the writer lock, the connection
+        semaphore and the cancellation-safe cleanup below. Opening a separate
+        aiosqlite connection elsewhere would bypass all three.
+
+        Hold this only for database work: ``write=True`` serializes every other
+        writer in the process, so never await network I/O inside the block.
+        """
+        async with self._connect(write=write) as db:
+            yield db
+
+    @asynccontextmanager
     async def _connect(self, *, write: bool = False):
         """Bound connection threads and finish acquisition/cleanup before cancelling.
 

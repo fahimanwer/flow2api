@@ -20,7 +20,8 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
-from .api import routes, admin, ext_update
+from .api import routes, admin, ext_update, suno
+from .services.suno_service import SunoService
 
 
 _LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -262,7 +263,17 @@ async def lifespan(app: FastAPI):
     print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
-    yield
+    # Suno provider: dispatcher + poller. Starting it is cheap when no Suno
+    # account is connected; it simply has nothing to dispatch.
+    try:
+        await suno_service.start()
+    except Exception as e:
+        print(f"⚠ Suno provider failed to start: {e}")
+
+    try:
+        yield
+    finally:
+        await suno_service.close()
 
     # Shutdown
     print("Flow2API Shutting down...")
@@ -295,6 +306,8 @@ async def lifespan(app: FastAPI):
 # Initialize components
 db = Database()
 proxy_manager = ProxyManager(db)
+suno_service = SunoService(db, proxy_manager)
+suno.set_service(suno_service)
 flow_client = FlowClient(proxy_manager, db)
 token_manager = TokenManager(db, flow_client)
 concurrency_manager = ConcurrencyManager()
@@ -334,6 +347,7 @@ app.add_middleware(
 app.include_router(routes.router)
 app.include_router(admin.router)
 app.include_router(ext_update.router)
+app.include_router(suno.router)
 
 # Static files - serve tmp directory for cached files
 tmp_dir = Path(__file__).parent.parent / "tmp"
