@@ -18,7 +18,12 @@
  * can never pile up tabs; and if Google Labs needs a fresh login (session expired
  * during sleep -> redirect to accounts.google.com) it STOPS opening tabs, backs
  * off, and raises a "login required" badge instead of churning Chrome to a crash.
+ *
+ * Optional third job (opt-in per profile, see suno.js): share this browser's Suno
+ * login with the backend so Flow2API can make songs on that account.
  */
+
+importScripts("suno.js");
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 // Where the worker tab is opened to mint. 2026-09-04: Google now bounces migrated
@@ -85,7 +90,9 @@ const DEFAULT_SETTINGS = {
   // present in this object — a key absent here reads back undefined no matter what the
   // options popup saved, so the register/session-push would always report pool=auto and
   // the reserve-my-account toggle silently never took effect. Default OFF (auto pool).
-  failedImageMode: false
+  failedImageMode: false,
+  // Opt-in Suno login sharing (suno.js). Same rule as above: MUST be listed here.
+  sunoEnabled: false
 };
 
 let ws = null;
@@ -122,7 +129,8 @@ function getSettings() {
         // "Failed-image mode" switch: when ON this account is reserved for staff-driven
         // failed-image regeneration (reported as pool_mode=failed_image, kept out of the
         // automatic article pool).
-        failedImageMode: stored.failedImageMode === true
+        failedImageMode: stored.failedImageMode === true,
+        sunoEnabled: stored.sunoEnabled === true
       });
       const explicit = (stored.routeKey || "").trim();
       if (explicit) return build(explicit);
@@ -1544,6 +1552,7 @@ async function setupAlarms() {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_SESSION) {
     await refreshSession();
+    sunoSync("alarm").catch(() => {});   // no-op unless the Suno switch is ON
     checkForUpdate();   // piggyback the hourly session cycle to refresh the update banner
   } else if (alarm.name === ALARM_KEEPALIVE) {
     connectWS();
@@ -1599,6 +1608,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   connectWS();
   // Kick off an immediate session push so the backend is valid right away.
   refreshSession().catch(() => {});
+  scheduleSunoSync("install", 3000);
 });
 
 chrome.runtime.onStartup.addListener(async () => {
@@ -1606,6 +1616,7 @@ chrome.runtime.onStartup.addListener(async () => {
   await setupAlarms();
   await reconcileTabsOnBoot();
   connectWS();
+  scheduleSunoSync("startup", 3000);
 });
 
 chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
@@ -1634,6 +1645,21 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
       await clearProxy();
     })();
     sendResponse({ ok: true });
+    return true;
+  }
+  // Suno login sharing (suno.js). Deliberately NOT routed through settingsChanged:
+  // that handler re-applies the proxy and bounces the Flow socket, which Suno must
+  // never disturb.
+  if (req.action === "sunoSetEnabled") {
+    sunoSetEnabled(req.enabled === true).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+  if (req.action === "sunoSyncNow") {
+    sunoSync("manual", { force: true }).then((r) => sendResponse(r));
+    return true;
+  }
+  if (req.action === "getSunoState") {
+    getSunoState().then((r) => sendResponse(r)).catch(() => sendResponse({ enabled: false, state: null }));
     return true;
   }
   if (req.action === "getConnState") {
@@ -1676,4 +1702,5 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   await reconcileTabsOnBoot();
   connectWS();
   checkForUpdate();   // fire-and-forget: refresh the update banner state on boot
+  scheduleSunoSync("boot", 3000);   // no-op unless the Suno switch is ON
 })();

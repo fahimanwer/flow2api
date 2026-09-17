@@ -54,6 +54,54 @@ function loadUpdateInfo() {
   });
 }
 
+function fmtAgo(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " d ago";
+}
+
+// Suno: switch + honest status line. The popup only shows what the last push proved;
+// "Login shared" never claims a song was generated.
+function renderSunoState(r) {
+  const on = !!(r && r.enabled);
+  $("sunoEnabled").checked = on;
+  const lab = $("sunoState");
+  lab.textContent = on ? "ON" : "Off";
+  lab.className = on ? "on" : "";
+  const box = $("sunoStatus");
+  const btn = $("sunoSyncBtn");
+  btn.hidden = !on;
+  if (!on) { box.hidden = true; return; }
+  box.hidden = false;
+  const st = (r && r.state) || { status: "syncing" };
+  let cls = "", text = "";
+  if (st.status === "connected") {
+    const a = st.account || {};
+    const who = a.display_name ? `as ${a.display_name}` : (a.id ? `(account #${a.id})` : "");
+    const credits = (typeof a.credits === "number") ? ` · ${a.credits} credits` : " · credits unknown";
+    const plan = a.plan ? ` · ${a.plan}` : "";
+    if (a.operator_disabled) { cls = "warn"; text = `Login shared ${who}, but the admin has paused this account in Flow2API.`; }
+    else if (a.status && a.status !== "ready") { cls = "warn"; text = `Login shared ${who}, Flow2API status: ${a.status}. Try Sync, or sign out of suno.com and back in.`; }
+    else { cls = "ok"; text = `✅ Login shared with Flow2API ${who}${plan}${credits}`; }
+  } else if (st.status === "syncing") { cls = ""; text = "Syncing…"; }
+  else if (st.status === "signed_out") { cls = "warn"; text = "Not signed in to Suno here. Open suno.com, sign in with this Chrome, then come back (it syncs on its own)."; }
+  else if (st.status === "unverified") { cls = "warn"; text = st.message || "Flow2API couldn't verify this Suno login."; }
+  else { cls = "err"; text = st.message || "Something went wrong."; }
+  const when = (r && r.lastPushAt) ? `<span class="when">Last successful sync: ${fmtAgo(r.lastPushAt)}</span>` : "";
+  box.className = cls;
+  box.innerHTML = text.replace(/</g, "&lt;") + when;
+}
+
+function loadSunoState() {
+  chrome.runtime.sendMessage({ action: "getSunoState" }, (r) => {
+    if (chrome.runtime.lastError) return;
+    renderSunoState(r);
+  });
+}
+
 function loadFailedMode() {
   chrome.storage.local.get(["failedImageMode"], ({ failedImageMode }) => {
     const on = failedImageMode === true;
@@ -68,7 +116,22 @@ document.addEventListener("DOMContentLoaded", () => {
   refreshStatus();
   renderLogs();
   loadFailedMode();
+  loadSunoState();
   loadUpdateInfo();
+
+  $("sunoEnabled").addEventListener("change", (e) => {
+    const on = e.target.checked;
+    renderSunoState({ enabled: on, state: on ? { status: "syncing" } : null });
+    chrome.runtime.sendMessage({ action: "sunoSetEnabled", enabled: on }, () => {
+      setTimeout(() => { loadSunoState(); renderLogs(); }, 1200);
+    });
+  });
+  $("sunoSyncBtn").addEventListener("click", () => {
+    renderSunoState({ enabled: true, state: { status: "syncing" } });
+    chrome.runtime.sendMessage({ action: "sunoSyncNow" }, () => {
+      setTimeout(() => { loadSunoState(); renderLogs(); }, 1500);
+    });
+  });
 
   $("failedImageMode").addEventListener("change", (e) => {
     const on = e.target.checked;
@@ -96,6 +159,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  setInterval(() => { refreshStatus(); renderLogs(); }, 4000);
+  setInterval(() => { refreshStatus(); renderLogs(); loadSunoState(); }, 4000);
   setInterval(loadUpdateInfo, 12000);   // re-check so the banner appears even if the popup is left open
 });

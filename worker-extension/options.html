@@ -18,6 +18,15 @@
     .switchhint { font-size: 11px; color: #9aa0a6; margin: 6px 2px 0; line-height: 1.4; }
     #failedModeState { font-weight: 600; }
     #failedModeState.on { color: #f0b562; }
+    #sunoState.on { color: #46d369; }
+    .sublabel { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: #6b7280; margin: 0 0 6px; text-align: left; }
+    #sunoStatus { font-size: 11.5px; color: #b6bcc4; margin: 6px 2px 0; line-height: 1.45; text-align: left; padding: 8px 10px; border-radius: 8px; background: #161922; border: 1px solid #2a2f3a; }
+    #sunoStatus.ok { color: #46d369; border-color: #22432b; background: #10231a; }
+    #sunoStatus.warn { color: #f0b562; border-color: #4a3a1f; background: #241d10; }
+    #sunoStatus.err { color: #f06262; border-color: #4a1f1f; background: #241010; }
+    #sunoStatus .when { display: block; color: #6b7280; font-size: 10px; margin-top: 3px; }
+    button.secondary { background: #2a2f3a; color: #e8eaed; margin-top: 8px; padding: 8px; font-size: 12px; }
+    hr.sep { border: 0; border-top: 1px solid #2a2f3a; margin: 18px 0 12px; }
     #updateBanner { display: none; margin-bottom: 14px; padding: 13px; border-radius: 10px; background: #2a2109; border: 1px solid #f0b562; text-align: left; animation: ubpulse 1.8s ease-in-out infinite; }
     @keyframes ubpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(240,181,98,0); } 50% { box-shadow: 0 0 0 4px rgba(240,181,98,.28); } }
     #updateBanner .ub-title { font-size: 13px; font-weight: 700; color: #f0b562; }
@@ -42,6 +51,7 @@
     <div class="ub-steps">Then open <b>chrome://extensions</b>, unzip it over the old folder (or load the new folder), and click the extension's <b>reload</b> ↻.</div>
   </div>
 
+  <p class="sublabel">Google Flow</p>
   <div id="statusBig" class="checking">Checking…</div>
 
   <p class="note">Runs automatically. <b>Just keep this Chrome signed in to Google&nbsp;Labs.</b><br />Nothing to set up.</p>
@@ -53,6 +63,16 @@
   <p class="switchhint">Turn ON while you fix failed images — this account is then used <b>only</b> for failed images and kept out of the automatic article generation.</p>
 
   <button id="reconnectBtn">Reconnect</button>
+
+  <hr class="sep" />
+  <p class="sublabel">Suno music</p>
+  <label class="switchrow" style="margin-top:6px">
+    <input type="checkbox" id="sunoEnabled" />
+    <span>Share my Suno login: <span id="sunoState">Off</span></span>
+  </label>
+  <p class="switchhint">Turn ON if this Chrome is signed in to <b>suno.com</b>. Your Suno login is shared with Flow2API so it can make songs on your account. Turning this off stops syncing; it does <b>not</b> remove the account from Flow2API.</p>
+  <div id="sunoStatus" hidden></div>
+  <button id="sunoSyncBtn" class="secondary" hidden>Sync Suno now</button>
 
   <div id="verLine"></div>
 

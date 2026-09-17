@@ -13,6 +13,14 @@ It does two things:
    `session-token` cookie and pushes it to `/api/plugin/update-token`, keeping the
    account login valid. Also runs once immediately on install.
 
+3. **Suno login sharing (optional, off by default)** — `suno.js`. Flip
+   **Share my Suno login** ON in the popup when this Chrome profile is signed in
+   to suno.com. The worker reads the Suno login cookie your own browsing created and
+   POSTs it to `/api/plugin/suno-cookie` (plugin connection token), then re-sends it
+   whenever the cookie changes (debounced) and at least every 6 h. It opens no Suno
+   tabs and does not touch the Flow socket or the proxy. OFF stops syncing; the
+   account already saved on the backend stays until an admin removes it.
+
 ## Install (staff: zip-and-load, no setup)
 
 1. Unzip `Flow2API-Worker.zip`.
