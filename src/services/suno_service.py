@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS suno_accounts (
     operator_limit INTEGER NOT NULL DEFAULT 2,
     last_refresh_at REAL,
     last_error TEXT,
+    source_client_hash TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -135,6 +136,13 @@ class SunoService:
         self._started = False
         self._sessions: Dict[int, SunoSession] = {}
         self._account_locks: Dict[int, asyncio.Lock] = {}
+        # One lock per uploaded-cookie fingerprint: identical concurrent uploads from the
+        # extension exchange with Clerk once, not twice (a second exchange would rotate
+        # the credential the first one just saved).
+        self._upload_locks: Dict[str, asyncio.Lock] = {}
+        # Credential imports in flight (shielded from request cancellation). Drained on
+        # close() so shutdown never interrupts a Clerk exchange mid-promotion.
+        self._import_tasks: set = set()
         self._refresh_tasks: Dict[int, asyncio.Task] = {}
         self._running_jobs: Dict[str, asyncio.Task] = {}
         self._finalize_attempts: Dict[str, int] = {}
@@ -150,6 +158,7 @@ class SunoService:
             return
         async with self.db.connect(write=True) as conn:
             await conn.executescript(_SCHEMA)
+            await self._migrate(conn)
             await conn.commit()
         recovered = await self._recover_after_restart()
         self._started = True
@@ -159,6 +168,15 @@ class SunoService:
             f"[SUNO] service started (requeued={recovered['requeued']}, "
             f"resumed={recovered['resumed']})"
         )
+
+    @staticmethod
+    async def _migrate(conn) -> None:
+        """Columns added after the first release. CREATE IF NOT EXISTS leaves an
+        existing table alone, so each later column needs its own guarded ALTER."""
+        cursor = await conn.execute("PRAGMA table_info(suno_accounts)")
+        have = {row[1] for row in await cursor.fetchall()}
+        if "source_client_hash" not in have:
+            await conn.execute("ALTER TABLE suno_accounts ADD COLUMN source_client_hash TEXT")
 
     async def close(self) -> None:
         self._started = False
@@ -173,6 +191,10 @@ class SunoService:
                 await task
         self._refresh_tasks.clear()
         self._running_jobs.clear()
+        # Imports are short and must finish: wait, never cancel.
+        for task in list(self._import_tasks):
+            with contextlib.suppress(Exception):
+                await task
         for account_id, session in list(self._sessions.items()):
             with contextlib.suppress(Exception):
                 await self._persist_rotation(account_id, session)
@@ -364,15 +386,80 @@ class SunoService:
 
     # ------------------------------------------------------ account commands
 
-    async def import_account(self, cookie_string: str, display_name: str = "",
-                             account_id: Optional[int] = None) -> Dict[str, Any]:
-        """Add a Suno account, or replace an existing account's credentials.
+    # Credential import has two callers with different trust: the admin UI and the
+    # worker extension (plugin connection token). Both share the same internals so
+    # a cookie is exchanged with Clerk exactly once and the *resulting* session is
+    # what gets saved. Exchanging twice would rotate the supplied cookie on the
+    # first pass and then try to save a jar built from its dead predecessor.
 
-        Replacement is serialized against refresh on the same lock and refuses a
-        cookie belonging to a different upstream user: a different account
-        cannot inherit this one's jobs or its audio.
+    # How long a ready account's last successful Clerk exchange keeps a repeat upload
+    # of the same browser cookie on the cheap "unchanged" path. Past this, the upload
+    # re-validates so an idle account cannot stay "ready" on trust alone.
+    SOURCE_TRUST_SECONDS = 24 * 3600
+    BILLING_STALE_SECONDS = 6 * 3600
+
+    async def run_import(self, coro) -> Any:
+        """Run a credential import as a service-owned task, shielded from the
+        caller's cancellation and drained by close()."""
+        task = asyncio.ensure_future(coro)
+        self._import_tasks.add(task)
+        task.add_done_callback(self._import_tasks.discard)
+        return await asyncio.shield(task)
+
+    def _upload_lock_for(self, src_hash: str) -> asyncio.Lock:
+        lock = self._upload_locks.get(src_hash)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._upload_locks[src_hash] = lock
+        return lock
+
+    @staticmethod
+    def _extract_identity(info: Any) -> Optional[str]:
+        """Upstream user id from ``/api/session``, or None.
+
+        Only a non-empty string or an integer counts. Anything else (dict, list,
+        bool, None) is treated as "no identity" rather than stringified, because a
+        plugin upload keys and matches accounts on this value.
         """
-        self._ensure_started()
+        if not isinstance(info, dict):
+            return None
+        user = info.get("user")
+        candidates = [info.get("user_id"), info.get("id"),
+                      user.get("id") if isinstance(user, dict) else None]
+        for value in candidates:
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                return str(value)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _source_still_trusted(self, row: Dict[str, Any]) -> bool:
+        if row.get("status") != sm.ACCOUNT_READY or not row.get("upstream_user_id"):
+            return False
+        return (_now() - float(row.get("last_refresh_at") or 0)) < self.SOURCE_TRUST_SECONDS
+
+    async def _maybe_refresh_billing(self, row: Dict[str, Any]) -> None:
+        """Bounded reconciliation with the backend's *current* credential."""
+        checked = row.get("credits_checked_at")
+        if checked is None or (_now() - float(checked)) >= self.BILLING_STALE_SECONDS:
+            await self.refresh_account_billing(int(row["id"]))
+
+    @staticmethod
+    def source_hash(jar: Dict[str, str]) -> Optional[str]:
+        """Fingerprint of the cookie as *supplied*, before Clerk rotates it.
+
+        Stored next to the rotated jar so a repeat upload of the same browser
+        cookie can be recognised without another exchange. Never the value itself.
+        """
+        value = (jar or {}).get("__client")
+        if not value:
+            return None
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    async def _validate_cookie(self, cookie_string: str) -> Tuple[SunoSession, Optional[str], str]:
+        """Exchange a pasted/exported cookie once. Returns (session, upstream_user_id, source_hash)."""
         jar = parse_cookie_string(cookie_string or "")
         if not jar.get("__client"):
             raise SunoValidationError(
@@ -380,71 +467,214 @@ class SunoService:
                 "That cookie string has no '__client' entry. Copy the whole Cookie header "
                 "from a signed-in suno.com request.",
             )
-
+        src_hash = self.source_hash(jar) or ""
         session = SunoSession(jar)
         try:
             await self.client.refresh_session(session)
             info = await self.client.session_info(session)
         except SunoAuthError as exc:
             raise SunoValidationError("cookie_rejected", f"Suno rejected that cookie: {exc}")
+        return session, self._extract_identity(info), src_hash
 
-        upstream_user_id = str(
-            info.get("user_id") or info.get("id") or (info.get("user") or {}).get("id") or ""
-        ).strip() or None
+    async def _replace_credentials_locked(self, account_id: int, session: SunoSession,
+                                          upstream_user_id: Optional[str],
+                                          src_hash: str) -> Dict[str, Any]:
+        """Write a validated session onto an existing row. Caller holds the account lock.
 
+        Refuses a different upstream user: an account cannot inherit another
+        account's jobs or audio. Admin-owned fields (display name, limits,
+        operator_disabled) are left alone.
+        """
+        existing = await self._fetch_account(account_id)
+        if not existing:
+            raise SunoValidationError("unknown_account", f"No Suno account {account_id}.")
+        if (existing.get("upstream_user_id") and upstream_user_id
+                and existing["upstream_user_id"] != upstream_user_id):
+            raise SunoConflictError(
+                "different_user",
+                "That cookie belongs to a different Suno user. Import it as a new "
+                "account instead of replacing this one.",
+            )
+        await self._update_account(
+            account_id,
+            cookies=session.cookie_string(),
+            clerk_sid=session.sid,
+            upstream_user_id=upstream_user_id or existing.get("upstream_user_id"),
+            status=sm.ACCOUNT_READY,
+            last_error=None,
+            last_refresh_at=_now(),
+            source_client_hash=src_hash or None,
+        )
+        session.dirty = False
+        self._sessions[account_id] = session
+        return await self._fetch_account(account_id) or {}
+
+    async def _create_account(self, session: SunoSession, upstream_user_id: Optional[str],
+                              display_name: str, src_hash: str) -> Optional[int]:
+        """Insert a new row. Returns None when the UNIQUE upstream id already exists,
+        so the caller can turn a create/create race into the intended update."""
         now = _now()
+        try:
+            async with self.db.connect(write=True) as conn:
+                cursor = await conn.execute(
+                    """INSERT INTO suno_accounts
+                       (upstream_user_id, display_name, cookies, clerk_sid, status,
+                        last_refresh_at, source_client_hash, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (upstream_user_id, display_name or None, session.cookie_string(),
+                     session.sid, sm.ACCOUNT_READY, now, src_hash or None, now, now),
+                )
+                new_id = cursor.lastrowid
+                await conn.commit()
+        except aiosqlite.IntegrityError:
+            return None
+        session.dirty = False
+        self._sessions[int(new_id)] = session
+        return int(new_id)
+
+    async def _account_id_for_user(self, upstream_user_id: str) -> Optional[int]:
+        async with self.db.connect() as conn:
+            cursor = await conn.execute(
+                "SELECT id FROM suno_accounts WHERE upstream_user_id = ?", (upstream_user_id,)
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row else None
+
+    async def _account_for_source_hash(self, src_hash: str) -> Optional[Dict[str, Any]]:
+        if not src_hash:
+            return None
+        async with self.db.connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT * FROM suno_accounts WHERE source_client_hash = ?", (src_hash,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def import_account(self, cookie_string: str, display_name: str = "",
+                             account_id: Optional[int] = None) -> Dict[str, Any]:
+        """Admin path: add a Suno account, or replace an existing account's credentials.
+
+        Replacement holds the account lock across the Clerk exchange *and* the
+        write, so it serializes with the background refresh worker and the
+        session that is saved is the one that was just validated.
+        """
+        self._ensure_started()
         if account_id is not None:
             async with self._lock_for(account_id):
-                existing = await self._fetch_account(account_id)
-                if not existing:
+                if not await self._fetch_account(account_id):
                     raise SunoValidationError("unknown_account", f"No Suno account {account_id}.")
-                if (existing.get("upstream_user_id") and upstream_user_id
-                        and existing["upstream_user_id"] != upstream_user_id):
-                    raise SunoConflictError(
-                        "different_user",
-                        "That cookie belongs to a different Suno user. Import it as a new "
-                        "account instead of replacing this one.",
-                    )
-                await self._update_account(
-                    account_id,
-                    cookies=session.cookie_string(),
-                    clerk_sid=session.sid,
-                    upstream_user_id=upstream_user_id or existing.get("upstream_user_id"),
-                    status=sm.ACCOUNT_READY,
-                    last_error=None,
-                    last_refresh_at=now,
+                session, upstream_user_id, src_hash = await self._validate_cookie(cookie_string)
+                row = await self._replace_credentials_locked(
+                    account_id, session, upstream_user_id, src_hash
                 )
-                self._sessions[account_id] = session
-                row = await self._fetch_account(account_id)
-            return self._public_account(row or {})
+            return self._public_account(row)
 
-        async with self.db.connect(write=True) as conn:
-            conn.row_factory = aiosqlite.Row
-            if upstream_user_id:
-                cursor = await conn.execute(
-                    "SELECT id FROM suno_accounts WHERE upstream_user_id = ?", (upstream_user_id,)
-                )
-                if await cursor.fetchone():
-                    raise SunoConflictError(
-                        "duplicate_account",
-                        "That Suno user is already connected. Replace its credentials instead.",
-                    )
-            cursor = await conn.execute(
-                """INSERT INTO suno_accounts
-                   (upstream_user_id, display_name, cookies, clerk_sid, status,
-                    last_refresh_at, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (upstream_user_id, display_name or None, session.cookie_string(), session.sid,
-                 sm.ACCOUNT_READY, now, now, now),
+        session, upstream_user_id, src_hash = await self._validate_cookie(cookie_string)
+        if upstream_user_id and await self._account_id_for_user(upstream_user_id) is not None:
+            raise SunoConflictError(
+                "duplicate_account",
+                "That Suno user is already connected. Replace its credentials instead.",
             )
-            new_id = cursor.lastrowid
-            await conn.commit()
-
-        self._sessions[int(new_id)] = session
-        await self.refresh_account_billing(int(new_id))
-        row = await self._fetch_account(int(new_id))
+        new_id = await self._create_account(session, upstream_user_id, display_name, src_hash)
+        if new_id is None:
+            raise SunoConflictError(
+                "duplicate_account",
+                "That Suno user is already connected. Replace its credentials instead.",
+            )
+        await self.refresh_account_billing(new_id)
+        row = await self._fetch_account(new_id)
         self._wake.set()
         return self._public_account(row or {})
+
+    async def sync_account_from_extension(self, cookie_string: str, display_name: str = "",
+                                          force: bool = False) -> Dict[str, Any]:
+        """Worker-extension path: upsert by Suno user identity.
+
+        The caller proves possession of a cookie Clerk accepts for some Suno user;
+        it cannot prove which browser sent it. So the identity is mandatory, an
+        identity-less row is never matched or adopted, and admin-owned fields are
+        never touched on update.
+
+        Returns ``{"action": created|updated|unchanged, "account": <public>}``.
+        ``unchanged`` = this exact browser cookie was already accepted, the account
+        is ready, and its last Clerk exchange is recent (SOURCE_TRUST_SECONDS). It
+        is deduplication, not a health check: an unhealthy or stale account is
+        re-validated even for a repeat upload, ``force`` always re-validates, and
+        billing is re-read on the unchanged path when older than
+        BILLING_STALE_SECONDS. Identical concurrent uploads serialize on a
+        per-fingerprint lock so Clerk sees one exchange.
+        """
+        self._ensure_started()
+        jar = parse_cookie_string(cookie_string or "")
+        if not jar.get("__client"):
+            raise SunoValidationError(
+                "invalid_cookie", "The exported cookies contain no '__client' entry."
+            )
+        src_hash = self.source_hash(jar) or ""
+
+        async with self._upload_lock_for(src_hash):
+            prior = await self._account_for_source_hash(src_hash)
+            if prior and prior.get("upstream_user_id"):
+                account_id = int(prior["id"])
+                if not force and self._source_still_trusted(prior):
+                    await self._maybe_refresh_billing(prior)
+                    row = await self._fetch_account(account_id) or prior
+                    return {"action": "unchanged", "account": self._public_account(row)}
+                # Same browser cookie, but the account is unhealthy, stale or the
+                # caller insisted: re-check under the account lock so a concurrent
+                # refresh (or an earlier identical upload) cannot interleave.
+                async with self._lock_for(account_id):
+                    current = await self._fetch_account(account_id)
+                    if not current:
+                        raise SunoValidationError("unknown_account", f"No Suno account {account_id}.")
+                    if (not force and current.get("source_client_hash") == src_hash
+                            and self._source_still_trusted(current)):
+                        return {"action": "unchanged", "account": self._public_account(current)}
+                    session, upstream_user_id, src_hash = await self._validate_cookie(cookie_string)
+                    if not upstream_user_id:
+                        raise SunoValidationError(
+                            "no_identity", "Suno did not report a user id for that cookie."
+                        )
+                    row = await self._replace_credentials_locked(
+                        account_id, session, upstream_user_id, src_hash
+                    )
+                await self._maybe_refresh_billing(row)
+                self._wake.set()
+                return {"action": "updated", "account": self._public_account(row)}
+
+            # Unseen cookie: the account is unknown until Clerk names the user, so
+            # this exchange necessarily runs outside any account lock. The
+            # per-fingerprint lock above still guarantees it runs once.
+            session, upstream_user_id, src_hash = await self._validate_cookie(cookie_string)
+            if not upstream_user_id:
+                raise SunoValidationError(
+                    "no_identity", "Suno did not report a user id for that cookie."
+                )
+
+            account_id = await self._account_id_for_user(upstream_user_id)
+            if account_id is None:
+                new_id = await self._create_account(session, upstream_user_id, display_name, src_hash)
+                if new_id is not None:
+                    await self.refresh_account_billing(new_id)
+                    row = await self._fetch_account(new_id)
+                    self._wake.set()
+                    return {"action": "created", "account": self._public_account(row or {})}
+                # Lost a create/create race (two profiles, same user, different
+                # cookies): fall through and promote this validated session instead.
+                account_id = await self._account_id_for_user(upstream_user_id)
+                if account_id is None:  # pragma: no cover - defensive
+                    raise SunoConflictError("duplicate_account", "That Suno user was just connected; retry.")
+
+            async with self._lock_for(account_id):
+                if not await self._fetch_account(account_id):
+                    raise SunoValidationError("unknown_account", f"No Suno account {account_id}.")
+                row = await self._replace_credentials_locked(
+                    account_id, session, upstream_user_id, src_hash
+                )
+            await self._maybe_refresh_billing(row)
+            self._wake.set()
+            return {"action": "updated", "account": self._public_account(row)}
 
     async def refresh_account_billing(self, account_id: int) -> Dict[str, Any]:
         """Read plan and credits. Best effort: never fails the caller."""

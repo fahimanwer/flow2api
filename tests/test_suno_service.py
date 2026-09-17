@@ -624,6 +624,201 @@ class SessionRefreshTests(SunoServiceTestCase):
         self.assertEqual(row["status"], sm.ACCOUNT_READY)
 
 
+class ExtensionCookieSyncTests(SunoServiceTestCase):
+    """``sync_account_from_extension``: the worker-extension upsert path."""
+
+    COOKIE = "__client=browser-1; ajs_anonymous_id=dev-1"
+
+    async def test_first_upload_creates_an_account(self):
+        result = await self.service.sync_account_from_extension(self.COOKIE, "laptop-a")
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(result["account"]["display_name"], "laptop-a")
+        self.assertNotIn("cookies", result["account"])
+        row = await self.service._fetch_account(result["account"]["id"])
+        # The row holds the ROTATED jar, but remembers the fingerprint of what was uploaded.
+        self.assertIn("rotated-", row["cookies"])
+        self.assertEqual(row["source_client_hash"], self.service.source_hash({"__client": "browser-1"}))
+
+    async def test_repeat_upload_of_same_cookie_is_unchanged_without_clerk(self):
+        first = await self.service.sync_account_from_extension(self.COOKIE)
+        calls = self.client.refresh_calls
+        again = await self.service.sync_account_from_extension(self.COOKIE)
+        self.assertEqual(again["action"], "unchanged")
+        self.assertEqual(again["account"]["id"], first["account"]["id"])
+        self.assertEqual(self.client.refresh_calls, calls)
+
+    async def test_new_browser_cookie_for_same_user_updates_in_place(self):
+        first = await self.service.sync_account_from_extension(self.COOKIE, "laptop-a")
+        await self.service.set_account_limit(first["account"]["id"], operator_limit=1, provider_cap=4)
+        result = await self.service.sync_account_from_extension("__client=browser-2", "laptop-b")
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(result["account"]["id"], first["account"]["id"])
+        row = await self.service._fetch_account(first["account"]["id"])
+        # Admin-owned fields survive; only the credential moved.
+        self.assertEqual(row["display_name"], "laptop-a")
+        self.assertEqual(row["operator_limit"], 1)
+        self.assertEqual(row["provider_cap"], 4)
+        self.assertEqual(row["source_client_hash"], self.service.source_hash({"__client": "browser-2"}))
+        self.assertEqual(len(await self.service.list_accounts()), 1)
+
+    async def test_different_user_creates_a_second_account(self):
+        await self.service.sync_account_from_extension(self.COOKIE)
+        self.client.session_info_result = {"user_id": "user-2"}
+        result = await self.service.sync_account_from_extension("__client=other")
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(len(await self.service.list_accounts()), 2)
+
+    async def test_missing_identity_is_refused_before_any_write(self):
+        self.client.session_info_result = {}
+        with self.assertRaises(SunoValidationError) as ctx:
+            await self.service.sync_account_from_extension(self.COOKIE)
+        self.assertEqual(ctx.exception.code, "no_identity")
+        self.assertEqual(await self.service.list_accounts(), [])
+
+    async def test_identity_less_admin_row_is_never_adopted(self):
+        # An admin import whose session_info gave no id leaves upstream_user_id NULL,
+        # even when the plugin later uploads the very same cookie.
+        self.client.session_info_result = {}
+        await self.service.import_account(self.COOKIE, "manual")
+        self.client.session_info_result = {"user_id": "user-1"}
+        calls = self.client.refresh_calls
+        result = await self.service.sync_account_from_extension(self.COOKIE)
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(self.client.refresh_calls, calls + 1)  # validated, not short-circuited
+        self.assertEqual(len(await self.service.list_accounts()), 2)
+
+    async def test_malformed_identity_is_refused(self):
+        for bad in ({"user_id": {"unexpected": "shape"}}, {"user_id": ["x"]}, {"user_id": True},
+                    {"id": ""}, {"user": {"id": None}}, "not-a-dict"):
+            with self.subTest(bad=bad):
+                self.client.session_info_result = bad
+                with self.assertRaises(SunoValidationError) as ctx:
+                    await self.service.sync_account_from_extension("__client=c-" + str(len(str(bad))))
+                self.assertEqual(ctx.exception.code, "no_identity")
+        self.assertEqual(await self.service.list_accounts(), [])
+
+    async def test_integer_identity_is_accepted(self):
+        self.client.session_info_result = {"id": 4242}
+        result = await self.service.sync_account_from_extension(self.COOKIE)
+        self.assertEqual(result["account"]["upstream_user_id"], "4242")
+
+    async def test_identical_concurrent_uploads_exchange_once(self):
+        self.client.refresh_delay = 0.02
+        results = await asyncio.gather(
+            self.service.sync_account_from_extension(self.COOKIE),
+            self.service.sync_account_from_extension(self.COOKIE),
+        )
+        self.assertEqual(sorted(r["action"] for r in results), ["created", "unchanged"])
+        # Exactly one Clerk exchange (plus none for billing: FakeClient bills without refresh).
+        self.assertEqual(self.client.refresh_calls, 1)
+        row = await self.service._fetch_account(results[0]["account"]["id"])
+        self.assertIn("__client=rotated-1", row["cookies"])
+
+    async def test_stale_trust_revalidates_same_cookie(self):
+        first = await self.service.sync_account_from_extension(self.COOKIE)
+        account_id = first["account"]["id"]
+        await self.service._update_account(
+            account_id, last_refresh_at=time.time() - self.service.SOURCE_TRUST_SECONDS - 1
+        )
+        calls = self.client.refresh_calls
+        result = await self.service.sync_account_from_extension(self.COOKIE)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(self.client.refresh_calls, calls + 1)
+
+    async def test_force_revalidates_a_ready_account(self):
+        await self.service.sync_account_from_extension(self.COOKIE)
+        calls = self.client.refresh_calls
+        result = await self.service.sync_account_from_extension(self.COOKIE, force=True)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(self.client.refresh_calls, calls + 1)
+
+    async def test_unchanged_path_reconciles_stale_billing(self):
+        first = await self.service.sync_account_from_extension(self.COOKIE)
+        account_id = first["account"]["id"]
+        old = time.time() - self.service.BILLING_STALE_SECONDS - 1
+        await self.service._update_account(account_id, credits=1, credits_checked_at=old)
+        result = await self.service.sync_account_from_extension(self.COOKIE)
+        self.assertEqual(result["action"], "unchanged")
+        self.assertEqual(result["account"]["credits"], 500)
+        self.assertGreater(result["account"]["credits_checked_at"], old)
+
+    async def test_close_waits_for_an_in_flight_import(self):
+        self.client.refresh_delay = 0.05
+        waiter = asyncio.create_task(
+            self.service.run_import(self.service.sync_account_from_extension(self.COOKIE))
+        )
+        await asyncio.sleep(0.01)
+        waiter.cancel()   # the HTTP client went away
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        await self.service.close()   # must drain, not abandon, the import
+        self.assertEqual(len(await self.service.list_accounts()), 1)
+
+    async def test_rejected_cookie_does_not_touch_a_healthy_account(self):
+        first = await self.service.sync_account_from_extension(self.COOKIE)
+        before = await self.service._fetch_account(first["account"]["id"])
+        self.client.refresh_error = SunoAuthError(401, "stale")
+        with self.assertRaises(SunoValidationError) as ctx:
+            await self.service.sync_account_from_extension("__client=stale-cookie")
+        self.assertEqual(ctx.exception.code, "cookie_rejected")
+        after = await self.service._fetch_account(first["account"]["id"])
+        self.assertEqual(after["cookies"], before["cookies"])
+        self.assertEqual(after["status"], sm.ACCOUNT_READY)
+
+    async def test_same_cookie_revalidates_when_account_is_unhealthy(self):
+        first = await self.service.sync_account_from_extension(self.COOKIE)
+        account_id = first["account"]["id"]
+        await self.service._update_account(account_id, status=sm.ACCOUNT_NEEDS_LOGIN, last_error="x")
+        calls = self.client.refresh_calls
+        result = await self.service.sync_account_from_extension(self.COOKIE)
+        # Not short-circuited: unchanged is deduplication, not a health check.
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(self.client.refresh_calls, calls + 1)
+        row = await self.service._fetch_account(account_id)
+        self.assertEqual(row["status"], sm.ACCOUNT_READY)
+        self.assertIsNone(row["last_error"])
+
+    async def test_concurrent_uploads_for_a_new_user_yield_one_account(self):
+        self.client.refresh_delay = 0.02
+        results = await asyncio.gather(
+            self.service.sync_account_from_extension("__client=a"),
+            self.service.sync_account_from_extension("__client=b"),
+        )
+        self.assertEqual(sorted(r["action"] for r in results), ["created", "updated"])
+        self.assertEqual(len(await self.service.list_accounts()), 1)
+
+    async def test_upload_racing_refresh_leaves_a_consistent_row(self):
+        first = await self.service.sync_account_from_extension(self.COOKIE)
+        account_id = first["account"]["id"]
+        self.service._sessions.clear()
+        self.client.refresh_delay = 0.03
+        refresh = asyncio.create_task(self.service._session_for(account_id))
+        await asyncio.sleep(0.005)
+        upload = asyncio.create_task(self.service.sync_account_from_extension("__client=browser-2"))
+        await asyncio.gather(refresh, upload)
+        row = await self.service._fetch_account(account_id)
+        self.assertEqual(row["status"], sm.ACCOUNT_READY)
+        # The saved credential is the LATEST one Clerk issued, not an obsolete one.
+        self.assertIn(f"__client=rotated-{self.client.refresh_calls}", row["cookies"])
+        # The cached session is the one the row describes.
+        self.assertEqual(self.service._sessions[account_id].cookie_string(), row["cookies"])
+
+    async def test_admin_import_exchanges_the_cookie_once(self):
+        calls = self.client.refresh_calls
+        await self.service.import_account(self.COOKIE, "manual")
+        self.assertEqual(self.client.refresh_calls, calls + 1)
+
+    async def test_schema_migration_adds_column_to_old_table(self):
+        async with self.db.connect(write=True) as conn:
+            await conn.execute("ALTER TABLE suno_accounts DROP COLUMN source_client_hash")
+            await conn.commit()
+            await self.service._migrate(conn)
+            await conn.commit()
+            cursor = await conn.execute("PRAGMA table_info(suno_accounts)")
+            cols = {r[1] for r in await cursor.fetchall()}
+        self.assertIn("source_client_hash", cols)
+
+
 class AccountDeletionTests(SunoServiceTestCase):
     async def test_delete_refused_while_jobs_are_in_flight(self):
         await self._add_account(provider_cap=1)

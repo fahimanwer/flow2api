@@ -1,14 +1,19 @@
 """Suno provider HTTP surface.
 
-Two authentication tiers, matching the rest of this backend:
+Three authentication tiers, matching the rest of this backend:
 
 * generation and read endpoints take the shared Flow2API key;
+* ``POST /api/plugin/suno-cookie`` takes the worker extension's plugin connection
+  token (the same credential that already pushes the Google Flow cookie). It can
+  only add or refresh an account for a Suno user whose cookie Clerk accepts; it
+  cannot read credentials back, delete, or change limits;
 * anything that imports, replaces, limits or deletes account credentials, or
   resolves a stuck job, requires an admin session.
 
 Nothing here ever returns a cookie, a Clerk session id or a JWT.
 """
 
+import asyncio
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
@@ -19,6 +24,7 @@ from ..core.auth import verify_api_key_flexible
 from ..core.suno_models import SunoConflictError, SunoValidationError, list_models
 from ..services.suno_client import SunoAPIError
 from ..services.suno_service import SunoService
+from . import admin as _admin
 from .admin import verify_admin_token
 
 router = APIRouter(tags=["suno"])
@@ -67,6 +73,13 @@ class AccountImportRequest(BaseModel):
     cookie: str
     display_name: Optional[str] = None
     account_id: Optional[int] = None
+
+
+class PluginCookieSyncRequest(BaseModel):
+    cookie: str
+    display_name: Optional[str] = None
+    ext_version: Optional[str] = None
+    force: bool = False   # manual "Sync Suno now": always re-validate
 
 
 class AccountLimitRequest(BaseModel):
@@ -201,6 +214,36 @@ async def suno_job_audio(
 async def suno_accounts(_: str = Depends(verify_api_key_flexible)):
     """Connected accounts, projected. Credentials are never included."""
     return {"accounts": await _svc().list_accounts()}
+
+
+# ------------------------------------------------------- worker-extension route
+
+async def verify_plugin_connection_token(authorization: Optional[str] = Header(None)) -> str:
+    """The extension's plugin connection token (never the shared API key or an
+    admin session). Kept as a dependency so tests can override it."""
+    await _admin._verify_plugin_connection_token(authorization)
+    return "plugin"
+
+
+@router.post("/api/plugin/suno-cookie")
+async def suno_plugin_cookie_sync(
+    body: PluginCookieSyncRequest, _: str = Depends(verify_plugin_connection_token)
+):
+    """Upsert the calling browser's Suno login, keyed by the Suno user it proves.
+
+    Runs as a service-owned task (``run_import``): a client that gives up
+    mid-request cannot abandon a cookie Clerk has already rotated, and shutdown
+    waits for it. Once the exchange starts, the save completes.
+    """
+    svc = _svc()
+    try:
+        return await svc.run_import(
+            svc.sync_account_from_extension(body.cookie, body.display_name or "", force=body.force)
+        )
+    except SunoValidationError as exc:
+        raise _http_error(exc)
+    except SunoAPIError as exc:
+        raise _upstream_error(exc)
 
 
 # -------------------------------------------------------------- admin routes

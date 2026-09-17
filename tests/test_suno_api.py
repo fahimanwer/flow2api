@@ -28,6 +28,7 @@ class StubService:
         self.raise_on_submit: Optional[Exception] = None
         self.audio_error: Optional[Exception] = None
         self.deleted: List[int] = []
+        self.synced: List[Any] = []
 
     async def submit(self, body):
         if self.raise_on_submit:
@@ -68,6 +69,16 @@ class StubService:
 
     async def refresh_account_billing(self, account_id):
         return {}
+
+    async def run_import(self, coro):
+        return await coro
+
+    async def sync_account_from_extension(self, cookie, display_name="", force=False):
+        self.synced.append((cookie, display_name, force))
+        if not cookie or "__client" not in cookie:
+            raise sm.SunoValidationError("invalid_cookie", "no __client")
+        return {"action": "created", "account": {"id": 7, "display_name": display_name,
+                                                  "status": "ready"}}
 
     async def resolve(self, job_id, action, clip_ids=None,
                       confirm_no_upstream_work=False, note=""):
@@ -214,6 +225,81 @@ class SunoApiTestCase(unittest.TestCase):
             headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
         )
         self.assertEqual(response.status_code, 200)
+
+
+class _PluginConfig:
+    connection_token = "plugin-secret"
+
+
+class _PluginDb:
+    async def get_plugin_config(self):
+        return _PluginConfig()
+
+
+class PluginCookieRouteTests(unittest.TestCase):
+    """``POST /api/plugin/suno-cookie`` accepts ONLY the plugin connection token.
+
+    The production dependency is exercised against a stub plugin config rather
+    than overridden, so the auth matrix below is the real one.
+    """
+
+    def setUp(self):
+        self.service = StubService()
+        suno_router.set_service(self.service)
+        app = FastAPI()
+        app.include_router(suno_router.router)
+        app.dependency_overrides[verify_api_key_flexible] = lambda: "api-key"
+        admin_module.active_admin_tokens.add(ADMIN_TOKEN)
+        self._saved_db = admin_module.db
+        admin_module.db = _PluginDb()
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        admin_module.db = self._saved_db
+        admin_module.active_admin_tokens.discard(ADMIN_TOKEN)
+        suno_router.set_service(None)
+
+    def _post(self, token=None, body=None):
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        return self.client.post(
+            "/api/plugin/suno-cookie",
+            json=body if body is not None else {"cookie": "__client=abc", "display_name": "lap"},
+            headers=headers,
+        )
+
+    def test_no_token_is_rejected(self):
+        self.assertEqual(self._post().status_code, 401)
+        self.assertEqual(self.service.synced, [])
+
+    def test_shared_api_key_is_rejected(self):
+        self.assertEqual(self._post("api-key").status_code, 401)
+        self.assertEqual(self.service.synced, [])
+
+    def test_admin_session_is_rejected(self):
+        self.assertEqual(self._post(ADMIN_TOKEN).status_code, 401)
+
+    def test_plugin_token_upserts_and_returns_no_credentials(self):
+        response = self._post("plugin-secret")
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["action"], "created")
+        self.assertEqual(data["account"]["display_name"], "lap")
+        self.assertNotIn("cookies", data["account"])
+        self.assertNotIn("cookie", response.text.replace('"cookie":', ""))
+        self.assertEqual(self.service.synced, [("__client=abc", "lap", False)])
+
+    def test_force_flag_reaches_the_service(self):
+        response = self._post("plugin-secret", {"cookie": "__client=abc", "force": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.service.synced[-1][2], True)
+
+    def test_cookie_without_client_entry_is_400(self):
+        response = self._post("plugin-secret", {"cookie": "session=nope"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"]["error"]["code"], "invalid_cookie")
+
+    def test_missing_body_field_is_422(self):
+        self.assertEqual(self._post("plugin-secret", {}).status_code, 422)
 
 
 class ServiceUnavailableTests(unittest.TestCase):

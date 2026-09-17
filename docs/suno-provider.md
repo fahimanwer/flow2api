@@ -129,9 +129,27 @@ explicitly once observed. Occupied slots count `submitting`, `submitted`,
 
 ### Credentials
 
-The owner pastes the whole `Cookie:` header from a signed-in suno.com request;
-the `__client` entry is the one that matters. The backend exchanges it through
-Clerk for a short-lived JWT before each call. Clerk **rotates** the cookie on
+Two ways in. **(a) Worker extension (preferred, 2026-09-17):** a staff member
+signed in to suno.com in the Chrome profile that runs the Flow2API Worker flips
+**Share my Suno login** ON in the popup (extension 3.5.0+). The extension exports
+the Cookie header to `POST /api/plugin/suno-cookie` (plugin connection token, the
+same credential that pushes the Google Flow cookie), re-sends it whenever the
+`__client` cookie changes (debounced 5 s) and at least every 6 h. The backend
+upserts by the Suno user the cookie proves: create, or replace the credential on
+the existing row for that user. A repeat of the same browser cookie on a `ready`
+account whose last Clerk exchange is under 24 h old returns `unchanged` without
+contacting Clerk (fingerprint of the *supplied* cookie in `source_client_hash`;
+the stored jar is the rotated one), re-reading billing if it is over 6 h old.
+An unhealthy or stale account, or a manual "Sync Suno now" (`force`), is always
+re-validated. Identical concurrent uploads serialize per fingerprint so Clerk
+sees one exchange; imports run as service-owned tasks that shutdown drains. Missing Suno identity is refused
+before any write; identity-less rows (old admin imports) are never matched.
+Admin-owned fields (display name, limits, disabled) are never touched on update.
+**(b) Admin paste:** the whole `Cookie:` header from a signed-in suno.com request
+via `POST /api/suno/accounts` (admin session). Both paths share one code path
+that exchanges the cookie with Clerk exactly **once** and saves that resulting
+session; the `__client` entry is the one that matters. The backend exchanges it
+through Clerk for a short-lived JWT before each call. Clerk **rotates** the cookie on
 every exchange, so the jar is persisted back to the account row immediately and
 before anything else uses it. Refresh runs as a shared task that owns the
 per-account lock across both the refresh and the durable save, so a cancelled
@@ -200,9 +218,17 @@ curl -sS https://flow.ashuthefire.com/api/suno/accounts \
   -d '{"cookie":"<the whole Cookie header from suno.com>","display_name":"main"}'
 ```
 
-After importing, stop using that browser profile on suno.com and **do not sign
-out**: signing out revokes the session, and browsing there rotates the cookie
-away from the backend.
+Or, with the worker extension 3.5.0+, skip the paste: sign in to suno.com in the
+worker's Chrome profile and switch **Share my Suno login** ON in the popup; it
+pushes to `/api/plugin/suno-cookie` and keeps the cookie current on its own.
+Turning the switch OFF stops syncing but does not delete the account.
+
+**Do not sign out** of suno.com in that browser: signing out revokes the session.
+With the admin paste path, also stop browsing suno.com in that profile, because
+browsing rotates the cookie away from the backend. With the extension path the
+rotation is re-pushed automatically, but whether the *backend's* own refresh
+rotates the cookie in a way that signs the browser out is UNKNOWN until tested
+(gate 9 below).
 
 ## 5. What is deliberately not built
 
@@ -236,6 +262,17 @@ Needs a Suno account. In order:
 
 Record the answers in `docs/suno-spike.md` and set the caps. Until then the
 provider will start, accept jobs and block or fail honestly rather than pretend.
+
+8. **Browser/backend session coexistence (release gate for the 3.5.0 zip).** With
+   the extension switch ON: (a) let the backend refresh several times while the
+   browser keeps using suno.com; (b) reload suno.com after a backend refresh; (c) use
+   the backend after browsing rotated the cookie (extension must have re-pushed,
+   `action=updated`); (d) restart the backend and confirm the account is still
+   `ready`. If (a) or (b) signs the browser out, the extension must own the session
+   (step 2 design) before the zip is distributed.
+9. Extension popup end to end on one staff laptop: switch ON -> "Login shared";
+   sign out of suno.com -> "Not signed in"; sign in again -> re-synced without
+   touching the popup; switch OFF mid-sync -> nothing recorded locally.
 
 ## 7. Legal posture
 
