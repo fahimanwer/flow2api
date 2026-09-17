@@ -11,6 +11,7 @@ its A/B sibling is still rendering.
 """
 
 import asyncio
+import time
 import os
 import tempfile
 import unittest
@@ -152,6 +153,42 @@ class AccountTests(SunoServiceTestCase):
         # the new value or the next refresh fails.
         self.assertIn("rotated-", row["cookies"])
         self.assertEqual(row["clerk_sid"], "sid-1")
+
+    async def test_mid_call_cookie_rotation_is_persisted_on_next_use(self):
+        """A cookie rotated by an ordinary API response (not a refresh) must
+        still reach the account row, or a restart strands the account."""
+        account = await self._add_account()
+        session = await self.service._session_for(account["id"])
+        # Simulate what the client does when an upstream response carries a
+        # new __client cookie.
+        session.cookies["__client"] = "rotated-mid-call"
+        session.dirty = True
+
+        again = await self.service._session_for(account["id"])
+        self.assertIs(again, session)
+        self.assertFalse(session.dirty)
+        row = await self.service._fetch_account(account["id"])
+        self.assertIn("__client=rotated-mid-call", row["cookies"])
+
+    async def test_close_persists_rotated_cookie(self):
+        account = await self._add_account()
+        session = await self.service._session_for(account["id"])
+        session.cookies["__client"] = "rotated-at-shutdown"
+        session.dirty = True
+        await self.service.close()
+        row = await self.service._fetch_account(account["id"])
+        self.assertIn("__client=rotated-at-shutdown", row["cookies"])
+
+    async def test_service_refreshes_before_client_ttl(self):
+        """The service must re-mint inside the client's TTL, so the client's
+        own unlocked in-place refresh never has to run."""
+        account = await self._add_account()
+        session = await self.service._session_for(account["id"])
+        refreshes = self.client.refresh_calls
+        # Age the token to just inside the client TTL but past the margin.
+        session.jwt_obtained_at = time.time() - (self.client.JWT_TTL_SECONDS - 5)
+        await self.service._session_for(account["id"])
+        self.assertEqual(self.client.refresh_calls, refreshes + 1)
 
     async def test_public_account_hides_credentials(self):
         await self._add_account()

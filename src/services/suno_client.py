@@ -53,7 +53,7 @@ class SunoSession:
     account row after each refresh or the next refresh fails.
     """
 
-    __slots__ = ("cookies", "sid", "jwt", "jwt_obtained_at", "device_id")
+    __slots__ = ("cookies", "sid", "jwt", "jwt_obtained_at", "device_id", "dirty")
 
     def __init__(self, cookies: Dict[str, str], sid: Optional[str] = None,
                  jwt: Optional[str] = None, device_id: Optional[str] = None):
@@ -62,6 +62,9 @@ class SunoSession:
         self.jwt = jwt
         self.jwt_obtained_at: float = 0.0
         self.device_id = device_id or cookies.get("ajs_anonymous_id")
+        # Set whenever an upstream response changed the jar (a rotated
+        # ``__client``). The owner of the session persists and clears it.
+        self.dirty: bool = False
 
     @property
     def client_cookie(self) -> Optional[str]:
@@ -100,16 +103,24 @@ def parse_cookie_string(raw: str) -> Dict[str, str]:
     return jar
 
 
-def _merge_set_cookie(jar: Dict[str, str], set_cookie_values: List[str]) -> None:
-    """Fold ``Set-Cookie`` response headers back into the jar."""
+def _merge_set_cookie(jar: Dict[str, str], set_cookie_values: List[str]) -> bool:
+    """Fold ``Set-Cookie`` response headers back into the jar.
+
+    Returns True when any value actually changed, so the caller knows the jar
+    now differs from what is persisted.
+    """
+    changed = False
     for header in set_cookie_values or []:
         first = header.split(";", 1)[0].strip()
         if "=" not in first:
             continue
         name, value = first.split("=", 1)
         name = name.strip()
-        if name:
-            jar[name] = value.strip()
+        value = value.strip()
+        if name and jar.get(name) != value:
+            jar[name] = value
+            changed = True
+    return changed
 
 
 class SunoClient:
@@ -210,8 +221,8 @@ class SunoClient:
         )
 
         set_cookie = response.headers.get_list("set-cookie") if hasattr(response.headers, "get_list") else []
-        if set_cookie:
-            _merge_set_cookie(session.cookies, list(set_cookie))
+        if set_cookie and _merge_set_cookie(session.cookies, list(set_cookie)):
+            session.dirty = True
 
         data: Any = None
         if expect_json:

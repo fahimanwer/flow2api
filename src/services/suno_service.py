@@ -173,6 +173,9 @@ class SunoService:
                 await task
         self._refresh_tasks.clear()
         self._running_jobs.clear()
+        for account_id, session in list(self._sessions.items()):
+            with contextlib.suppress(Exception):
+                await self._persist_rotation(account_id, session)
 
     async def _recover_after_restart(self) -> Dict[str, int]:
         """A restart loses in-flight tasks, not upstream work.
@@ -282,7 +285,7 @@ class SunoService:
                 raise SunoValidationError("unknown_account", f"Suno account {account_id} is gone.")
 
             cached = self._sessions.get(account_id)
-            if cached and cached.jwt and (_now() - cached.jwt_obtained_at) <= self.client.JWT_TTL_SECONDS:
+            if self._session_fresh(cached):
                 return cached  # someone refreshed while we queued
 
             session = SunoSession(
@@ -315,12 +318,42 @@ class SunoService:
                 status=sm.ACCOUNT_READY if row.get("status") == sm.ACCOUNT_NEEDS_LOGIN
                 else row.get("status"),
             )
+            session.dirty = False  # the row now matches the jar
             self._sessions[account_id] = session
             return session
 
+    # Seconds before the client's own TTL at which the service re-mints. The
+    # client can refresh in place when a token ages out mid-call, but that path
+    # runs outside the account lock and cannot persist a rotated cookie, so the
+    # service refreshes first and the client's fallback stays unused.
+    REFRESH_MARGIN_SECONDS = 10
+
+    def _session_fresh(self, session: Optional[SunoSession]) -> bool:
+        if not session or not session.jwt:
+            return False
+        limit = max(1, self.client.JWT_TTL_SECONDS - self.REFRESH_MARGIN_SECONDS)
+        return (_now() - session.jwt_obtained_at) <= limit
+
+    async def _persist_rotation(self, account_id: int, session: SunoSession) -> None:
+        """Write back a jar that an upstream response changed since the last save.
+
+        Clerk invalidates the previous ``__client`` when it rotates, so a jar
+        that only lives in memory would strand the account on restart.
+        """
+        if not session.dirty:
+            return
+        async with self._lock_for(account_id):
+            if not session.dirty or self._sessions.get(account_id) is not session:
+                return
+            await self._update_account(
+                account_id, cookies=session.cookie_string(), clerk_sid=session.sid
+            )
+            session.dirty = False
+
     async def _session_for(self, account_id: int) -> SunoSession:
         cached = self._sessions.get(account_id)
-        if cached and cached.jwt and (_now() - cached.jwt_obtained_at) <= self.client.JWT_TTL_SECONDS:
+        if self._session_fresh(cached):
+            await self._persist_rotation(account_id, cached)
             return cached
 
         task = self._refresh_tasks.get(account_id)
