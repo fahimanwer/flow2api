@@ -16,6 +16,8 @@ from ..core.logger import debug_logger
 class FileCache:
     """File caching service for videos"""
 
+    DIRECT_FETCH_HOSTS = frozenset({"flow-content.google"})
+
     def __init__(
         self,
         cache_dir: str = "tmp",
@@ -487,21 +489,9 @@ class FileCache:
             Local cache filename
         """
         import base64
-        import uuid
-
-        # Generate unique filename
-        unique_id = hashlib.md5(f"{uuid.uuid4()}{time.time()}".encode()).hexdigest()
-        suffix = f"_{resolution}" if resolution else ""
-        filename = f"{unique_id}{suffix}.jpg"
-        file_path = self.cache_dir / filename
 
         try:
-            # Decode base64 and save to file
             image_data = base64.b64decode(base64_data)
-            with open(file_path, 'wb') as f:
-                f.write(image_data)
-            debug_logger.log_info(f"Base64 image cached: {filename} ({len(image_data)} bytes)")
-            return filename
         except Exception as e:
             debug_logger.log_error(
                 error_message=f"Failed to cache base64 image: {str(e)}",
@@ -509,6 +499,78 @@ class FileCache:
                 response_text=""
             )
             raise Exception(f"Failed to cache base64 image: {str(e)}")
+        return await self.cache_image_bytes(image_data, resolution)
+
+    async def cache_image_bytes(self, image_data: bytes, resolution: str = "") -> str:
+        """
+        Cache raw image bytes to a new local file (written atomically)
+
+        Args:
+            image_data: Image file bytes (JPEG or PNG)
+            resolution: Resolution info for filename (e.g., "4K", "2K", "1K")
+
+        Returns:
+            Local cache filename
+        """
+        import uuid
+
+        unique_id = hashlib.md5(f"{uuid.uuid4()}{time.time()}".encode()).hexdigest()
+        suffix = f"_{resolution}" if resolution else ""
+        ext = "png" if image_data[:8] == b"\x89PNG\r\n\x1a\n" else "jpg"
+        filename = f"{unique_id}{suffix}.{ext}"
+        file_path = self.cache_dir / filename
+
+        try:
+            self._write_cached_content(file_path, image_data)
+            debug_logger.log_info(f"Image cached: {filename} ({len(image_data)} bytes)")
+            return filename
+        except Exception as e:
+            debug_logger.log_error(
+                error_message=f"Failed to cache image: {str(e)}",
+                status_code=0,
+                response_text=""
+            )
+            raise Exception(f"Failed to cache image: {str(e)}")
+
+    async def fetch_image_bytes(self, url: str) -> bytes:
+        """
+        Download a generated image into memory without caching it.
+
+        Flow's signed CDN links (DIRECT_FETCH_HOSTS) are fetched without a proxy
+        first: no account or captcha is involved and callers already download
+        these links directly (measured ~45 ms direct vs ~550 ms through WARP).
+        Anything else, or a failed direct try, goes through the usual media proxy.
+        """
+        fingerprint = self._get_request_fingerprint()
+        headers = self._build_download_headers("image", fingerprint=fingerprint)
+        host = (urlparse(url).hostname or "").lower()
+
+        attempts = []
+        if host in self.DIRECT_FETCH_HOSTS:
+            attempts.append((None, 15))
+        attempts.append((await self._resolve_download_proxy("image", fingerprint=fingerprint), 60))
+
+        last_error = "no attempt"
+        for proxy_url, timeout in attempts:
+            try:
+                async with AsyncSession() as session:
+                    response = await session.get(
+                        url,
+                        timeout=timeout,
+                        proxy=proxy_url,
+                        headers=headers,
+                        impersonate="chrome120",
+                        verify=False
+                    )
+                if response.status_code == 200 and response.content:
+                    return response.content
+                last_error = f"HTTP {response.status_code}"
+            except Exception as e:
+                last_error = str(e)
+            debug_logger.log_warning(
+                f"Image fetch {'direct' if proxy_url is None else 'via proxy'} failed: {last_error}"
+            )
+        raise Exception(f"Failed to fetch image: {last_error}")
 
     def get_cache_path(self, filename: str) -> Path:
         """Get full path to cached file"""

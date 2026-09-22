@@ -1,8 +1,10 @@
 # Shared Agent Status
 
-Last updated: 2026-09-22
+Last updated: 2026-09-22 (watermark removal)
 
 ## Active
+
+- 2026-09-22: Owner asked for watermark-free images from every account, with an admin switch to turn it off, and to deploy now and run Codex on the live code once its credits return (2026-09-23 ~04:44). Owner ToS decision: recorded here, owner accepts it. Branch `feat/watermark-removal` (worktree `../flow2api-watermark`). Plan `tmp/watermark_removal_plan.md`; test evidence `tmp/watermark_test/README.md`. What it does: Python port of GargantuaX/gemini-watermark-remover (MIT) calibrated on our own output (48 px logo at 0.60 strength, 73 px margin on 1K, 89 px on 2K; free + Pro are stamped, Ultra is not). Sealed test on real images: 39/41 removed, 0/27 clean images changed. Free/Pro 1K images are downloaded (direct from `flow-content.google`, WARP fallback), cleaned and served from `/tmp` (2 h, same as 2K pins); Ultra keeps Google's link; 2K upscales are cleaned for any tier. Switch: Settings → Generation Settings → "Remove Gemini watermark" (`generation_config.remove_watermark`, default ON, guarded ALTER). C2PA/IPTC "Made with Google AI" metadata and SynthID are deliberately kept (only the visible sparkle goes). Adds `numpy`. Server cost (1 core): 1K ~15 ms, 2K ~75 ms, direct fetch ~45 ms. Tests: 27 new, suite 293 pass / 1 pre-existing failure; migration verified on a copy of the live DB in a throwaway prod-image container (copy deleted). Per-request evidence lands in `request_logs.response_body.generated_assets.watermark` (`applied`, `reason`, `ms`).
 
 - 2026-09-22 (found while testing PR #19 live): prompt rejections and captcha-mint failures wrote `tokens.last_error_at`, a column that exists only on `token_stats` → `sqlite3.OperationalError` → HTTP 500 to the caller (5 of the pinterest worker's last 25 Flow calls; introduced 2026-09-03 in `5206822`). Fix: `db.touch_token_last_error()` stamps `token_stats.last_error_at` without counting an error; both call sites in `token_manager.record_error` use it. Branch `fix/last-error-at-stamp`.
 
@@ -22,6 +24,10 @@ Last updated: 2026-09-22
 - Upstream `origin/main` contains a README-only chart fix since the production fork; merged before deployment to satisfy the ancestor requirement.
 
 - Linux image verification: 200 isolated disconnects against deployed fix code returned thread count to baseline (1 -> 1).
+
+## Worktrees
+
+- `../flow2api-watermark` — branch `feat/watermark-removal`, Gemini watermark removal, **active** until merged (then safe-to-delete).
 
 ## September 7 incident
 

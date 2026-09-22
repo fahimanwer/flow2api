@@ -41,6 +41,7 @@ proxy_url = ""
 [generation]
 image_timeout = 300
 video_timeout = 1500
+remove_watermark = true  # 去除免费/Pro 账号图片的可见 Gemini 水印（首次启动时生效，之后在管理后台修改）
 
 [call_logic]
 call_mode = "default"  # default=随机轮询策略, polling=顺序轮询策略
