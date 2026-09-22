@@ -71,6 +71,7 @@ def _make_tm():
     tm = TokenManager.__new__(TokenManager)
     tm.db = MagicMock()
     tm.db.update_token = AsyncMock()
+    tm.db.touch_token_last_error = AsyncMock()
     tm.db.upsert_recaptcha_cooldown = AsyncMock()
     tm.db.delete_recaptcha_cooldown = AsyncMock()
     tm.db.increment_token_stats = AsyncMock()
@@ -169,7 +170,8 @@ class PromptRejectionNotAccountError(unittest.TestCase):
         asyncio.run(tm.record_error(30, msg, "gemini-3.1-flash-image-landscape"))
         tm.db.increment_token_stats.assert_not_called()
         self.assertNotIn(30, tm._recaptcha_cd)
-        tm.db.update_token.assert_awaited()  # last_error_at stamped
+        tm.db.touch_token_last_error.assert_awaited()  # last_error_at stamped on token_stats (tokens has no such column)
+        tm.db.update_token.assert_not_called()
 
     def test_real_errors_still_count(self):
         from src.services.token_manager import _is_prompt_rejection

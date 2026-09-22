@@ -1724,6 +1724,21 @@ class Database:
                 """, (today, token_id))
             await db.commit()
 
+    async def touch_token_last_error(self, token_id: int):
+        """Stamp token_stats.last_error_at WITHOUT counting an error (prompt rejected by Google,
+        extension could not mint a captcha). `tokens` has no last_error_at column — writing it
+        there raised sqlite3.OperationalError and turned those requests into HTTP 500s (live
+        2026-09-22, introduced 2026-09-03 in 5206822)."""
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                "UPDATE token_stats SET last_error_at = CURRENT_TIMESTAMP WHERE token_id = ?", (token_id,)
+            )
+            if cursor.rowcount == 0:
+                await db.execute(
+                    "INSERT INTO token_stats (token_id, last_error_at) VALUES (?, CURRENT_TIMESTAMP)", (token_id,)
+                )
+            await db.commit()
+
     async def reset_error_count(self, token_id: int):
         """Reset consecutive error count (only reset consecutive_error_count, keep error_count and today_error_count)
 

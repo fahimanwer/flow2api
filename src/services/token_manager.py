@@ -1799,7 +1799,7 @@ class TokenManager:
         if _is_prompt_rejection(error_message):
             # Google refused the prompt (safety filter). Stamp last_error_at so the
             # UI shows the attempt, but no strike, no cooldown, no disable count.
-            await self.db.update_token(token_id, last_error_at=datetime.now())
+            await self.db.touch_token_last_error(token_id)
             debug_logger.log_info(
                 f"[TOKEN] Token {token_id}: prompt rejected by Google (not an account "
                 f"fault; not counted): {str(error_message)[:120]}"
@@ -1810,7 +1810,7 @@ class TokenManager:
             # The extension never produced a token — a DEVICE failure, not Google
             # rejecting the account. Short flat pause, no strike (see mark_mint_failure).
             await self.mark_mint_failure(token_id)
-            await self.db.update_token(token_id, last_error_at=datetime.now())
+            await self.db.touch_token_last_error(token_id)
             debug_logger.log_info(
                 f"[TOKEN] Token {token_id}: extension could not mint a reCAPTCHA token; "
                 f"device paused briefly (no account strike): {str(error_message)[:120]}"
