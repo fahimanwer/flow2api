@@ -1817,7 +1817,20 @@ class TokenManager:
             try:
                 project_pool_size = self._get_project_pool_size()
                 while len(projects) < project_pool_size:
-                    new_project = await self._create_project_for_token(token, len(projects) + 1)
+                    try:
+                        new_project = await self._create_project_for_token(token, len(projects) + 1)
+                    except Exception as e:
+                        # Labs' project.createProject answers 404 for accounts born on flow.google.com
+                        # (2026-09). One project is enough to generate; the pool only adds concurrency.
+                        # With at least one project, carry on with what we have instead of failing
+                        # EVERY request (10 x 500 -> auto_error ban, live 2026-09-22 token 93).
+                        if projects:
+                            debug_logger.op_warning(
+                                f"[PROJECT_POOL] token={token_id} ({token.email}): cannot create pooled project "
+                                f"#{len(projects) + 1} ({str(e)[:120]}); using the {len(projects)} existing"
+                            )
+                            break
+                        raise
                     projects.append(new_project)
                     projects = self._sort_projects(projects)
 
