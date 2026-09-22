@@ -648,6 +648,7 @@ class GenerationConfigRequest(BaseModel):
     image_timeout: Optional[int] = None
     video_timeout: Optional[int] = None
     max_retries: Optional[int] = None
+    remove_watermark: Optional[bool] = None
 
 
 class CallLogicConfigRequest(BaseModel):
@@ -1753,6 +1754,7 @@ async def get_generation_config(token: str = Depends(verify_admin_token)):
             "image_timeout": config.image_timeout,
             "video_timeout": config.video_timeout,
             "max_retries": config.max_retries,
+            "remove_watermark": config.remove_watermark,
         }
     }
 
@@ -1767,6 +1769,7 @@ async def update_generation_config(
         image_timeout=request.image_timeout,
         video_timeout=request.video_timeout,
         max_retries=request.max_retries,
+        remove_watermark=request.remove_watermark,
     )
 
     # 🔥 Hot reload: sync database config to memory
@@ -2088,6 +2091,7 @@ async def update_generation_timeout(
         image_timeout=request.image_timeout,
         video_timeout=request.video_timeout,
         max_retries=request.max_retries,
+        remove_watermark=request.remove_watermark,
     )
 
     # 🔥 Hot reload: sync database config to memory

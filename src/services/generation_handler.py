@@ -11,12 +11,14 @@ from ..core.monitoring import record_generation_result
 from ..core.models import Task, RequestLog
 from ..core.account_tiers import (
     PAYGATE_TIER_NOT_PAID,
+    PAYGATE_TIER_TWO,
     get_paygate_tier_label,
     get_required_paygate_tier_for_model,
     normalize_user_paygate_tier,
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+from .watermark_remover import clean_image_bytes
 
 
 # Model configuration
@@ -1183,6 +1185,7 @@ class GenerationHandler:
             proxy_manager=proxy_manager,
             flow_client=flow_client,
         )
+        self._watermark_unknown_sizes: set = set()
 
     def _create_generation_result(self) -> Dict[str, Any]:
         """????????????????"""
@@ -1703,6 +1706,61 @@ class GenerationHandler:
                 pending_token_state["active"] = False
 
 
+    async def _remove_watermark_bytes(
+        self,
+        image_bytes: bytes,
+        image_trace: Optional[Dict[str, Any]],
+    ) -> tuple:
+        """Strip Flow's visible watermark off the event loop. Never raises.
+
+        Returns (bytes, info); bytes are the input unchanged unless info["applied"].
+        """
+        started_at = time.time()
+        try:
+            cleaned, result = await asyncio.to_thread(clean_image_bytes, image_bytes)
+            info = result.as_dict()
+        except Exception as e:
+            debug_logger.log_warning(f"[WATERMARK] remover failed, image returned unchanged: {str(e)}")
+            cleaned, info = image_bytes, {"applied": False, "reason": f"error:{type(e).__name__}"}
+        if info.get("reason") == "unknown-size":
+            size_key = (info.get("width"), info.get("height"))
+            if size_key not in self._watermark_unknown_sizes:
+                self._watermark_unknown_sizes.add(size_key)
+                debug_logger.log_info(
+                    f"[WATERMARK] no calibration for {size_key[0]}x{size_key[1]}, image returned unchanged"
+                )
+        if image_trace is not None:
+            image_trace["watermark_ms"] = int((time.time() - started_at) * 1000)
+        return cleaned, info
+
+    async def _remove_watermark_base64(
+        self,
+        encoded_image: str,
+        image_trace: Optional[Dict[str, Any]],
+    ) -> tuple:
+        """Same as _remove_watermark_bytes for a base64 image; returns (base64, info)."""
+        try:
+            image_bytes = base64.b64decode(encoded_image)
+        except Exception:
+            return encoded_image, {"applied": False, "reason": "error:bad-base64"}
+        cleaned, info = await self._remove_watermark_bytes(image_bytes, image_trace)
+        if info.get("applied"):
+            return base64.b64encode(cleaned).decode("ascii"), info
+        return encoded_image, info
+
+    async def _fetch_and_remove_watermark(
+        self,
+        image_url: str,
+        image_trace: Optional[Dict[str, Any]],
+    ) -> tuple:
+        """Download a generated image and strip its watermark; returns (bytes or None, info)."""
+        try:
+            image_bytes = await self.file_cache.fetch_image_bytes(image_url)
+        except Exception as e:
+            debug_logger.log_warning(f"[WATERMARK] image fetch failed, returning source link: {str(e)}")
+            return None, {"applied": False, "reason": "fetch-failed"}
+        return await self._remove_watermark_bytes(image_bytes, image_trace)
+
     def _get_no_token_error_message(self, generation_type: str) -> str:
         """获取无可用Token时的详细错误信息"""
         if generation_type == "image":
@@ -1825,6 +1883,7 @@ class GenerationHandler:
                 "type": "image",
                 "origin_image_url": image_url
             }
+            watermark_info: Optional[Dict[str, Any]] = None
 
             # 检查是否需要 upsample
             upsample_resolution = model_config.get("upsample")
@@ -1856,6 +1915,13 @@ class GenerationHandler:
                             if stream:
                                 yield self._create_stream_chunk(f"✅ Image upscaled to {resolution_name}\n")
 
+                            if config.remove_watermark:
+                                encoded_image, watermark_info = await self._remove_watermark_base64(
+                                    encoded_image, image_trace
+                                )
+                                if stream and watermark_info.get("applied"):
+                                    yield self._create_stream_chunk("✅ Watermark removed\n")
+
                             # 2K/4K 图片统一落盘为真实文件，日志里只保留链接。
                             response_state["generated_assets"] = {
                                 "type": "image",
@@ -1864,6 +1930,8 @@ class GenerationHandler:
                                     "resolution": resolution_name
                                 }
                             }
+                            if watermark_info is not None:
+                                response_state["generated_assets"]["watermark"] = watermark_info
 
                             try:
                                 await self._update_request_log_progress(
@@ -1944,7 +2012,25 @@ class GenerationHandler:
 
             local_url = image_url
             cache_started_at = time.time()
-            if config.cache_enabled:
+            # Free/Pro images carry Flow's visible watermark; Ultra images do not,
+            # so they keep the direct link and skip the download.
+            image_bytes = None
+            if config.remove_watermark and normalized_tier != PAYGATE_TIER_TWO:
+                image_bytes, watermark_info = await self._fetch_and_remove_watermark(image_url, image_trace)
+                if stream and watermark_info.get("applied"):
+                    yield self._create_stream_chunk("✅ Watermark removed\n")
+            if image_bytes is not None and (watermark_info.get("applied") or config.cache_enabled):
+                try:
+                    cached_filename = await self.file_cache.cache_image_bytes(image_bytes, "1K")
+                    local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                except Exception as e:
+                    debug_logger.log_error(f"Failed to cache 1K image: {str(e)}")
+                    if watermark_info.get("applied"):
+                        watermark_info = {**watermark_info, "applied": False, "reason": "cache-failed"}
+                    if stream:
+                        cache_error = self._normalize_error_message(e, max_length=120)
+                        yield self._create_stream_chunk(f"⚠️ Cache failed: {cache_error}\nReturning source link...\n")
+            elif config.cache_enabled:
                 await self._update_request_log_progress(
                     request_log_state,
                     token_id=token.id,
@@ -1977,6 +2063,8 @@ class GenerationHandler:
                 "origin_image_url": image_url,
                 "final_image_url": local_url
             }
+            if watermark_info is not None:
+                response_state["generated_assets"]["watermark"] = watermark_info
             self._mark_generation_succeeded(generation_result)
 
             if stream:

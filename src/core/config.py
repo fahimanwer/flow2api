@@ -326,6 +326,17 @@ class Config:
         self._config["generation"]["video_timeout"] = timeout
 
     @property
+    def remove_watermark(self) -> bool:
+        """Remove the visible Gemini watermark from free/Pro images (default on)"""
+        return bool(self._config.get("generation", {}).get("remove_watermark", True))
+
+    def set_remove_watermark(self, enabled: bool):
+        """Set whether the visible Gemini watermark is removed"""
+        if "generation" not in self._config:
+            self._config["generation"] = {}
+        self._config["generation"]["remove_watermark"] = bool(enabled)
+
+    @property
     def polling_mode_enabled(self) -> bool:
         """Get polling mode enabled status."""
         return self.call_logic_mode == "polling"
