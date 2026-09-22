@@ -501,7 +501,53 @@ class TokenManager:
             return "Google login needs attention (access token dead) — device must sign out/in"
         if self.is_health_cooldown(token_id, "throttle"):
             return "Google throttle cooldown"
+        if self.is_health_cooldown(token_id, "safety_flagged"):
+            return "Google refuses every prompt on this account (safety flag) — paused"
         return None
+
+    # An account whose prompts are ALL refused is flagged on Google's side, whatever the
+    # prompts say. Refusals are otherwise not strikes, so count consecutive ones here.
+    PROMPT_REJECTION_FLAG_STRIKES = 6
+    PROMPT_REJECTION_PAUSE = timedelta(hours=1)
+
+    async def _note_prompt_rejection(self, token_id: int) -> None:
+        counts = self.__dict__.setdefault("_prompt_rejections", {})
+        counts[token_id] = counts.get(token_id, 0) + 1
+        if counts[token_id] < self.PROMPT_REJECTION_FLAG_STRIKES:
+            return
+        counts[token_id] = 0
+        now = datetime.now(timezone.utc)
+        key = (int(token_id), "safety_flagged")
+        prev = self._health_cd.get(key) or {}
+        strikes = int(prev.get("strikes", 0)) + 1
+        first = prev.get("first_failure_at") or now
+        entry = {
+            "until": now + self.PROMPT_REJECTION_PAUSE,
+            "strikes": strikes,
+            "first_failure_at": first,
+            "last_failure_at": now,
+            "fingerprint": "",
+        }
+        self._health_cd[key] = entry
+        try:
+            await self.db.upsert_token_health_cooldown(
+                token_id, "safety_flagged", entry["until"], strikes, first, now, ""
+            )
+        except Exception as e:
+            debug_logger.op_warning(f"[HEALTH_CD] could not persist safety_flagged: {e}")
+        debug_logger.event(
+            f"[HEALTH_CD] token={token_id} safety_flagged strike={strikes}: "
+            f"{self.PROMPT_REJECTION_FLAG_STRIKES} prompt refusals in a row, paused "
+            f"{int(self.PROMPT_REJECTION_PAUSE.total_seconds())}s"
+        )
+
+    async def _clear_prompt_rejections(self, token_id: int) -> None:
+        self.__dict__.setdefault("_prompt_rejections", {}).pop(token_id, None)
+        if self._health_cd.pop((int(token_id), "safety_flagged"), None) is not None:
+            try:
+                await self.db.delete_token_health_cooldown(token_id, "safety_flagged")
+            except Exception as e:
+                debug_logger.op_warning(f"[HEALTH_CD] could not clear safety_flagged: {e}")
 
     async def _note_verified_at(self, token_id: int, at: Optional[str]) -> None:
         """Called whenever an AT is PROVEN to work (credits OK / generation OK). Clears an
@@ -1798,8 +1844,12 @@ class TokenManager:
 
         if _is_prompt_rejection(error_message):
             # Google refused the prompt (safety filter). Stamp last_error_at so the
-            # UI shows the attempt, but no strike, no cooldown, no disable count.
+            # UI shows the attempt, but no strike and no disable count. Many refusals
+            # IN A ROW with no success between them mean the ACCOUNT is flagged (2026-09-22:
+            # one Pro account refused 16 harmless prompts in a row; Pro-first ordering then
+            # kept picking it because its instant failures made it look idle) → pause it.
             await self.db.touch_token_last_error(token_id)
+            await self._note_prompt_rejection(token_id)
             debug_logger.log_info(
                 f"[TOKEN] Token {token_id}: prompt rejected by Google (not an account "
                 f"fault; not counted): {str(error_message)[:120]}"
@@ -1869,6 +1919,8 @@ class TokenManager:
         await self.clear_recaptcha_cooldown(token_id)
         # A generation succeeded → the access token in use is live → clear at_stale.
         await self._note_verified_at(token_id, None)
+        # ...and Google accepted a prompt, so the account is not safety-flagged.
+        await self._clear_prompt_rejections(token_id)
 
     async def ban_token_for_429(self, token_id: int):
         """因429错误立即禁用token
