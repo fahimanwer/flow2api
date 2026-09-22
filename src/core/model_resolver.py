@@ -293,6 +293,12 @@ VIDEO_BASE_MODELS = {
     "omni-flash_6s": {"landscape": "omni-flash_6s", "portrait": "omni-flash_6s_portrait"},
     "omni-flash_8s": {"landscape": "omni-flash_8s", "portrait": "omni-flash_8s_portrait"},
     "omni-flash_10s": {"landscape": "omni-flash_10s", "portrait": "omni-flash_10s_portrait"},
+    # Omni ingredients-only: every image is a reference, even 1 or 2.
+    "omni_r2v": {"landscape": "omni_r2v", "portrait": "omni_r2v_portrait"},
+    "omni_r2v_4s": {"landscape": "omni_r2v_4s", "portrait": "omni_r2v_4s_portrait"},
+    "omni_r2v_6s": {"landscape": "omni_r2v_6s", "portrait": "omni_r2v_6s_portrait"},
+    "omni_r2v_8s": {"landscape": "omni_r2v_8s", "portrait": "omni_r2v_8s_portrait"},
+    "omni_r2v_10s": {"landscape": "omni_r2v_10s", "portrait": "omni_r2v_10s_portrait"},
     # I2V models
     "veo_3_1_i2v_s_fast_fl": {
         "landscape": "veo_3_1_i2v_s_fast_fl",
@@ -423,6 +429,10 @@ VIDEO_BASE_MODELS = {
         "landscape": "veo_3_1_r2v_fast_ultra_relaxed_8s",
         "portrait": "veo_3_1_r2v_fast_portrait_ultra_relaxed_8s",
     },
+    "veo_3_1_r2v_lite": {
+        "landscape": "veo_3_1_r2v_lite_landscape",
+        "portrait": "veo_3_1_r2v_lite_portrait",
+    },
     # Extend models (视频续写)
     "veo_3_1_extend": {
         "landscape": "veo_3_1_extend",
@@ -455,6 +465,8 @@ FRIENDLY_VIDEO_ALIASES = {
     "veo-r2v": "veo_3_1_r2v_fast",
     "veo-r2v-ultra": "veo_3_1_r2v_fast_ultra",
     "veo-r2v-relaxed": "veo_3_1_r2v_fast_ultra_relaxed",
+    "veo-r2v-lite": "veo_3_1_r2v_lite",
+    "omni-r2v": "omni_r2v",
     "veo-extend": "veo_3_1_extend",
 }
 
@@ -478,11 +490,13 @@ VIDEO_ALIAS_DISPLAY_NAMES = {
     "veo-r2v": "Veo 3.1 R2V",
     "veo-r2v-ultra": "Veo 3.1 R2V Ultra",
     "veo-r2v-relaxed": "Veo 3.1 R2V Ultra Relaxed",
+    "veo-r2v-lite": "Veo 3.1 Lite R2V",
+    "omni-r2v": "Omni 1.1 Flash R2V",
     "veo-extend": "Veo 3.1 Extend",
 }
 
 # Aliases/families whose durationSeconds (4/6/8/10) selects a *_{d}s model.
-VIDEO_ALIASES_ALLOW_DURATION = {"Omni Flash", "Omni 1.1 Flash", "omni", "omni-flash"}
+VIDEO_ALIASES_ALLOW_DURATION = {"Omni Flash", "Omni 1.1 Flash", "omni", "omni-flash", "omni-r2v", "omni_r2v"}
 VIDEO_DURATIONS = (4, 6, 8, 10)
 
 
@@ -562,8 +576,10 @@ def _resolve_friendly_video_alias(model: str, request=None, images: Any = None) 
         base = "veo_3_1_t2v_lite"
         if image_count == 1:
             base = "veo_3_1_i2v_lite"
-        elif image_count >= 2:
+        elif image_count == 2:
             base = "veo_3_1_interpolation_lite"
+        elif image_count >= 3:
+            base = "veo_3_1_r2v_lite"
     elif model == "Veo 3.1 - Quality":
         base = "veo_3_1_t2v"
         if image_count >= 1:
