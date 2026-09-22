@@ -24,6 +24,7 @@
  */
 
 importScripts("suno.js");
+importScripts("session_state.js");
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 // Where the worker tab is opened to mint. 2026-09-04: Google now bounces migrated
@@ -1478,6 +1479,15 @@ async function refreshSession(token_id = null, opts = {}) {
     pushBody.pool_mode = settings.failedImageMode ? "failed_image" : "auto";
     // Version visibility: report this build's version so the admin can see who's outdated.
     pushBody.ext_version = extVersion();
+    // 3.5.2: the project open on flow.google.com (if any). Flow no longer lets the server create a
+    // first project through Labs for a fresh account, so a new account registers with this one.
+    try {
+      const tabs = await chrome.tabs.query({ url: ["*://flow.google.com/project/*", "*://labs.google/fx/tools/flow/project/*"] });
+      for (const t of tabs || []) {
+        const pid = FlowSessionState.flowProjectIdFromUrl(t.url || "");
+        if (pid) { pushBody.project_id = pid; pushBody.project_name = String(t.title || "").slice(0, 80); break; }
+      }
+    } catch (_) {}
 
     // Bound the push so a hung request can't outlive the server's wait for our ack.
     const pushAbort = new AbortController();
@@ -1616,13 +1626,52 @@ chrome.runtime.onStartup.addListener(async () => {
   await setupAlarms();
   await reconcileTabsOnBoot();
   connectWS();
+  // Push the session on boot as well (was install + hourly only): a device that signed in and
+  // then restarted Chrome otherwise stayed unregistered for up to an hour (2026-09-22).
+  refreshSession().catch(() => {});
   scheduleSunoSync("startup", 3000);
 });
+
+// The moment Labs writes its session cookie (staff just pressed "Sign in with Google" on
+// labs.google/fx), clear the login breaker and push — no waiting for the hourly alarm, no
+// Reconnect click. Debounced: NextAuth rewrites the cookie a few times during sign-in.
+let flowCookiePushTimer = null;
+chrome.cookies.onChanged.addListener((changeInfo) => {
+  if (!FlowSessionState.isFlowSessionCookieSet(changeInfo)) return;
+  clearTimeout(flowCookiePushTimer);
+  flowCookiePushTimer = setTimeout(async () => {
+    try {
+      await clearLoginRequired();
+      await log("INFO", "Google Labs session cookie appeared — pushing it to the server now");
+      await refreshSession();
+      connectWS();
+    } catch (e) {
+      await log("WARN", "Session push after sign-in failed (hourly retry stays armed)", { error: e && e.message });
+    }
+  }, 4000);
+});
+
+// Is a Google account signed in in this Chrome at all? (accounts.google.com session cookies;
+// any of these means "yes" — Labs' own sign-in is a separate step on top.)
+async function googleSignedIn() {
+  try {
+    for (const name of ["SID", "__Secure-1PSID", "__Secure-3PSID", "SAPISID"]) {
+      const c = await chrome.cookies.get({ url: "https://accounts.google.com/", name });
+      if (c && c.value) return true;
+    }
+  } catch (_) {}
+  return false;
+}
 
 chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   if (req.action === "testCaptchaConnection") {
     closeSocket(); connectWS();
     sendResponse({ ok: true });
+    return true;
+  }
+  if (req.action === "openLabsSignIn") {
+    // Popup button: bring staff to the page where Labs' own "Sign in with Google" lives.
+    chrome.tabs.create({ url: FlowSessionState.LABS_SIGNIN_URL, active: true }, () => sendResponse({ ok: true }));
     return true;
   }
   if (req.action === "refreshSessionNow") {
@@ -1668,6 +1717,8 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
         connected: !!(ws && ws.readyState === WebSocket.OPEN),
         grantExpired: await isGrantExpired(),
         loginRequired: (await getAuthState()).state === "login_required",
+        googleSignedIn: await googleSignedIn(),
+        labsSignedIn: await hasSessionCookie(),
       });
     })();
     return true;

@@ -25,7 +25,9 @@ It does two things:
 
 1. Unzip `Flow2API-Worker.zip`.
 2. `chrome://extensions` → enable **Developer mode** → **Load unpacked** → pick the folder.
-3. Be **logged into Google Labs / Flow** in that Chrome profile. Done.
+3. Be **logged into Google Labs / Flow** in that Chrome profile: sign in to Google, then press Labs' own
+   **Sign in with Google** on labs.google/fx (a separate step — the popup says which one is missing and has an
+   "Open Google Labs" button). The worker registers by itself the moment Labs' session cookie appears (3.5.1).
 
 Config (server URL, API key, connection token) is baked into the defaults for
 zip-and-load distribution — this is an internal tool, so the credentials are
