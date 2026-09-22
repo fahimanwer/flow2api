@@ -21,6 +21,15 @@ from .file_cache import FileCache
 from .watermark_remover import clean_image_bytes
 
 
+# Reference-image limits, from Flow's own model list (GET aisandbox-pa /v1/flow/models,
+# usages[].inputSpec.maxImageReferences, read 2026-09-22): Nano Banana Pro / 2 / 2 Lite = 10,
+# Omni 1.1 Flash abra_r2v_* = 7, Veo 3.1 Fast and Lite r2v = 3.
+FLOW_IMAGE_MAX_REFERENCES = 10
+FLOW_OMNI_MAX_REFERENCES = 7
+# Reference images upload this many at a time (one by one took ~6.6 s each).
+REFERENCE_UPLOAD_CONCURRENCY = 3
+
+
 # Model configuration
 MODEL_CONFIG = {
     # 图片生成 - GEM_PIX_2 (Gemini 3.0 Pro)
@@ -721,7 +730,7 @@ MODEL_CONFIG = {
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
         "supports_images": True,
         "min_images": 0,
-        "max_images": 3,
+        "max_images": FLOW_OMNI_MAX_REFERENCES,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
         "reference_model_key": "abra_r2v_8s",
@@ -735,7 +744,7 @@ MODEL_CONFIG = {
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
         "supports_images": True,
         "min_images": 0,
-        "max_images": 3,
+        "max_images": FLOW_OMNI_MAX_REFERENCES,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
         "reference_model_key": "abra_r2v_8s",
@@ -752,7 +761,7 @@ MODEL_CONFIG = {
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
         "supports_images": True,
         "min_images": 0,
-        "max_images": 3,
+        "max_images": FLOW_OMNI_MAX_REFERENCES,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
         "output_resolution": "VIDEO_RESOLUTION_720P",
@@ -767,7 +776,7 @@ MODEL_CONFIG = {
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
         "supports_images": True,
         "min_images": 0,
-        "max_images": 3,
+        "max_images": FLOW_OMNI_MAX_REFERENCES,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
         "output_resolution": "VIDEO_RESOLUTION_720P",
@@ -801,6 +810,23 @@ for _duration in (4, 6, 8, 10):
         _cfg["start_end_model_key"] = f"abra_i2v_{_duration}s"
         _cfg["reference_model_key"] = f"abra_r2v_{_duration}s"
         _cfg["reference_duration"] = _duration
+        MODEL_CONFIG[_new_key] = _cfg
+
+# ── Omni ingredients-only: every image is a reference, even with 1 or 2 images
+#    (plain "omni" treats 1-2 images as first/last frames).
+for _duration in (None, 4, 6, 8, 10):
+    for _base_key, _new_key in (
+        ("omni", "omni_r2v"),
+        ("omni_portrait", "omni_r2v_portrait"),
+    ):
+        _src = _base_key if _duration is None else (
+            f"omni_{_duration}s" if _base_key == "omni" else f"omni_{_duration}s_portrait"
+        )
+        if _duration is not None:
+            _new_key = f"omni_r2v_{_duration}s" + ("_portrait" if _base_key == "omni_portrait" else "")
+        _cfg = dict(MODEL_CONFIG[_src])
+        _cfg["reference_only"] = True
+        _cfg["min_images"] = 1
         MODEL_CONFIG[_new_key] = _cfg
 
 
@@ -1059,6 +1085,22 @@ def _apply_veo_3_1_model_updates():
         add_alias(f"veo_3_1_t2v_landscape_{resolution_name}", f"veo_3_1_t2v_{resolution_name}")
         add_alias(f"veo_3_1_i2v_s_landscape_{resolution_name}", f"veo_3_1_i2v_s_{resolution_name}")
 
+    # Veo 3.1 Lite ingredients: one upstream key for both orientations, 8 s only, max 3 refs.
+    for orientation, aspect in (("landscape", landscape), ("portrait", portrait)):
+        MODEL_CONFIG[f"veo_3_1_r2v_lite_{orientation}"] = {
+            "type": "video",
+            "video_type": "r2v",
+            "model_key": "veo_3_1_r2v_lite",
+            "aspect_ratio": aspect,
+            "supports_images": True,
+            "min_images": 1,
+            "max_images": 3,
+            "use_v2_model_config": True,
+            "allow_tier_upgrade": False,
+        }
+        add_alias(f"veo_3_1_r2v_lite_{orientation}_8s", f"veo_3_1_r2v_lite_{orientation}")
+        add_alias(f"veo_3_1_r2v_lite_8s_{orientation}", f"veo_3_1_r2v_lite_{orientation}")
+
     add_alias("veo_3_1_r2v_fast_landscape", "veo_3_1_r2v_fast")
     add_alias("veo_3_1_r2v_fast_landscape_ultra", "veo_3_1_r2v_fast_ultra")
     add_alias("veo_3_1_r2v_fast_landscape_ultra_relaxed", "veo_3_1_r2v_fast_ultra_relaxed")
@@ -1262,6 +1304,32 @@ class GenerationHandler:
         if len(text) <= max_length:
             return text
         return f"{text[:max_length - 3]}..."
+
+    async def _upload_reference_images(
+        self,
+        token,
+        images: List[bytes],
+        aspect_ratio: str,
+        project_id: str,
+    ) -> List[str]:
+        """Upload images a few at a time; media ids come back in input order."""
+        semaphore = asyncio.Semaphore(REFERENCE_UPLOAD_CONCURRENCY)
+
+        async def _upload(image_bytes: bytes) -> str:
+            async with semaphore:
+                return await self.flow_client.upload_image(
+                    token.at, image_bytes, aspect_ratio, project_id=project_id
+                )
+
+        tasks = [asyncio.create_task(_upload(img)) for img in images]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            # First failure (or cancellation) stops the rest; the original error propagates.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     def _resolve_video_model_key_for_tier(self, model_config: Dict[str, Any], user_tier: str) -> tuple[str, Optional[str]]:
         """根据账号层级调整视频模型 key。"""
@@ -1807,24 +1875,29 @@ class GenerationHandler:
             # 上传图片 (如果有)
             upload_started_at = time.time()
             image_inputs = []
+            if images and len(images) > FLOW_IMAGE_MAX_REFERENCES:
+                error_msg = (
+                    f"Image models support at most {FLOW_IMAGE_MAX_REFERENCES} reference images; "
+                    f"{len(images)} provided"
+                )
+                if stream:
+                    yield self._create_stream_chunk(f"{error_msg}\n")
+                self._mark_generation_failed(generation_result, error_msg)
+                yield self._create_error_response(error_msg, status_code=400)
+                return
             if images and len(images) > 0:
                 if stream:
                     yield self._create_stream_chunk(f"Uploading {len(images)} reference image(s)...\n")
 
-                # 支持多图输入
-                for idx, image_bytes in enumerate(images):
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        image_bytes,
-                        model_config["aspect_ratio"],
-                        project_id=project_id
-                    )
-                    image_inputs.append({
-                        "name": media_id,
-                        "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"
-                    })
-                    if stream:
-                        yield self._create_stream_chunk(f"Uploaded image {idx + 1}/{len(images)}\n")
+                media_ids = await self._upload_reference_images(
+                    token, images, model_config["aspect_ratio"], project_id
+                )
+                image_inputs = [
+                    {"name": media_id, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
+                    for media_id in media_ids
+                ]
+                if stream:
+                    yield self._create_stream_chunk(f"Uploaded {len(media_ids)} image(s)\n")
             if image_trace is not None:
                 image_trace["upload_images_ms"] = int((time.time() - upload_started_at) * 1000)
 
@@ -2154,8 +2227,15 @@ class GenerationHandler:
 
             # Omni: 无图走 T2V，有图走当前上游 Reference Images 直连链路
             elif video_type == "omni":
+                if model_config.get("reference_only") and image_count < 1:
+                    error_msg = "Omni ingredients models need at least 1 reference image"
+                    if stream:
+                        yield self._create_stream_chunk(f"{error_msg}\n")
+                    self._mark_generation_failed(generation_result, error_msg)
+                    yield self._create_error_response(error_msg, status_code=400)
+                    return
                 if max_images is not None and image_count > max_images:
-                    error_msg = f"Omni 模型最多支持 {max_images} 张参考图，当前提供了 {image_count} 张"
+                    error_msg = f"Omni models support at most {max_images} reference images; {image_count} provided"
                     if stream:
                         yield self._create_stream_chunk(f"{error_msg}\n")
                     self._mark_generation_failed(generation_result, error_msg)
@@ -2215,29 +2295,26 @@ class GenerationHandler:
                 if stream:
                     yield self._create_stream_chunk(f"Uploading {image_count} reference image(s)...\n")
 
-                for img in images:
-                    media_id = await self.flow_client.upload_image(
-                        token.at, img, model_config["aspect_ratio"], project_id=project_id
-                    )
-                    reference_images.append({
-                        "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
-                        "mediaId": media_id
-                    })
+                media_ids = await self._upload_reference_images(
+                    token, images, model_config["aspect_ratio"], project_id
+                )
+                reference_images = [
+                    {"imageUsageType": "IMAGE_USAGE_TYPE_ASSET", "mediaId": media_id}
+                    for media_id in media_ids
+                ]
                 debug_logger.log_info(f"[R2V] 上传了 {len(reference_images)} 张参考图片")
 
             # Omni 1.1: 1 image = first frame, 2 images = first + last frame (abra_i2v_*s);
-            # 3+ images = reference-images route (abra_r2v_*s).
+            # 3+ images, or any count on the omni_r2v models = reference-images route (abra_r2v_*s).
             elif video_type == "omni" and images:
                 if stream:
                     yield self._create_stream_chunk(f"Uploading {image_count} Omni 1.1 image(s)...\n")
 
-                uploaded_ids = []
-                for img in (images[:2] if image_count <= 2 else images):
-                    media_id = await self.flow_client.upload_image(
-                        token.at, img, model_config["aspect_ratio"], project_id=project_id
-                    )
-                    uploaded_ids.append(media_id)
-                if image_count <= 2:
+                use_frames = image_count <= 2 and not model_config.get("reference_only")
+                uploaded_ids = await self._upload_reference_images(
+                    token, images, model_config["aspect_ratio"], project_id
+                )
+                if use_frames:
                     start_media_id = uploaded_ids[0]
                     end_media_id = uploaded_ids[1] if image_count == 2 else None
                     debug_logger.log_info(
