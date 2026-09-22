@@ -652,7 +652,8 @@ class GenerationConfigRequest(BaseModel):
 
 
 class CallLogicConfigRequest(BaseModel):
-    call_mode: str
+    call_mode: Optional[str] = None
+    tier_order: Optional[str] = None
 
 
 class ChangePasswordRequest(BaseModel):
@@ -1858,6 +1859,7 @@ async def get_call_logic_config(token: str = Depends(verify_admin_token)):
         "config": {
             "call_mode": call_mode,
             "polling_mode_enabled": call_mode == "polling",
+            "tier_order": config_obj.tier_order,
         }
     }
 
@@ -1868,19 +1870,24 @@ async def update_call_logic_config(
     token: str = Depends(verify_admin_token)
 ):
     """Update token call logic configuration."""
-    call_mode = request.call_mode if request.call_mode in ("default", "polling") else None
-    if call_mode is None:
+    if request.call_mode is not None and request.call_mode not in ("default", "polling"):
         raise HTTPException(status_code=400, detail="Invalid call_mode")
+    if request.tier_order is not None and request.tier_order not in ("save_ultra", "balanced"):
+        raise HTTPException(status_code=400, detail="Invalid tier_order")
+    if request.call_mode is None and request.tier_order is None:
+        raise HTTPException(status_code=400, detail="Nothing to update")
 
-    await db.update_call_logic_config(call_mode)
+    await db.update_call_logic_config(call_mode=request.call_mode, tier_order=request.tier_order)
     await db.reload_config_to_memory()
+    saved = await db.get_call_logic_config()
 
     return {
         "success": True,
         "message": "Token轮询模式保存成功",
         "config": {
-            "call_mode": call_mode,
-            "polling_mode_enabled": call_mode == "polling",
+            "call_mode": saved.call_mode,
+            "polling_mode_enabled": saved.call_mode == "polling",
+            "tier_order": saved.tier_order,
         }
     }
 

@@ -180,6 +180,7 @@ class CallLogicConfig(BaseModel):
     id: int = 1
     call_mode: str = "default"
     polling_mode_enabled: bool = False
+    tier_order: str = "save_ultra"  # save_ultra = images Pro→Free→Ultra, videos Ultra→Pro→Free; balanced = ignore tier
     updated_at: Optional[datetime] = None
 
 

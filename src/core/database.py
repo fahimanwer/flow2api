@@ -226,9 +226,12 @@ class Database:
         if count[0] == 0:
             call_mode = "default"
             polling_mode_enabled = False
+            tier_order = "save_ultra"
 
             if config_dict:
                 call_logic_config = config_dict.get("call_logic", {})
+                if call_logic_config.get("tier_order") in ("save_ultra", "balanced"):
+                    tier_order = call_logic_config["tier_order"]
                 call_mode = call_logic_config.get("call_mode", "default")
                 if call_mode not in ("default", "polling"):
                     polling_mode_enabled = call_logic_config.get("polling_mode_enabled", False)
@@ -237,9 +240,9 @@ class Database:
                     polling_mode_enabled = call_mode == "polling"
 
             await db.execute("""
-                INSERT INTO call_logic_config (id, call_mode, polling_mode_enabled)
-                VALUES (1, ?, ?)
-            """, (call_mode, polling_mode_enabled))
+                INSERT INTO call_logic_config (id, call_mode, polling_mode_enabled, tier_order)
+                VALUES (1, ?, ?, ?)
+            """, (call_mode, polling_mode_enabled, tier_order))
 
         # Ensure cache_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM cache_config")
@@ -465,9 +468,16 @@ class Database:
                         id INTEGER PRIMARY KEY DEFAULT 1,
                         call_mode TEXT DEFAULT 'default',
                         polling_mode_enabled BOOLEAN DEFAULT 0,
+                        tier_order TEXT DEFAULT 'save_ultra',
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+            elif not await self._column_exists(db, "call_logic_config", "tier_order"):
+                try:
+                    await db.execute("ALTER TABLE call_logic_config ADD COLUMN tier_order TEXT DEFAULT 'save_ultra'")
+                    print("  ✓ Added column 'tier_order' to call_logic_config table")
+                except Exception as e:
+                    print(f"  ✗ Failed to add column 'tier_order': {e}")
 
             # Check and create captcha_config table if missing
             if not await self._table_exists(db, "captcha_config"):
@@ -918,6 +928,7 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     call_mode TEXT DEFAULT 'default',
                     polling_mode_enabled BOOLEAN DEFAULT 0,
+                    tier_order TEXT DEFAULT 'save_ultra',
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -1942,18 +1953,28 @@ class Database:
                 mode = row_dict.get("call_mode")
                 if mode not in ("default", "polling"):
                     row_dict["call_mode"] = "polling" if row_dict.get("polling_mode_enabled") else "default"
+                if row_dict.get("tier_order") not in ("save_ultra", "balanced"):
+                    row_dict["tier_order"] = "save_ultra"
                 return CallLogicConfig(**row_dict)
             return CallLogicConfig(call_mode="default", polling_mode_enabled=False)
 
-    async def update_call_logic_config(self, call_mode: str):
-        """Update token call logic configuration."""
-        normalized = "polling" if call_mode == "polling" else "default"
-        polling_mode_enabled = normalized == "polling"
+    async def update_call_logic_config(self, call_mode: Optional[str] = None, tier_order: Optional[str] = None):
+        """Update token call logic configuration. A field left as None keeps its stored value."""
         async with self._connect(write=True) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM call_logic_config WHERE id = 1")
+            row = await cursor.fetchone()
+            current = dict(row) if row else {}
+            if call_mode is None:
+                call_mode = current.get("call_mode") or ("polling" if current.get("polling_mode_enabled") else "default")
+            normalized = "polling" if call_mode == "polling" else "default"
+            polling_mode_enabled = normalized == "polling"
+            if tier_order not in ("save_ultra", "balanced"):
+                tier_order = current.get("tier_order") if current.get("tier_order") in ("save_ultra", "balanced") else "save_ultra"
             await db.execute("""
-                INSERT OR REPLACE INTO call_logic_config (id, call_mode, polling_mode_enabled, updated_at)
-                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
-            """, (normalized, polling_mode_enabled))
+                INSERT OR REPLACE INTO call_logic_config (id, call_mode, polling_mode_enabled, tier_order, updated_at)
+                VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (normalized, polling_mode_enabled, tier_order))
             await db.commit()
 
     # Request log operations
@@ -2270,6 +2291,7 @@ class Database:
         call_logic_config = await self.get_call_logic_config()
         if call_logic_config:
             config.set_call_logic_mode(call_logic_config.call_mode)
+            config.set_tier_order(call_logic_config.tier_order)
 
         # Reload debug config
         debug_config = await self.get_debug_config()
