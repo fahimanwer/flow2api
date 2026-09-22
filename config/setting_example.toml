@@ -45,6 +45,7 @@ remove_watermark = true  # 去除免费/Pro 账号图片的可见 Gemini 水印�
 
 [call_logic]
 call_mode = "default"  # default=随机轮询策略, polling=顺序轮询策略
+tier_order = "save_ultra"  # save_ultra=图片 Pro→Free→Ultra、视频 Ultra→Pro→Free；balanced=忽略账号等级（首次启动时生效，之后在管理后台修改）
 
 [admin]
 error_ban_threshold = 3

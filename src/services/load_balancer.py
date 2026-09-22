@@ -10,6 +10,10 @@ from ..core.account_tiers import (
     normalize_user_paygate_tier,
     supports_model_for_tier,
 )
+
+# Owner decision 2026-09-22 (tmp/tier_order_plan.md): save Ultra quota for what needs it.
+IMAGE_TIER_RANK = {"PAYGATE_TIER_ONE": 0, "PAYGATE_TIER_NOT_PAID": 1, "PAYGATE_TIER_TWO": 2}
+VIDEO_TIER_RANK = {"PAYGATE_TIER_TWO": 0, "PAYGATE_TIER_ONE": 1, "PAYGATE_TIER_NOT_PAID": 2}
 from .concurrency_manager import ConcurrencyManager
 from ..core.client_policy import client_block_reason, no_account_error, token_reserved_for
 from ..core.logger import debug_logger
@@ -332,6 +336,16 @@ class LoadBalancer:
         if ready_candidates and refresh_candidates:
             available_tokens = ready_candidates + refresh_candidates
 
+        # Account order (admin "Save Ultra for last"): images try Pro, then Free, then Ultra;
+        # videos try Ultra, then Pro, then Free. Accounts that are full, cooling or out of
+        # quota were filtered out above, so an idle Ultra is still used when nothing cheaper
+        # is left. Stable sort: rotation order is kept inside each tier.
+        tier_rank = self._tier_rank_for(for_image_generation, for_video_generation)
+        if tier_rank is not None:
+            available_tokens.sort(
+                key=lambda item: tier_rank.get(normalize_user_paygate_tier(item["token"].user_paygate_tier), 1)
+            )
+
         # A client's own reserved accounts come first, in BOTH rotation modes (in polling mode the
         # round-robin cursor above would otherwise pick the reserved account only 1/N of the time
         # and spill onto shared accounts). Order inside each group is kept.
@@ -374,6 +388,17 @@ class LoadBalancer:
             return token
 
         debug_logger.log_info(f"[LOAD_BALANCER] ❌ 候选Token均不可用 (图片生成={for_image_generation}, 视频生成={for_video_generation})")
+        return None
+
+    @staticmethod
+    def _tier_rank_for(for_image_generation: bool, for_video_generation: bool) -> Optional[Dict[str, int]]:
+        """Tier -> try order for the current media type, or None when the picker is 'balanced'."""
+        if config.tier_order != "save_ultra":
+            return None
+        if for_image_generation:
+            return IMAGE_TIER_RANK
+        if for_video_generation:
+            return VIDEO_TIER_RANK
         return None
 
     async def get_unavailable_reason(

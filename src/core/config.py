@@ -356,6 +356,20 @@ class Config:
         """Set polling mode enabled/disabled."""
         self.set_call_logic_mode("polling" if enabled else "default")
 
+    TIER_ORDER_MODES = ("save_ultra", "balanced")
+
+    @property
+    def tier_order(self) -> str:
+        """Account order: save_ultra (Pro→Free→Ultra for images, Ultra→Pro→Free for videos) or balanced."""
+        mode = self._config.get("call_logic", {}).get("tier_order")
+        return mode if mode in self.TIER_ORDER_MODES else "save_ultra"
+
+    def set_tier_order(self, mode: str):
+        """Set the account order used by the token picker."""
+        if "call_logic" not in self._config:
+            self._config["call_logic"] = {}
+        self._config["call_logic"]["tier_order"] = mode if mode in self.TIER_ORDER_MODES else "save_ultra"
+
     def set_call_logic_mode(self, mode: str):
         """Set call logic mode (default or polling)."""
         normalized = "polling" if mode == "polling" else "default"
