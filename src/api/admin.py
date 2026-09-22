@@ -18,6 +18,14 @@ from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha_task_type
 from ..core.models import Token
+from ..core.client_policy import (
+    DEFAULT_CLIENT,
+    TIER_RULES,
+    client_block_reason,
+    client_policy_store,
+    normalize_client,
+    normalize_rule,
+)
 from ..core.browser_runtime_status import (
     fail_runtime_prepare,
     finish_runtime_prepare,
@@ -629,6 +637,13 @@ class CaptchaScoreTestRequest(BaseModel):
     enterprise: Optional[bool] = False
 
 
+class ClientPolicyRequest(BaseModel):
+    client: str
+    image_tier: str = "any"
+    video_tier: str = "any"
+    note: Optional[str] = ""
+
+
 class GenerationConfigRequest(BaseModel):
     image_timeout: Optional[int] = None
     video_timeout: Optional[int] = None
@@ -845,6 +860,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "captcha_proxy_url": row.get("captcha_proxy_url") or "",
         "extension_route_key": row.get("extension_route_key") or "",
         "pool_mode": row.get("pool_mode") or "auto",
+        "reserved_client": normalize_client(row.get("reserved_client") or ""),
         "ext_version": row.get("ext_version") or "",
         "protocol_mode": row.get("protocol_mode") or "session",
         "google_cookies": row.get("google_cookies") or "",
@@ -915,6 +931,10 @@ async def _compute_skip_reasons(token_rows, now) -> Dict[int, Dict[str, Any]]:
                 parts.append(f"recaptcha cooldown {mins}m (strike {cd[1]})")
             if token_manager.is_health_cooldown(tid):
                 parts.append(token_manager.health_cooldown_reason(tid) or "health cooldown")
+            reserved = normalize_client(row.get("reserved_client") or "")
+            if reserved:
+                # Same rule as client_policy.client_block_reason: everyone else skips it.
+                parts.append(f"reserved for {reserved} (only that client may use it)")
             exhausted = [f for f in _QUOTA_FAMILIES if token_manager.is_model_quota_exhausted(tid, f)]
             if service is not None:
                 ok, route_key = await service.has_connection_for_token(tid)
@@ -1753,6 +1773,74 @@ async def update_generation_config(
     await db.reload_config_to_memory()
 
     return {"success": True, "message": "生成配置更新成功"}
+
+
+# ---------------- Per-caller routing (client_policies + tokens.reserved_client) ----------------
+async def _client_policy_view() -> List[Dict[str, Any]]:
+    """Policies plus, per policy, how many ACTIVE accounts pass its rule right now."""
+    tokens = await token_manager.get_active_tokens() if token_manager else []
+    out = []
+    for policy in client_policy_store.all():
+        eligible = {}
+        for media, flag in (("image", "image_enabled"), ("video", "video_enabled")):
+            eligible[media] = sum(
+                1 for t in tokens
+                if getattr(t, flag, True) and client_block_reason(t, policy.client, media) is None
+            )
+        row = policy.as_dict()
+        row["eligible"] = eligible
+        row["reserved_accounts"] = [
+            t.email for t in tokens if normalize_client(getattr(t, "reserved_client", "") or "") == policy.client
+        ]
+        out.append(row)
+    return out
+
+
+@router.get("/api/client-policies")
+async def get_client_policies(token: str = Depends(verify_admin_token)):
+    return {"success": True, "policies": await _client_policy_view(), "rules": list(TIER_RULES)}
+
+
+@router.post("/api/client-policies")
+async def upsert_client_policy(request: ClientPolicyRequest, token: str = Depends(verify_admin_token)):
+    client = normalize_client(request.client)
+    if not client:
+        raise HTTPException(status_code=400, detail="client must be a-z 0-9 . _ - (max 40 chars)")
+    image_tier, video_tier = normalize_rule(request.image_tier), normalize_rule(request.video_tier)
+    if (request.image_tier or "any").strip().lower() not in TIER_RULES or (request.video_tier or "any").strip().lower() not in TIER_RULES:
+        raise HTTPException(status_code=400, detail=f"tiers must be one of {', '.join(TIER_RULES)}")
+    await db.upsert_client_policy(client, image_tier, video_tier, (request.note or "").strip()[:200])
+    await client_policy_store.load(db)  # hot reload, same idea as reload_config_to_memory
+    from ..core.logger import debug_logger
+    debug_logger.op_warning(f"[CLIENT_POLICY] {client}: image={image_tier} video={video_tier}")
+    return {"success": True, "policies": await _client_policy_view()}
+
+
+@router.delete("/api/client-policies/{client}")
+async def delete_client_policy(client: str, token: str = Depends(verify_admin_token)):
+    client = normalize_client(client)
+    if not client or client == DEFAULT_CLIENT:
+        raise HTTPException(status_code=400, detail="the default policy cannot be deleted")
+    await db.delete_client_policy(client)
+    await client_policy_store.load(db)
+    return {"success": True, "policies": await _client_policy_view()}
+
+
+@router.post("/api/tokens/{token_id}/reserved-client")
+async def set_token_reserved_client(token_id: int, request: dict, token: str = Depends(verify_admin_token)):
+    """Reserve this account for ONE client (metadata only, no ST needed — same reason as
+    /route-key: PUT /api/tokens/{id} forces st_to_at). Blank = shared again."""
+    from ..core.logger import debug_logger
+    target = await token_manager.get_token(token_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Token not found")
+    raw = (request.get("reserved_client") or "").strip()
+    value = normalize_client(raw)
+    if raw and not value:
+        raise HTTPException(status_code=400, detail="client must be a-z 0-9 . _ - (max 40 chars)")
+    await db.update_token(token_id, reserved_client=value)
+    debug_logger.op_warning(f"[CLIENT_POLICY] token={token_id} ({target.email}) reserved_client={value or '(cleared)'}")
+    return {"success": True, "token": {"id": token_id, "email": target.email, "reserved_client": value}}
 
 
 @router.get("/api/call-logic/config")

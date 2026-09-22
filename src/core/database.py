@@ -573,6 +573,7 @@ class Database:
                     ("browser_user_agent", "TEXT"),  # Slice B: extension browser real UA
                     ("pool_mode", "TEXT DEFAULT 'auto'"),  # 'auto' | 'failed_image' (two-pool routing)
                     ("ext_version", "TEXT"),  # worker-extension version this device last reported
+                    ("reserved_client", "TEXT DEFAULT ''"),  # per-caller routing: only this client may use the account
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -851,6 +852,26 @@ class Database:
                     FOREIGN KEY (token_id) REFERENCES tokens(id)
                 )
             """)
+
+            # Per-caller routing policies (X-Flow-Client header -> which account tiers it may use).
+            # Multi-row, keyed by client id; 'default' is the row unidentified callers get.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS client_policies (
+                    client TEXT PRIMARY KEY,
+                    image_tier TEXT NOT NULL DEFAULT 'any',
+                    video_tier TEXT NOT NULL DEFAULT 'any',
+                    note TEXT DEFAULT '',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute(
+                "INSERT OR IGNORE INTO client_policies (client, image_tier, video_tier, note) VALUES (?, ?, ?, ?)",
+                ("default", "any", "any", "Callers with no X-Flow-Client header. 'any' = unchanged behaviour."),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO client_policies (client, image_tier, video_tier, note) VALUES (?, ?, ?, ?)",
+                ("pinterest-factory", "ultra", "ultra", "Pin images must be watermark-free: Ultra accounts only."),
+            )
 
             # Admin config table
             await db.execute("""
@@ -1852,6 +1873,34 @@ class Database:
                     INSERT INTO generation_config (id, image_timeout, video_timeout, max_retries)
                     VALUES (1, ?, ?, ?)
                 """, (normalized_image_timeout, normalized_video_timeout, normalized_max_retries))
+            await db.commit()
+
+    # ---------------- client_policies (per-caller routing) ----------------
+    async def get_client_policies(self) -> List[Dict[str, Any]]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM client_policies ORDER BY client")
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def upsert_client_policy(self, client: str, image_tier: str, video_tier: str, note: str = "") -> None:
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                INSERT INTO client_policies (client, image_tier, video_tier, note, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(client) DO UPDATE SET
+                    image_tier = excluded.image_tier,
+                    video_tier = excluded.video_tier,
+                    note = excluded.note,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (client, image_tier, video_tier, note or ""),
+            )
+            await db.commit()
+
+    async def delete_client_policy(self, client: str) -> None:
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM client_policies WHERE client = ? AND client != 'default'", (client,))
             await db.commit()
 
     async def get_call_logic_config(self) -> CallLogicConfig:

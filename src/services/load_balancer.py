@@ -1,7 +1,7 @@
 """Load balancing module for Flow2API"""
 import asyncio
 import random
-from typing import Optional, Dict
+from typing import Any, Dict, Optional
 from ..core.models import Token
 from ..core.config import config
 from ..core.account_tiers import (
@@ -11,6 +11,7 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .concurrency_manager import ConcurrencyManager
+from ..core.client_policy import client_block_reason, no_account_error, token_reserved_for
 from ..core.logger import debug_logger
 
 
@@ -165,6 +166,7 @@ class LoadBalancer:
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
         pool: str = "auto",
+        client: str = "",
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -193,6 +195,7 @@ class LoadBalancer:
         # Ensure persisted per-model quota cooldowns are loaded before we filter on them.
         await self.token_manager._ensure_quota_loaded()
 
+        media = "video" if for_video_generation else "image"
         active_tokens = await self.token_manager.get_active_tokens()
         # Two-pool routing: keep failed_image accounts out of the auto pool (and vice versa).
         active_tokens = select_pool(active_tokens, pool)
@@ -218,6 +221,13 @@ class LoadBalancer:
             # device reload / threshold disable. See TokenManager._handle_at_stale.
             if self.token_manager.is_health_cooldown(token.id):
                 filtered_reasons[token.id] = self.token_manager.health_cooldown_reason(token.id) or "账号健康冷却中"
+                continue
+            # Per-caller routing (client_policy.py): a token reserved for another client, or
+            # below the tier this client's policy demands, is out. Unidentified callers use
+            # the 'default' policy (any tier) so their behaviour is unchanged.
+            client_reason = client_block_reason(token, client, media)
+            if client_reason:
+                filtered_reasons[token.id] = client_reason
                 continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             # Image generation is exempt from paygate-tier gating (free accounts
@@ -322,6 +332,14 @@ class LoadBalancer:
         if ready_candidates and refresh_candidates:
             available_tokens = ready_candidates + refresh_candidates
 
+        # A client's own reserved accounts come first, in BOTH rotation modes (in polling mode the
+        # round-robin cursor above would otherwise pick the reserved account only 1/N of the time
+        # and spill onto shared accounts). Order inside each group is kept.
+        if client:
+            mine = [item for item in available_tokens if token_reserved_for(item["token"]) == client]
+            if mine:
+                available_tokens = mine + [item for item in available_tokens if token_reserved_for(item["token"]) != client]
+
         debug_logger.log_info("[LOAD_BALANCER] 候选Token负载:")
         for item in available_tokens:
             token = item["token"]
@@ -365,16 +383,55 @@ class LoadBalancer:
         for_video_generation: bool = False,
         model: Optional[str] = None,
         pool: str = "auto",
+        client: str = "",
     ) -> Optional[str]:
         """给出更明确的“无可用账号”原因，优先用于分辨率/tier 档位提示。"""
+        detail = await self.get_unavailable_detail(
+            for_image_generation=for_image_generation,
+            for_video_generation=for_video_generation,
+            model=model,
+            pool=pool,
+            client=client,
+        )
+        return detail["message"] if detail else None
+
+    async def get_unavailable_detail(
+        self,
+        *,
+        for_image_generation: bool = False,
+        for_video_generation: bool = False,
+        model: Optional[str] = None,
+        pool: str = "auto",
+        client: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Why no token could be selected: {"message": str, "extra": {...}|None}.
+
+        `extra` is set only when the CLIENT POLICY (reserved / tier rule) is what removed the
+        last usable account; callers put it into the 503 body so the app can react (code
+        client_policy_no_account) instead of treating it as a Flow outage.
+        """
         await self.token_manager._ensure_quota_loaded()
         active_tokens = select_pool(await self.token_manager.get_active_tokens(), pool)
         if not active_tokens:
-            return (
+            return {"message": (
                 "No active account is available — every account is currently disabled, "
                 "cooling down, or has an expired session. Re-enable at least one account "
                 "(or refresh its session) in the admin UI."
-            )
+            ), "extra": None}
+
+        media = "video" if for_video_generation else "image"
+        allowed_tokens = [t for t in active_tokens if client_block_reason(t, client, media) is None]
+        if not allowed_tokens:
+            extra = no_account_error(client, media)
+            if extra["need"] == "off":
+                message = f"{media} generation is switched off for client {extra['client']} (admin: Client routing)"
+            else:
+                message = (
+                    f"No {extra['need']} account is available for client {extra['client']} ({media}): "
+                    f"{len(active_tokens)} active account(s), none reserved for it or at the required tier"
+                )
+            return {"message": message, "extra": extra}
+        active_tokens = allowed_tokens
 
         required_tier = get_required_paygate_tier_for_model(model)
         supported_tokens = []
@@ -386,17 +443,17 @@ class LoadBalancer:
 
         if model and not supported_tokens:
             tier_label = get_paygate_tier_label(required_tier)
-            return f"This model requires a {tier_label} account, but no {tier_label} account is available: {model}"
+            return {"extra": None, "message": f"This model requires a {tier_label} account, but no {tier_label} account is available: {model}"}
 
         # All otherwise-usable accounts are resting on a reCAPTCHA / anti-bot cooldown
         # (account-level, so it applies to every model). Report it clearly.
         if supported_tokens and all(
             self.token_manager.is_recaptcha_cooldown(t.id) for t in supported_tokens
         ):
-            return (
+            return {"extra": None, "message": (
                 "All accounts are briefly cooling down after reCAPTCHA / unusual-activity "
                 "checks; they auto-recover shortly (progressive backoff)."
-            )
+            )}
 
         # All otherwise-usable accounts have NO online worker browser for their route
         # key (extension closed / disconnected). Say so — the generic message sends
@@ -408,28 +465,28 @@ class LoadBalancer:
                 if not ok:
                     offline += 1
             if offline == len(supported_tokens):
-                return (
+                return {"extra": None, "message": (
                     "No worker browser is online for any eligible account — every account's "
                     "Chrome extension is disconnected or closed. Open/reconnect the browsers "
                     "(the extension popup must show Connected for THAT account's route key)."
-                )
+                )}
 
         # All otherwise-usable accounts are paused for a dead Google access token
         # (at_stale) — a human must sign out/in on those worker devices.
         if supported_tokens and all(
             self.token_manager.is_health_cooldown(t.id, "at_stale") for t in supported_tokens
         ):
-            return (
+            return {"extra": None, "message": (
                 "All accounts are paused: Google stopped renewing their access tokens. "
                 "Sign out of Google Labs and back in on the worker devices (the extension shows a red '!')."
-            )
+            )}
 
         # All otherwise-usable tokens have exhausted THIS model's quota (other
         # models still work on them). Report it as a model-quota cooldown.
         if model and supported_tokens and all(
             self.token_manager.is_model_quota_exhausted(t.id, model) for t in supported_tokens
         ):
-            return f"Model {model} has reached today's quota (cooling down); other models are still available."
+            return {"extra": None, "message": f"Model {model} has reached today's quota (cooling down); other models are still available."}
 
         capability_tokens = []
         for token in supported_tokens:
@@ -441,8 +498,8 @@ class LoadBalancer:
 
         if supported_tokens and not capability_tokens:
             if for_image_generation:
-                return "Eligible accounts exist, but image generation is disabled on all of them."
+                return {"extra": None, "message": "Eligible accounts exist, but image generation is disabled on all of them."}
             if for_video_generation:
-                return "Eligible accounts exist, but video generation is disabled on all of them."
+                return {"extra": None, "message": "Eligible accounts exist, but video generation is disabled on all of them."}
 
         return None
