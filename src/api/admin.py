@@ -2914,6 +2914,12 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     # see which devices are still on an old build after an update ships.
     _ev = request.get("ext_version")
     reported_ext_version = str(_ev).strip()[:20] if isinstance(_ev, str) and _ev.strip() else None
+    # 3.5.2+: the project the worker sees open on flow.google.com (a UUID). Flow no longer lets the
+    # server create one through Labs for a fresh account, so a new token is registered with this one.
+    _pid = request.get("project_id")
+    reported_project_id = _pid.strip().lower() if isinstance(_pid, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", _pid.strip()) else None
+    _pname = request.get("project_name")
+    reported_project_name = str(_pname).strip()[:80] if isinstance(_pname, str) and _pname.strip() else None
 
     # Step 1: Convert ST to AT to get user info (including email)
     try:
@@ -3098,6 +3104,8 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
         try:
             new_token = await token_manager.add_token(
                 st=session_token,
+                project_id=reported_project_id,
+                project_name=reported_project_name,
                 remark="Added by Chrome Extension",
                 is_active=not dead_grant,
                 ban_reason=("auto_at_stale" if dead_grant else None),

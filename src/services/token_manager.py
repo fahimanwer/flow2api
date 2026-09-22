@@ -947,7 +947,14 @@ class TokenManager:
                     tool_name="PINHOLE"
                 ))
             except Exception as e:
-                raise ValueError(f"??????: {str(e)}")
+                # Since Flow moved to flow.google.com (2026-09) the Labs endpoint answers 404 for a
+                # fresh account. The worker extension (3.5.2+) reports the project it sees open on
+                # flow.google.com instead (project_id above); tell staff exactly what to do.
+                raise ValueError(
+                    "Flow no longer lets the server create a project through Labs "
+                    f"(project.createProject: {e}). In this browser open flow.google.com, click New project "
+                    "once, keep that tab open, then press Reconnect — the worker reports that project."
+                )
 
         token = Token(
             st=st,
@@ -985,7 +992,16 @@ class TokenManager:
         pooled_projects[0].id = await self.db.add_project(pooled_projects[0])
 
         while len(pooled_projects) < project_pool_size:
-            new_project = await self._create_project_for_token(token, len(pooled_projects) + 1, base_project_name)
+            try:
+                new_project = await self._create_project_for_token(token, len(pooled_projects) + 1, base_project_name)
+            except Exception as e:
+                # One project is enough to generate; the pool only adds concurrency. Never fail the
+                # whole registration because the Labs create endpoint is gone (404 since 2026-09).
+                debug_logger.op_warning(
+                    f"[ADD_TOKEN] token={token_id} ({email}): pooled project #{len(pooled_projects) + 1} not created "
+                    f"({str(e)[:120]}); continuing with {len(pooled_projects)}"
+                )
+                break
             pooled_projects.append(new_project)
 
         debug_logger.log_info(

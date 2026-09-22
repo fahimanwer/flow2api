@@ -54,7 +54,8 @@
   <p class="sublabel">Google Flow</p>
   <div id="statusBig" class="checking">Checking…</div>
 
-  <p class="note">Runs automatically. <b>Just keep this Chrome signed in to Google&nbsp;Labs.</b><br />Nothing to set up.</p>
+  <p class="note">Runs automatically. <b>Just keep this Chrome signed in to Google&nbsp;Labs.</b><br />Google Labs has its own "Sign in with Google" on top of your Google account — do both once. Nothing else to set up.</p>
+  <button id="openLabsBtn" class="secondary" hidden>Open Google Labs (sign in there)</button>
 
   <label class="switchrow">
     <input type="checkbox" id="failedImageMode" />
@@ -81,6 +82,7 @@
     <div class="logs" id="logs"></div>
   </details>
 
+  <script src="session_state.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

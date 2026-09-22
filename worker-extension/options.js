@@ -24,17 +24,10 @@ function setStatus(kind, text) {
 function refreshStatus() {
   chrome.runtime.sendMessage({ action: "getConnState" }, (r) => {
     if (chrome.runtime.lastError) return;
-    if (r && r.grantExpired) {
-      // Server verified our Google access token is dead (cookie still present). Only a
-      // real sign-out/sign-in fixes it — say exactly that, above everything else.
-      setStatus("disconnected", "⚠️ Google needs you to sign in again: sign OUT of Google Labs, sign back IN, then click Reconnect");
-    } else if (r && r.loginRequired) {
-      setStatus("disconnected", "Signed out of Google Labs — open labs.google/fx, sign in with this account, then click Reconnect");
-    } else if (r && r.connected) {
-      setStatus("connected", "✅ Connected — working automatically");
-    } else {
-      setStatus("disconnected", "Not connected yet — make sure you're signed in to Google Labs, then click Reconnect");
-    }
+    // One place decides the wording (session_state.js): Google signed in ≠ Labs signed in.
+    const d = FlowSessionState.describeSignIn(r || {});
+    setStatus(d.kind, d.text);
+    $("openLabsBtn").hidden = !d.labsButton;
   });
 }
 
@@ -146,6 +139,10 @@ document.addEventListener("DOMContentLoaded", () => {
         setTimeout(() => { refreshStatus(); renderLogs(); }, 1500);
       });
     });
+  });
+
+  $("openLabsBtn").addEventListener("click", () => {
+    chrome.runtime.sendMessage({ action: "openLabsSignIn" }, () => {});
   });
 
   $("reconnectBtn").addEventListener("click", () => {
