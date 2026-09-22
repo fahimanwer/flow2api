@@ -54,6 +54,11 @@ class Token(BaseModel):
     # failed-image regeneration). Reported by the extension's "Failed-image mode" switch.
     pool_mode: Optional[str] = "auto"
 
+    # Per-caller routing: when set, ONLY the named client (X-Flow-Client / X-Client
+    # header) may generate with this account, and that client prefers it. Admin-set
+    # (POST /api/tokens/{id}/reserved-client); the extension never writes it.
+    reserved_client: Optional[str] = ""
+
     # worker-extension version this device last reported (on session push). Lets the
     # admin see which devices are still on an old build after an update ships.
     ext_version: Optional[str] = None

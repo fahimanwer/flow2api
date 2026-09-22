@@ -12,6 +12,7 @@ from curl_cffi.requests import AsyncSession
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from ..core.client_policy import resolve_client
 from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
@@ -491,6 +492,7 @@ async def _collect_non_stream_result(
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
     pool: str = "auto",
+    client: str = "",
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -502,6 +504,7 @@ async def _collect_non_stream_result(
         base_url_override=base_url_override,
         video_media_id=video_media_id,
         pool=pool,
+        client=client,
     ):
         result = chunk
 
@@ -723,6 +726,7 @@ async def _iterate_openai_stream(
     normalized: NormalizedGenerationRequest,
     base_url_override: Optional[str] = None,
     pool: str = "auto",
+    client: str = "",
 ):
     handler = _ensure_generation_handler()
     async for chunk in handler.handle_generation(
@@ -733,6 +737,7 @@ async def _iterate_openai_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
         pool=pool,
+        client=client,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -748,6 +753,7 @@ async def _iterate_gemini_stream(
     normalized: NormalizedGenerationRequest,
     response_model: str,
     base_url_override: Optional[str] = None,
+    client: str = "",
 ):
     handler = _ensure_generation_handler()
     async for chunk in handler.handle_generation(
@@ -757,6 +763,7 @@ async def _iterate_gemini_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        client=client,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -867,6 +874,8 @@ async def create_chat_completion(
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
+        # Per-caller routing: who is asking (X-Flow-Client, else X-Client; absent = default policy).
+        client = resolve_client(raw_request.headers)
 
         # Two-pool routing: X-Flow-Pool=failed_image routes this request to the reserved
         # failed-image account pool (staff regeneration). Anything else => the auto pool.
@@ -875,7 +884,7 @@ async def create_chat_completion(
 
         if request.stream:
             return StreamingResponse(
-                _iterate_openai_stream(normalized, request_base_url, pool=pool),
+                _iterate_openai_stream(normalized, request_base_url, pool=pool, client=client),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -892,6 +901,7 @@ async def create_chat_completion(
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
                 pool=pool,
+                client=client,
             )
         )
         return _build_openai_json_response(payload)
@@ -917,6 +927,8 @@ async def generate_content(
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
+        # Per-caller routing: who is asking (X-Flow-Client, else X-Client; absent = default policy).
+        client = resolve_client(raw_request.headers)
 
         payload = _enrich_payload_with_direct_url(
             _parse_handler_result(
@@ -926,6 +938,7 @@ async def generate_content(
                     normalized.images,
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
+                    client=client,
                 )
             )
         )
@@ -964,9 +977,11 @@ async def stream_generate_content(
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
+        # Per-caller routing: who is asking (X-Flow-Client, else X-Client; absent = default policy).
+        client = resolve_client(raw_request.headers)
 
         return StreamingResponse(
-            _iterate_gemini_stream(normalized, normalized.model, request_base_url),
+            _iterate_gemini_stream(normalized, normalized.model, request_base_url, client=client),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

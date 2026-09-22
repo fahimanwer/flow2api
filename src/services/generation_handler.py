@@ -1323,6 +1323,7 @@ class GenerationHandler:
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
         pool: str = "auto",
+        client: str = "",
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1368,6 +1369,7 @@ class GenerationHandler:
             "model": model,
             "prompt": prompt_for_log,
             "has_images": images is not None and len(images) > 0,
+            "client": client or "default",
         }
         if generation_type == "video":
             request_payload["video_duration_seconds"] = model_config.get("reference_duration")
@@ -1408,6 +1410,7 @@ class GenerationHandler:
                 enforce_concurrency_filter=False,
                 track_pending=True,
                 pool=pool,
+                client=client,
             )
         else:
             token = await self.load_balancer.select_token(
@@ -1417,18 +1420,24 @@ class GenerationHandler:
                 enforce_concurrency_filter=False,
                 track_pending=True,
                 pool=pool,
+                client=client,
             )
         perf_trace["token_select_ms"] = int((time.time() - token_select_started_at) * 1000)
 
         if not token:
             error_msg = None
-            if self.load_balancer and hasattr(self.load_balancer, "get_unavailable_reason"):
-                error_msg = await self.load_balancer.get_unavailable_reason(
+            error_extra = None
+            if self.load_balancer and hasattr(self.load_balancer, "get_unavailable_detail"):
+                detail = await self.load_balancer.get_unavailable_detail(
                     for_image_generation=(generation_type == "image"),
                     for_video_generation=(generation_type == "video"),
                     model=model,
                     pool=pool,
+                    client=client,
                 )
+                if detail:
+                    error_msg = detail.get("message")
+                    error_extra = detail.get("extra")
             if not error_msg:
                 error_msg = self._get_no_token_error_message(generation_type)
             debug_logger.log_error(f"[GENERATION] {error_msg}")
@@ -1438,7 +1447,7 @@ class GenerationHandler:
                 token_id=None,
                 operation=request_operation,
                 request_data=request_payload,
-                response_data={"error": error_msg, "performance": perf_trace},
+                response_data={"error": error_msg, "error_detail": error_extra, "performance": perf_trace},
                 status_code=503,
                 duration=time.time() - start_time,
                 log_id=request_log_state.get("id"),
@@ -1447,7 +1456,7 @@ class GenerationHandler:
             )
             if stream:
                 yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=503)
+            yield self._create_error_response(error_msg, status_code=503, extra=error_extra)
             return
 
         debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
@@ -2796,8 +2805,13 @@ class GenerationHandler:
 
         return json.dumps(response, ensure_ascii=False)
 
-    def _create_error_response(self, error_message: str, status_code: int = 500) -> str:
-        """创建错误响应"""
+    def _create_error_response(self, error_message: str, status_code: int = 500, extra: Optional[Dict[str, Any]] = None) -> str:
+        """创建错误响应
+
+        `extra` (e.g. client_policy.no_account_error) may override `code` and add fields;
+        `message`, `type` and `status_code` keep their shape — `status_code` is what
+        routes._get_error_status_code turns into the HTTP status.
+        """
         import json
 
         error = {
@@ -2808,6 +2822,8 @@ class GenerationHandler:
                 "status_code": status_code,
             }
         }
+        if extra:
+            error["error"].update(extra)
 
         return json.dumps(error, ensure_ascii=False)
 

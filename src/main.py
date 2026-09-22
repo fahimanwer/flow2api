@@ -114,6 +114,9 @@ async def lifespan(app: FastAPI):
 
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
+    # Per-caller routing policies (client_policies table) into memory; admin POST reloads them.
+    from .core.client_policy import client_policy_store
+    await client_policy_store.load(db)
     generation_handler.file_cache.set_timeout(config.cache_timeout)
     cache_cleanup_enabled = await generation_handler.file_cache.refresh_cleanup_task()
     captcha_config = await db.get_captcha_config()
