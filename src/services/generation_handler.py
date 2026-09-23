@@ -1851,6 +1851,9 @@ class GenerationHandler:
         pending_token_state: Optional[Dict[str, bool]] = None
     ) -> AsyncGenerator:
         """处理图片生成 (同步返回)"""
+        reset_mint = getattr(self.flow_client, "reset_mint_context", None)
+        if callable(reset_mint):
+            reset_mint()
 
         if response_state is None:
             response_state = self._create_response_state()
@@ -2170,6 +2173,9 @@ class GenerationHandler:
         video_media_id: Optional[str] = None,
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""
+        reset_mint = getattr(self.flow_client, "reset_mint_context", None)
+        if callable(reset_mint):
+            reset_mint()
 
         if response_state is None:
             response_state = self._create_response_state()

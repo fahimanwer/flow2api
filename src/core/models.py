@@ -233,6 +233,8 @@ class CaptchaConfig(BaseModel):
     personal_max_resident_tabs: int = 5  # 内置浏览器单实例共享打码标签页数量上限
     browser_personal_fresh_restart_every_n_solves: int = 10  # 成功打码多少次后清理并重启浏览器，0表示禁用
     personal_idle_tab_ttl_seconds: int = 600  # 内置浏览器标签页空闲超时(秒)
+    server_fallback_enabled: bool = True  # server mints on flow.google.com when a worker cannot (2026-09-23)
+    server_fallback_max_browsers: int = 3  # fallback Chromiums open at once (one per proxy)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

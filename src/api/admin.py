@@ -2281,6 +2281,13 @@ async def update_captcha_config(
         10,
     )
     personal_idle_tab_ttl_seconds = request.get("personal_idle_tab_ttl_seconds")
+    server_fallback_enabled = request.get("server_fallback_enabled")
+    server_fallback_max_browsers = request.get("server_fallback_max_browsers")
+    if server_fallback_max_browsers is not None:
+        try:
+            server_fallback_max_browsers = max(1, min(6, int(server_fallback_max_browsers)))
+        except Exception:
+            return {"success": False, "message": "Server fallback browsers must be a number from 1 to 6"}
 
     # 验证浏览器代理URL格式
     if browser_proxy_enabled and browser_proxy_url:
@@ -2336,11 +2343,21 @@ async def update_captcha_config(
         personal_project_pool_size=personal_project_pool_size,
         personal_max_resident_tabs=personal_max_resident_tabs,
         browser_personal_fresh_restart_every_n_solves=browser_personal_fresh_restart_every_n_solves,
-        personal_idle_tab_ttl_seconds=personal_idle_tab_ttl_seconds
+        personal_idle_tab_ttl_seconds=personal_idle_tab_ttl_seconds,
+        server_fallback_enabled=(bool(server_fallback_enabled) if server_fallback_enabled is not None else None),
+        server_fallback_max_browsers=server_fallback_max_browsers,
     )
 
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
+    try:
+        # Disabled or a lower cap: idle fallback browsers go now, busy ones at their next sweep.
+        from ..services.flow_page_captcha import FlowPageCaptchaService
+        await (await FlowPageCaptchaService.get_instance()).sweep_idle(
+            ttl_seconds=0 if not config.captcha_server_fallback_enabled else 10**9
+        )
+    except Exception:
+        pass
 
     runtime_prepare_started = False
     runtime_prepare_message = ""
@@ -2373,6 +2390,13 @@ async def get_captcha_runtime_status(
     token: str = Depends(verify_admin_token)
 ):
     """Get background browser runtime preparation status."""
+    if (method or "").strip().lower() == "extension":
+        # Extension mode has no runtime to prepare; report the server fallback pool instead.
+        from ..services.flow_page_captcha import FlowPageCaptchaService
+        service = await FlowPageCaptchaService.get_instance()
+        status = {"state": "idle", "active": False, "message": "", "error": "", "method": "extension", "task_running": False}
+        status["server_fallback"] = service.status()
+        return status
     runtime_method = _normalize_runtime_method(method)
     task = captcha_runtime_prepare_tasks.get(runtime_method)
     status = get_runtime_status(runtime_method)
@@ -2405,7 +2429,9 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "personal_project_pool_size": captcha_config.personal_project_pool_size,
         "personal_max_resident_tabs": captcha_config.personal_max_resident_tabs,
         "browser_personal_fresh_restart_every_n_solves": captcha_config.browser_personal_fresh_restart_every_n_solves,
-        "personal_idle_tab_ttl_seconds": captcha_config.personal_idle_tab_ttl_seconds
+        "personal_idle_tab_ttl_seconds": captcha_config.personal_idle_tab_ttl_seconds,
+        "server_fallback_enabled": bool(captcha_config.server_fallback_enabled),
+        "server_fallback_max_browsers": captcha_config.server_fallback_max_browsers,
     }
 
 

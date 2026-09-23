@@ -507,6 +507,8 @@ class Database:
                         personal_max_resident_tabs INTEGER DEFAULT 5,
                         browser_personal_fresh_restart_every_n_solves INTEGER DEFAULT 10,
                         personal_idle_tab_ttl_seconds INTEGER DEFAULT 600,
+                        server_fallback_enabled INTEGER DEFAULT 1,
+                        server_fallback_max_browsers INTEGER DEFAULT 3,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
@@ -716,6 +718,9 @@ class Database:
                     ("personal_max_resident_tabs", "INTEGER DEFAULT 5"),
                     ("browser_personal_fresh_restart_every_n_solves", "INTEGER DEFAULT 10"),
                     ("personal_idle_tab_ttl_seconds", "INTEGER DEFAULT 600"),
+                    # 2026-09-23: server-side reCAPTCHA fallback (flow_page_captcha)
+                    ("server_fallback_enabled", "INTEGER DEFAULT 1"),
+                    ("server_fallback_max_browsers", "INTEGER DEFAULT 3"),
                 ]
 
                 for col_name, col_type in captcha_columns_to_add:
@@ -985,6 +990,8 @@ class Database:
                     personal_max_resident_tabs INTEGER DEFAULT 5,
                     browser_personal_fresh_restart_every_n_solves INTEGER DEFAULT 10,
                     personal_idle_tab_ttl_seconds INTEGER DEFAULT 600,
+                    server_fallback_enabled INTEGER DEFAULT 1,
+                    server_fallback_max_browsers INTEGER DEFAULT 3,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -2321,6 +2328,8 @@ class Database:
                 captcha_config.browser_personal_fresh_restart_every_n_solves
             )
             config.set_personal_idle_tab_ttl_seconds(captcha_config.personal_idle_tab_ttl_seconds)
+            config.set_captcha_server_fallback_enabled(captcha_config.server_fallback_enabled)
+            config.set_captcha_server_fallback_max_browsers(captcha_config.server_fallback_max_browsers)
 
     # Cache config operations
     async def get_cache_config(self) -> CacheConfig:
@@ -2457,7 +2466,9 @@ class Database:
         personal_project_pool_size: int = None,
         personal_max_resident_tabs: int = None,
         browser_personal_fresh_restart_every_n_solves: int = None,
-        personal_idle_tab_ttl_seconds: int = None
+        personal_idle_tab_ttl_seconds: int = None,
+        server_fallback_enabled: bool = None,
+        server_fallback_max_browsers: int = None,
     ):
         """Update captcha configuration"""
         async with self._connect(write=True) as db:
@@ -2493,6 +2504,8 @@ class Database:
                     else current.get("browser_personal_fresh_restart_every_n_solves", 10)
                 )
                 new_personal_idle_ttl = personal_idle_tab_ttl_seconds if personal_idle_tab_ttl_seconds is not None else current.get("personal_idle_tab_ttl_seconds", 600)
+                new_fallback_enabled = server_fallback_enabled if server_fallback_enabled is not None else current.get("server_fallback_enabled", 1)
+                new_fallback_max = server_fallback_max_browsers if server_fallback_max_browsers is not None else current.get("server_fallback_max_browsers", 3)
                 new_remote_timeout = max(5, int(new_remote_timeout)) if new_remote_timeout is not None else 60
                 new_browser_count = max(1, min(20, int(new_browser_count)))
                 new_personal_project_pool_size = max(1, min(50, int(new_personal_project_pool_size)))
@@ -2513,6 +2526,7 @@ class Database:
                         personal_max_resident_tabs = ?,
                         browser_personal_fresh_restart_every_n_solves = ?,
                         personal_idle_tab_ttl_seconds = ?,
+                        server_fallback_enabled = ?, server_fallback_max_browsers = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = 1
                 """, (new_method, new_yes_key, new_yes_url, new_yes_task_type,
@@ -2520,7 +2534,8 @@ class Database:
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
                       new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
-                      new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl))
+                      new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl,
+                      1 if bool(new_fallback_enabled) else 0, max(1, min(6, int(new_fallback_max or 3)))))
             else:
                 new_method = captcha_method if captcha_method is not None else "yescaptcha"
                 new_yes_key = yescaptcha_api_key if yescaptcha_api_key is not None else ""
@@ -2546,6 +2561,8 @@ class Database:
                     else 10
                 )
                 new_personal_idle_ttl = personal_idle_tab_ttl_seconds if personal_idle_tab_ttl_seconds is not None else 600
+                new_fallback_enabled = server_fallback_enabled if server_fallback_enabled is not None else True
+                new_fallback_max = server_fallback_max_browsers if server_fallback_max_browsers is not None else 3
                 new_remote_timeout = max(5, int(new_remote_timeout))
                 new_browser_count = max(1, min(20, int(new_browser_count)))
                 new_personal_project_pool_size = max(1, min(50, int(new_personal_project_pool_size)))
@@ -2562,14 +2579,15 @@ class Database:
                         browser_proxy_enabled, browser_proxy_url, browser_count,
                         personal_project_pool_size,
                         personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
-                        personal_idle_tab_ttl_seconds)
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        personal_idle_tab_ttl_seconds, server_fallback_enabled, server_fallback_max_browsers)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (new_method, new_yes_key, new_yes_url, new_yes_task_type,
                       new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
                       new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
-                      new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl))
+                      new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl,
+                      1 if bool(new_fallback_enabled) else 0, max(1, min(6, int(new_fallback_max or 3)))))
 
             await db.commit()
 

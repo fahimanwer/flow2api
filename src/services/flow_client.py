@@ -69,6 +69,16 @@ class FlowClient:
             "flow_request_fingerprint",
             default=None
         )
+        # 2026-09-23 server-side reCAPTCHA fallback. Per request (contextvar):
+        # where the last token came from ("extension" | "server") and whether the
+        # rest of this request must mint on the server (set once Google rejected an
+        # extension-minted token; covers every later stage, e.g. Omni approval).
+        self._mint_source_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+            "flow_mint_source", default=None
+        )
+        self._mint_override_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+            "flow_mint_override", default=None
+        )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
 
         # Minimal browser-style headers only (what current Flow upstream still expects).
@@ -129,6 +139,34 @@ class FlowClient:
         if not isinstance(fingerprint, dict) or not fingerprint:
             return None
         return dict(fingerprint)
+
+    def reset_mint_context(self):
+        """Start of a generation request: forget the previous request's mint source/override."""
+        self._mint_source_ctx.set(None)
+        self._mint_override_ctx.set(None)
+
+    def last_mint_source(self) -> Optional[str]:
+        return self._mint_source_ctx.get()
+
+    @staticmethod
+    def _classify_flow_fail(status_code: Optional[int], text: str) -> str:
+        """One classifier for anti-bot failures, shared by the transports, the
+        FLOW_FAIL log line and the fallback decision. Returns RECAPTCHA / QUOTA /
+        AUTH/ST_EXPIRED / HTTP."""
+        _low = (text or "").lower()
+        if any(m in _low for m in ("recaptcha", "captcha", "evaluation failed", "unusual_activity")):
+            return "RECAPTCHA"
+        if any(m in _low for m in ("resource_exhausted", "resource has been exhausted", "quota")):
+            return "QUOTA"
+        if status_code == 401 or "unauthenticated" in _low:
+            return "AUTH/ST_EXPIRED"
+        return "HTTP"
+
+    @staticmethod
+    def _is_recaptcha_rejection(error: BaseException) -> bool:
+        """True only for an upstream reCAPTCHA rejection (classified by the transport),
+        never for a local mint failure, quota, prompt refusal or an unrelated 403."""
+        return getattr(error, "flow_fail_class", None) == "RECAPTCHA"
 
     def clear_request_fingerprint(self):
         """清理请求链路绑定的浏览器指纹。"""
@@ -568,21 +606,15 @@ class FlowClient:
                     # expose the egress used, so reCAPTCHA/quota/auth failures are
                     # visible in `docker logs` WITHOUT the gated firehose. The redeem
                     # IP printed here is what to compare against the mint IP.
-                    _low = f"{error_reason} {response.text[:300]}".lower()
-                    if any(m in _low for m in ("recaptcha", "captcha", "evaluation failed", "unusual_activity")):
-                        _cls = "RECAPTCHA"
-                    elif any(m in _low for m in ("resource_exhausted", "resource has been exhausted", "quota")):
-                        _cls = "QUOTA"
-                    elif response.status_code == 401 or "unauthenticated" in _low:
-                        _cls = "AUTH/ST_EXPIRED"
-                    else:
-                        _cls = "HTTP"
+                    _cls = self._classify_flow_fail(response.status_code, f"{error_reason} {response.text[:300]}")
                     debug_logger.op_warning(
                         f"[FLOW_FAIL] class={_cls} http={response.status_code} "
                         f"egress={mask_proxy_url(proxy_url)} reason={error_reason[:160]}"
                     )
 
-                    raise FlowAPIError(response.status_code, error_reason, parsed_reason)
+                    api_error = FlowAPIError(response.status_code, error_reason, parsed_reason)
+                    api_error.flow_fail_class = _cls
+                    raise api_error
 
                 return response.json()
 
@@ -625,7 +657,9 @@ class FlowClient:
                         f"Flow API request failed: curl={error_msg}; urllib={fallback_error}"
                     )
 
-            raise Exception(f"Flow API request failed: {error_msg}")
+            wrapped = Exception(f"Flow API request failed: {error_msg}")
+            wrapped.flow_fail_class = getattr(e, "flow_fail_class", None) or self._classify_flow_fail(None, error_msg)
+            raise wrapped
 
     async def _make_text_request(
         self,
@@ -812,7 +846,9 @@ class FlowClient:
                     debug_logger.log_error(f"[API FAILED] URL: {url}")
                     debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
                     debug_logger.log_error(f"[API FAILED] Response: {response_text}")
-                    raise Exception(error_reason)
+                    text_error = Exception(error_reason)
+                    text_error.flow_fail_class = self._classify_flow_fail(response.status_code, f"{error_reason} {response_text[:300]}")
+                    raise text_error
 
                 return response_text
 
@@ -822,7 +858,9 @@ class FlowClient:
                 debug_logger.log_error(f"[API FAILED] URL: {url}")
                 debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
                 debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
-            raise Exception(f"Flow API text request failed: {error_msg}")
+            wrapped = Exception(f"Flow API text request failed: {error_msg}")
+            wrapped.flow_fail_class = getattr(e, "flow_fail_class", None)
+            raise wrapped
 
     def _should_fallback_to_urllib(self, error_message: str) -> bool:
         """判断是否应从 curl_cffi 回退到 urllib。"""
@@ -2965,7 +3003,9 @@ class FlowClient:
                         token_id=token_id,
                     )
                     if not approve_recaptcha_token:
-                        raise RuntimeError("Omni 参考图视频审批阶段获取 reCAPTCHA token 失败")
+                        # Same text as every other mint failure so the token manager
+                        # applies the flat mint pause, not a reputation strike.
+                        raise RuntimeError("Failed to obtain reCAPTCHA token (Omni approval stage)")
                     approve_payload = {
                         "agentSessionId": agent_session_id,
                         "agentClientContext": {
@@ -4234,6 +4274,18 @@ class FlowClient:
     ) -> bool:
         """统一处理生成链路的重试判定与打码自愈通知。"""
         error_str = str(error)
+        # 2026-09-23: Google refused a token the worker extension minted (old
+        # extension, or a new Google rule). The rest of THIS request mints on the
+        # server, if the fallback can serve this account. Never for quota, prompt
+        # refusals or other 403s: only a transport-classified reCAPTCHA rejection.
+        if (
+            self._is_recaptcha_rejection(error)
+            and self._mint_source_ctx.get() == "extension"
+            and self._mint_override_ctx.get() != "server"
+            and config.captcha_server_fallback_enabled
+        ):
+            self._mint_override_ctx.set("server")
+            debug_logger.event(f"{log_prefix}extension token rejected by Google; remaining mints of this request go to the server fallback")
         retry_reason = self._get_retry_reason(error_str)
         retry_delay = self._get_retry_delay_seconds(error_str, retry_attempt)
 
@@ -4699,6 +4751,39 @@ class FlowClient:
         target_timeout = 45 if action_name == "VIDEO_GENERATION" else 35
         return max(12, min(base_timeout, target_timeout))
 
+    async def _server_fallback_mint(self, action: str, token_id: Optional[int], why: str = "") -> Optional[str]:
+        """Server-side reCAPTCHA mint for this account (see flow_page_captcha). Returns the
+        token and binds the redeem fingerprint (account proxy + the server Chromium's UA)."""
+        if not config.captcha_server_fallback_enabled or not token_id or not self.db:
+            return None
+        try:
+            from .flow_page_captcha import FlowPageCaptchaService
+            service = await FlowPageCaptchaService.get_instance()
+            if not service.is_available():
+                return None
+            token_row = await self.db.get_token(token_id)
+            proxy_url = (getattr(token_row, "redeem_proxy_url", None) or "").strip() if token_row else ""
+            if not proxy_url:
+                debug_logger.op_warning(f"[FALLBACK_MINT] token={token_id} skipped: account has no redeem proxy ({why[:80]})")
+                return None
+            result = await service.mint(action, proxy_url, token_id=token_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            debug_logger.op_warning(f"[FALLBACK_MINT] token={token_id} error {type(exc).__name__}: {str(exc)[:160]}")
+            return None
+        if not result or not result.get("token"):
+            return None
+        fingerprint: Dict[str, Any] = {"proxy_url": proxy_url}
+        if result.get("user_agent"):
+            fingerprint["user_agent"] = result["user_agent"]
+        self._set_request_fingerprint(fingerprint)
+        self._mint_source_ctx.set("server")
+        debug_logger.event(
+            f"[REDEEM_ALIGN] token={token_id} egress={mask_proxy_url(proxy_url)} ua_set={bool(result.get('user_agent'))} source=server"
+        )
+        return result["token"]
+
     async def _build_extension_redeem_fingerprint(
         self, token_id: Optional[int]
     ) -> Optional[Dict[str, Any]]:
@@ -4749,34 +4834,47 @@ class FlowClient:
         debug_logger.log_info(f"[reCAPTCHA] 开始获取 token: method={captcha_method}, project_id={project_id}, action={action}")
 
         if captcha_method == "extension":
-            try:
-                from .browser_captcha_extension import ExtensionCaptchaService
-                service = await ExtensionCaptchaService.get_instance(self.db)
-                # Video mints take longer in the browser (extension waits up to 60 s for
-                # VIDEO_GENERATION since ext 3.3.6); give the server side headroom.
-                extension_timeout = 75 if action == "VIDEO_GENERATION" else 25
-                token = await service.get_token(
-                    project_id,
-                    action,
-                    timeout=extension_timeout,
-                    token_id=token_id
-                )
-                # Slice B — align REDEEM with MINT: make the generate request exit the SAME
-                # residential IP + use the SAME browser UA that the extension used to mint the
-                # reCAPTCHA. If the account hasn't reported them, this is None and the redeem
-                # falls back to the global request proxy (WARP) exactly as before (no regression).
-                redeem_fp = await self._build_extension_redeem_fingerprint(token_id) if token else None
-                self._set_request_fingerprint(redeem_fp)
-                if redeem_fp:
-                    debug_logger.event(
-                        f"[REDEEM_ALIGN] token={token_id} egress={mask_proxy_url(redeem_fp.get('proxy_url'))} "
-                        f"ua_set={bool(redeem_fp.get('user_agent'))}"
+            token = None
+            extension_error: Optional[str] = None
+            if self._mint_override_ctx.get() != "server":
+                try:
+                    from .browser_captcha_extension import ExtensionCaptchaService
+                    service = await ExtensionCaptchaService.get_instance(self.db)
+                    # Video mints take longer in the browser (extension waits up to 60 s for
+                    # VIDEO_GENERATION since ext 3.3.6); give the server side headroom.
+                    extension_timeout = 75 if action == "VIDEO_GENERATION" else 25
+                    token = await service.get_token(
+                        project_id,
+                        action,
+                        timeout=extension_timeout,
+                        token_id=token_id
                     )
-                return token, None
-            except Exception as e:
-                debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {str(e)}")
-                self._set_request_fingerprint(None)
-                return None, None
+                except Exception as e:
+                    extension_error = str(e)
+                    debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {extension_error}")
+                if token:
+                    # Slice B — align REDEEM with MINT: make the generate request exit the SAME
+                    # residential IP + use the SAME browser UA that the extension used to mint the
+                    # reCAPTCHA. If the account hasn't reported them, this is None and the redeem
+                    # falls back to the global request proxy (WARP) exactly as before (no regression).
+                    redeem_fp = await self._build_extension_redeem_fingerprint(token_id)
+                    self._set_request_fingerprint(redeem_fp)
+                    self._mint_source_ctx.set("extension")
+                    if redeem_fp:
+                        debug_logger.event(
+                            f"[REDEEM_ALIGN] token={token_id} egress={mask_proxy_url(redeem_fp.get('proxy_url'))} "
+                            f"ua_set={bool(redeem_fp.get('user_agent'))}"
+                        )
+                    return token, None
+            # 2026-09-23 server-side fallback: the worker is offline, could not mint, or
+            # its token was refused earlier in this request. Mint on flow.google.com in a
+            # server Chromium that egresses through the account's own proxy; redeem must
+            # then use THAT Chromium's UA (a mismatched UA is refused).
+            fallback = await self._server_fallback_mint(action, token_id, why=extension_error or "extension mint failed")
+            if fallback:
+                return fallback, "server"
+            self._set_request_fingerprint(None)
+            return None, None
 
         # 内置浏览器打码 (nodriver)
         if captcha_method == "personal":

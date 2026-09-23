@@ -141,6 +141,18 @@ class LoadBalancer:
             self._round_robin_state[scenario] = selected["token"].id
         return selected
 
+    async def _server_fallback_eligible(self, token: Token) -> bool:
+        if not config.captcha_server_fallback_enabled:
+            return False
+        if not (getattr(token, "redeem_proxy_url", None) or "").strip():
+            return False
+        try:
+            from .flow_page_captcha import FlowPageCaptchaService
+            service = await FlowPageCaptchaService.get_instance()
+            return bool(service.is_available())
+        except Exception:
+            return False
+
     async def _check_extension_route(self, token: Token) -> tuple[bool, str]:
         """Ensure extension captcha requests are routed to the selected account."""
         if config.captcha_method != "extension":
@@ -152,6 +164,13 @@ class LoadBalancer:
             service = await ExtensionCaptchaService.get_instance(getattr(self.token_manager, "db", None))
             has_connection, route_key = await service.has_connection_for_token(token.id)
             if has_connection:
+                return True, ""
+
+            # 2026-09-23: a worker that is offline is no longer a dead end when the
+            # server can mint for this account itself (flag on, account has its own
+            # proxy, this deployment has Chromium). Health/quota/client filters above
+            # are unchanged; extension-only paths (session refresh) stay strict.
+            if await self._server_fallback_eligible(token):
                 return True, ""
 
             available = service.describe_routes() or "none"

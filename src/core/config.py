@@ -447,6 +447,33 @@ class Config:
         self._config["captcha"]["browser_launch_background"] = bool(enabled)
 
     @property
+    def captcha_server_fallback_enabled(self) -> bool:
+        """Server-side reCAPTCHA fallback (flow_page_captcha) when a worker cannot deliver a token."""
+        return bool(self._config.get("captcha", {}).get("server_fallback_enabled", True))
+
+    def set_captcha_server_fallback_enabled(self, enabled: bool):
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["server_fallback_enabled"] = bool(enabled)
+
+    @property
+    def captcha_server_fallback_max_browsers(self) -> int:
+        """How many fallback Chromiums (one per proxy) may be open at once, 1..6."""
+        value = self._config.get("captcha", {}).get("server_fallback_max_browsers", 3)
+        try:
+            return max(1, min(6, int(value)))
+        except Exception:
+            return 3
+
+    def set_captcha_server_fallback_max_browsers(self, value: int):
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        try:
+            self._config["captcha"]["server_fallback_max_browsers"] = max(1, min(6, int(value)))
+        except Exception:
+            self._config["captcha"]["server_fallback_max_browsers"] = 3
+
+    @property
     def browser_count(self) -> int:
         """浏览器打码实例数量，browser/personal 模式共用。"""
         value = self._config.get("captcha", {}).get("browser_count", 1)

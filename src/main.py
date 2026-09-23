@@ -277,6 +277,12 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await suno_service.close()
+        try:
+            from .services.flow_page_captcha import FlowPageCaptchaService
+            if FlowPageCaptchaService._instance is not None:
+                await FlowPageCaptchaService._instance.close()
+        except Exception as e:
+            print(f"⚠ Fallback captcha service close failed: {e}")
 
     # Shutdown
     print("Flow2API Shutting down...")
