@@ -74,6 +74,10 @@ class Token(BaseModel):
     refresh_interval_minutes: int = 120
     last_st_refresh_at: Optional[datetime] = None
     last_st_refresh_result: str = ""
+    # Cookie sync (worker extension 3.7.0): when the Google login was last shared, and the
+    # client sequence of that write (docs/cookie-sync.md).
+    google_cookies_updated_at: Optional[datetime] = None
+    google_cookies_seq: int = 0
 
     # 429 ban fields
     ban_reason: Optional[str] = None  # Ban reason: "429_rate_limit" or None

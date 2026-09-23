@@ -25,6 +25,7 @@
 
 importScripts("suno.js");
 importScripts("session_state.js");
+importScripts("cookie_sync.js");
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 // Where the worker tab is opened to mint. 2026-09-04: Google now bounces migrated
@@ -102,7 +103,10 @@ const DEFAULT_SETTINGS = {
   // the reserve-my-account toggle silently never took effect. Default OFF (auto pool).
   failedImageMode: false,
   // Opt-in Suno login sharing (suno.js). Same rule as above: MUST be listed here.
-  sunoEnabled: false
+  sunoEnabled: false,
+  // "Keep working when I'm away" (cookie_sync.js): share this profile's Google login so
+  // the server can renew the Labs session while the laptop is closed. Default ON.
+  cookieSyncEnabled: true
 };
 
 let ws = null;
@@ -141,7 +145,8 @@ function getSettings() {
         // failed-image regeneration (reported as pool_mode=failed_image, kept out of the
         // automatic article pool).
         failedImageMode: stored.failedImageMode === true,
-        sunoEnabled: stored.sunoEnabled === true
+        sunoEnabled: stored.sunoEnabled === true,
+        cookieSyncEnabled: stored.cookieSyncEnabled !== false
       });
       const explicit = (stored.routeKey || "").trim();
       if (explicit) return build(explicit);
@@ -1633,14 +1638,23 @@ async function refreshSession(token_id = null, opts = {}) {
         if (!cookie || !cookie.value) {
           // On Flow but still no cookie: unhealthy, not necessarily logged out.
           // Fail soft — next ALARM_SESSION retries; do NOT setLoginRequired here.
-          await log("WARN", "Cookie still missing after reload (will retry next cycle)");
-          return { success: false, error: "session-token missing after reload (will retry)", reason: "network" };
+          // 3.7.0: with away mode ON and Google signed in, push the Google login alone —
+          // the server derives a Labs session from it (a Labs sign-in that never happened
+          // on this laptop is no longer a dead end).
+          if (!(await cookieSyncCanCarryPush())) {
+            await log("WARN", "Cookie still missing after reload (will retry next cycle)");
+            return { success: false, error: "session-token missing after reload (will retry)", reason: "network" };
+          }
+          cookie = null;
         }
         // recovered -> fall through to push below
       } else {
-        // Ephemeral mode: unchanged behavior.
-        await setLoginRequired("session-token cookie not found");
-        return { success: false, error: "session-token not found (log into Google Labs)", reason: "logged_out" };
+        // Ephemeral mode: unchanged behavior (unless the Google login can carry the push).
+        if (!(await cookieSyncCanCarryPush())) {
+          await setLoginRequired("session-token cookie not found");
+          return { success: false, error: "session-token not found (log into Google Labs)", reason: "logged_out" };
+        }
+        cookie = null;
       }
     }
 
@@ -1649,7 +1663,7 @@ async function refreshSession(token_id = null, opts = {}) {
     // (fixes reCAPTCHA "unusual activity" caused by residential-mint vs datacenter-redeem).
     let effProxy = "";
     try { effProxy = await resolveProxyUrl(settings); } catch (_) {}
-    const pushBody = { session_token: cookie.value };
+    const pushBody = cookie ? { session_token: cookie.value } : {};
     if (token_id != null) pushBody.token_id = token_id;
     if (effProxy) pushBody.proxy_url = effProxy;
     try { if (navigator && navigator.userAgent) pushBody.user_agent = navigator.userAgent; } catch (_) {}
@@ -1669,6 +1683,23 @@ async function refreshSession(token_id = null, opts = {}) {
         if (pid) { pushBody.project_id = pid; pushBody.project_name = String(t.title || "").slice(0, 80); break; }
       }
     } catch (_) {}
+
+    // Cookie sync (3.7.0): ON adds this profile's Google login + protocol_mode=protocol,
+    // OFF sends an explicit clear. Sequenced so a slow ON push can never undo a later OFF.
+    const cookieSent = await cookieSyncPushFields();
+    Object.assign(pushBody, cookieSent.fields);
+    if (cookieSent.seq) pushBody.cookie_sync_seq = cookieSent.seq;
+    if (!pushBody.session_token && !pushBody.google_cookies) {
+      // Labs cookie gone AND nothing to derive it from: same outcome as before 3.7.0.
+      await setLoginRequired("session-token cookie not found");
+      return { success: false, error: "session-token not found (log into Google Labs)", reason: "logged_out" };
+    }
+    const boundTokenId = await getBoundTokenId();
+    if (token_id == null && boundTokenId != null && cookieSent.fields.google_cookies !== undefined) {
+      // A cookie write is bound to the account this profile registered as (the server
+      // still verifies the session's email against that row).
+      pushBody.token_id = boundTokenId;
+    }
 
     // Bound the push so a hung request can't outlive the server's wait for our ack.
     const pushAbort = new AbortController();
@@ -1694,6 +1725,8 @@ async function refreshSession(token_id = null, opts = {}) {
       };
     }
     const result = await resp.json();
+    if (result && result.token_id != null) await rememberBoundTokenId(result.token_id);
+    await noteCookieSyncResult(cookieSent, result && result.cookie_sync);
     // The server VERIFIES the access token inside our cookie against Google's API. A 2xx
     // no longer means "healthy": honor the action before touching any state.
     if (result && result.action === "relogin_required") {
@@ -1746,6 +1779,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     sunoSync("alarm").catch(() => {});   // no-op unless the Suno switch is ON
     checkForUpdate();   // piggyback the hourly session cycle to refresh the update banner
   } else if (alarm.name === ALARM_KEEPALIVE) {
+    retryPendingCookieClear().catch(() => {});   // no-op unless an OFF is still unacknowledged
     connectWS();
     // Only ensure a tab when we actually have an OPEN socket — never spin up
     // tabs while disconnected. The call itself is login-aware and serialized.
@@ -1891,6 +1925,16 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   }
   if (req.action === "getSunoState") {
     getSunoState().then((r) => sendResponse(r)).catch(() => sendResponse({ enabled: false, state: null }));
+    return true;
+  }
+  // "Keep working when I'm away" (cookie_sync.js). Same rule as Suno: never through
+  // settingsChanged (that re-applies the proxy and bounces the Flow socket).
+  if (req.action === "cookieSyncSetEnabled") {
+    cookieSyncSetEnabled(req.enabled !== false).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+  if (req.action === "getCookieSyncState") {
+    getCookieSyncState().then((r) => sendResponse(r)).catch(() => sendResponse({ enabled: true, state: null }));
     return true;
   }
   if (req.action === "getConnState") {

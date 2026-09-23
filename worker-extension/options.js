@@ -88,6 +88,40 @@ function renderSunoState(r) {
   box.innerHTML = text.replace(/</g, "&lt;") + when;
 }
 
+// Away mode (cookie sync): switch + honest status line (what the last push proved).
+function renderCookieSyncState(r) {
+  const on = !(r && r.enabled === false);
+  $("cookieSyncEnabled").checked = on;
+  const lab = $("cookieSyncState");
+  lab.textContent = on ? "ON" : "Off";
+  lab.className = on ? "on" : "";
+  const box = $("cookieSyncStatus");
+  const st = (r && r.state) || null;
+  let cls = "", text = "";
+  if (!on) {
+    if (st && st.status === "clearing") { cls = "warn"; text = "Off. Deletion pending — Flow2API has not confirmed yet (retrying every minute)."; }
+    else { text = "Off — Flow2API keeps this account working only while this laptop is open."; }
+  } else if (st && st.status === "stored") {
+    const ago = st.at ? Math.max(0, Math.round((Date.now() - st.at) / 60000)) : null;
+    const when = ago == null ? "" : (ago < 1 ? " just now" : ` ${ago} min ago`);
+    cls = "ok"; text = `✅ Server copy updated${when} (${st.count || 0} cookies). Flow2API can sign this account in again while you are away.`;
+  } else if (st && st.status === "signed_out") { cls = "warn"; text = "Not signed in to Google in this Chrome. Sign in, then the next push shares the login on its own."; }
+  else if (st && st.status === "error") { cls = "err"; text = st.message || "The last push failed. It retries every hour."; }
+  else if (st && st.status === "cleared") { text = "Server copy deleted."; }
+  else { text = "Waiting for the next session push…"; }
+  const when = (r && r.lastPushAt) ? `<span class="when">Last confirmed: ${fmtAgo(r.lastPushAt)}</span>` : "";
+  box.hidden = false;
+  box.className = cls;
+  box.innerHTML = text.replace(/</g, "&lt;") + when;
+}
+
+function loadCookieSyncState() {
+  chrome.runtime.sendMessage({ action: "getCookieSyncState" }, (r) => {
+    if (chrome.runtime.lastError) return;
+    renderCookieSyncState(r);
+  });
+}
+
 function loadSunoState() {
   chrome.runtime.sendMessage({ action: "getSunoState" }, (r) => {
     if (chrome.runtime.lastError) return;
@@ -110,7 +144,16 @@ document.addEventListener("DOMContentLoaded", () => {
   renderLogs();
   loadFailedMode();
   loadSunoState();
+  loadCookieSyncState();
   loadUpdateInfo();
+
+  $("cookieSyncEnabled").addEventListener("change", (e) => {
+    const on = e.target.checked;
+    renderCookieSyncState({ enabled: on, state: { status: on ? "syncing" : "clearing" } });
+    chrome.runtime.sendMessage({ action: "cookieSyncSetEnabled", enabled: on }, () => {
+      setTimeout(() => { loadCookieSyncState(); renderLogs(); }, 1500);
+    });
+  });
 
   $("sunoEnabled").addEventListener("change", (e) => {
     const on = e.target.checked;
@@ -156,6 +199,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  setInterval(() => { refreshStatus(); renderLogs(); loadSunoState(); }, 4000);
+  setInterval(() => { refreshStatus(); renderLogs(); loadSunoState(); loadCookieSyncState(); }, 4000);
   setInterval(loadUpdateInfo, 12000);   // re-check so the banner appears even if the popup is left open
 });

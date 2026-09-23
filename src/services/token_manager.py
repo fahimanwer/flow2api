@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, List
 from ..core.database import Database
 from ..core.config import config
 from ..core.models import Token, Project
-from ..core.logger import debug_logger
+from ..core.logger import debug_logger, mask_proxy_url
 from ..core.monitoring import record_token_refresh
 from .flow_client import FlowClient, FlowAPIError
 from .proxy_manager import ProxyManager
@@ -1475,6 +1475,19 @@ class TokenManager:
             new_at = result["access_token"]
             expires = result.get("expires")
 
+            # Identity guard (cookie-sync review 2026-09-23): a session that belongs to a
+            # DIFFERENT Google account than this row must never be promoted, whatever
+            # path produced it (push, cookie login, extension).
+            session_email = str((result.get("user") or {}).get("email") or "").strip().lower()
+            row_email = str(getattr(token, "email", "") or "").strip().lower() if token is not None else ""
+            if session_email and row_email and session_email != row_email:
+                debug_logger.op_warning(
+                    f"[AT_REFRESH] token={token_id} session belongs to another account "
+                    f"({session_email} != {row_email}); not promoted"
+                )
+                record_token_refresh("at", "failure")
+                return RefreshOutcome(False, "account_mismatch", verified=False)
+
             # Parse expiry time
             new_at_expires = None
             if expires:
@@ -1535,6 +1548,55 @@ class TokenManager:
             record_token_refresh("at", "failure")
             return RefreshOutcome(False, reason)
 
+    # One Google login replay must finish well inside the extension's 25 s push timeout
+    # and the request paths that wait on it.
+    COOKIE_LOGIN_TIMEOUT_SECONDS = 20.0
+
+    @staticmethod
+    def cookie_login_proxy(token) -> Optional[str]:
+        """The proxy a cookie login for this account must use: the protocol-login proxy if
+        the admin set one, else the account's residential redeem proxy. None = no usable
+        proxy, and then NO login happens (never from the datacenter IP: Google's risk
+        engine signed a fresh account out from it on 2026-09-22)."""
+        from .protocol_login import _normalize_proxy_url
+
+        for candidate in (getattr(token, "proxy_url", None), getattr(token, "redeem_proxy_url", None)):
+            normalized = _normalize_proxy_url(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    async def cookie_login(self, token, google_cookies: Optional[str] = None, proxy: Optional[str] = None) -> Dict[str, Any]:
+        """Replay the Labs "Sign in with Google" with the account's stored (or given) Google
+        cookies through its proxy. Returns the protocol_login result dict, always with
+        `reason` (no_cookies / no_proxy / timeout / network / rejected / …)."""
+        from .protocol_login import protocol_loginer
+
+        cookies = (google_cookies if google_cookies is not None else getattr(token, "google_cookies", "")) or ""
+        if not cookies.strip():
+            return {"success": False, "reason": "no_cookies", "error": "No Google cookies stored for this account"}
+        proxy_url = proxy or self.cookie_login_proxy(token)
+        if not proxy_url:
+            return {"success": False, "reason": "no_proxy", "error": "No proxy for this account; refusing to log in from the server IP"}
+        try:
+            result = await asyncio.wait_for(
+                protocol_loginer.login(
+                    cookies,
+                    proxy=proxy_url,
+                    email=(getattr(token, "email", "") or getattr(token, "login_account", "") or None),
+                ),
+                timeout=self.COOKIE_LOGIN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            result = {"success": False, "reason": "timeout", "error": f"Google login took longer than {self.COOKIE_LOGIN_TIMEOUT_SECONDS:.0f}s"}
+        result.setdefault("reason", "ok" if result.get("success") else "rejected")
+        debug_logger.event(
+            f"[COOKIE_LOGIN] token={getattr(token, 'id', '?')} via proxy={mask_proxy_url(proxy_url)} -> "
+            f"{'ok' if result.get('success') else result.get('reason')}"
+            + ("" if result.get("success") else f" ({str(result.get('error') or '')[:120]})")
+        )
+        return result
+
     async def _try_protocol_refresh_st(self, token_id: int, token: Token) -> Optional[str]:
         if self._normalize_protocol_mode(getattr(token, "protocol_mode", "session")) != "protocol":
             return None
@@ -1543,14 +1605,8 @@ class TokenManager:
             return None
 
         try:
-            from .protocol_login import protocol_loginer
-
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: trying protocol ST refresh...")
-            login_result = await protocol_loginer.login(
-                token.google_cookies,
-                proxy=(getattr(token, "proxy_url", "") or None),
-                email=(getattr(token, "login_account", "") or token.email or None),
-            )
+            login_result = await self.cookie_login(token)
             if login_result.get("success") and login_result.get("session_token"):
                 new_st = str(login_result["session_token"]).strip()
                 # CANDIDATE only — never written here. The caller feeds it to
@@ -1711,26 +1767,37 @@ class TokenManager:
         st_to_at + get_credits + commit). Only a VERIFIED credential clears health or
         re-enables an auto_at_stale row."""
         token_id = int(token.id)
+
+        def _eligible(row) -> bool:
+            if not row or not row.auto_refresh_enabled:
+                return False
+            if not (row.is_active or (row.ban_reason or "") in self.AUTH_DISABLE_REASONS):
+                return False
+            if self._normalize_protocol_mode(row.protocol_mode) != "protocol":
+                return False
+            return bool((row.google_cookies or "").strip())
+
         latest = await self.db.get_token(token_id)
-        if not latest or (not latest.is_active and (latest.ban_reason or "") != "auto_at_stale"):
-            return
-        if not latest.auto_refresh_enabled:
-            return
-        if self._normalize_protocol_mode(latest.protocol_mode) != "protocol":
-            return
-        if not (latest.google_cookies or "").strip():
+        if not _eligible(latest):
             return
 
         new_st = await self._try_protocol_refresh_st(token_id, latest)
         if not new_st:
             return
 
+        # Re-read after the network round-trip: an admin disable or a cookie-sync OFF
+        # that landed meanwhile wins over the login we just did.
+        latest = await self.db.get_token(token_id)
+        if not _eligible(latest):
+            debug_logger.log_info(f"[PROTOCOL_REFRESH] Token {token_id}: state changed during login, result dropped")
+            return
+
         outcome = await self._locked_refresh(token_id, new_st, latest)
         if outcome.success and outcome.verified:
             await self.db.update_token(token_id, last_st_refresh_at=now, last_st_refresh_result="success")
-            if not latest.is_active and (latest.ban_reason or "") == "auto_at_stale":
+            if not latest.is_active and (latest.ban_reason or "") in self.AUTH_DISABLE_REASONS:
                 await self.enable_token(token_id)
-                debug_logger.event(f"[PROTOCOL_REFRESH] token={token_id} auto_at_stale healed via protocol login — re-enabled")
+                debug_logger.event(f"[PROTOCOL_REFRESH] token={token_id} {latest.ban_reason} healed via cookie login — re-enabled")
             debug_logger.log_info(f"[PROTOCOL_REFRESH] Token {token_id}: protocol ST/AT refresh succeeded")
         elif outcome.success:
             # Promoted but unverifiable (Google API unreachable): stored, nothing else.
@@ -1752,10 +1819,13 @@ class TokenManager:
         if not refresh_config or not refresh_config.enabled:
             return
 
-        # Active tokens PLUS inactive ones disabled for a dead access token (auto_at_stale):
-        # protocol login can mint a fresh grant, so those must not be stranded.
+        # HEALER only (cookie-sync review 2026-09-23): log in again for accounts that are
+        # disabled for a dead session / dead grant (auto_st_expired, auto_at_stale). ACTIVE
+        # accounts are healed on demand the moment an access-token refresh fails
+        # (_handle_at_stale / _try_refresh_st try the cookie login first), so a periodic
+        # Google login for every healthy account would only invite risk flags.
         all_tokens = await self.db.get_all_tokens()
-        tokens = [t for t in all_tokens if t.is_active or (t.ban_reason or "") == "auto_at_stale"]
+        tokens = [t for t in all_tokens if (not t.is_active) and (t.ban_reason or "") in self.AUTH_DISABLE_REASONS]
         now = datetime.now(timezone.utc)
         for token in tokens:
             try:

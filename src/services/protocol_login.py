@@ -11,9 +11,31 @@ from ..core.logger import debug_logger
 
 
 LABS_BASE = "https://labs.google/fx"
+LABS_CALLBACK_PATH = "/fx/api/auth/callback/google"
 SESSION_COOKIE_NAME = "__Secure-next-auth.session-token"
 IMPERSONATE = "chrome124"
 GOOGLE_COOKIE_NAMES = ("SID", "HSID", "SSID", "APISID", "SAPISID")
+# The exported Google login cookies are attached ONLY to hops on these hosts (2026-09-23
+# cookie-sync review): a redirect anywhere else ends the login instead of leaking the jar.
+GOOGLE_COOKIE_HOST_SUFFIXES = (".google.com",)
+GOOGLE_COOKIE_HOSTS = ("google.com", "accounts.google.com")
+
+
+def google_cookies_usable(raw: str) -> bool:
+    """True when the export carries at least one login cookie the replay can use
+    (same rule as ProtocolLogin.login, shared with the plugin endpoint)."""
+    cookies = _parse_google_cookies(raw)
+    return any(name in cookies for name in GOOGLE_COOKIE_NAMES)
+
+
+def _is_google_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in GOOGLE_COOKIE_HOSTS or host.endswith(GOOGLE_COOKIE_HOST_SUFFIXES)
+
+
+def _is_labs_callback(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() == "labs.google" and parsed.path == LABS_CALLBACK_PATH
 
 
 def _parse_google_cookies(raw: str) -> Dict[str, str]:
@@ -199,6 +221,7 @@ class ProtocolLogin:
         if not any(name in google_cookies for name in GOOGLE_COOKIE_NAMES):
             return {
                 "success": False,
+                "reason": "no_cookies",
                 "error": "No valid Google cookie found (need at least one of SID/HSID/SSID/APISID/SAPISID)",
             }
 
@@ -211,10 +234,10 @@ class ProtocolLogin:
             try:
                 csrf_resp = await session.get(f"{LABS_BASE}/api/auth/csrf")
                 if csrf_resp.status_code != 200:
-                    return {"success": False, "error": f"CSRF failed: HTTP {csrf_resp.status_code}"}
+                    return {"success": False, "reason": "http", "error": f"CSRF failed: HTTP {csrf_resp.status_code}"}
                 csrf_token = (csrf_resp.json() or {}).get("csrfToken")
                 if not csrf_token:
-                    return {"success": False, "error": "CSRF response is missing csrfToken"}
+                    return {"success": False, "reason": "http", "error": "CSRF response is missing csrfToken"}
 
                 labs_cookies: Dict[str, str] = {}
                 _merge_cookies(labs_cookies, csrf_resp.headers)
@@ -234,13 +257,13 @@ class ProtocolLogin:
                     allow_redirects=False,
                 )
                 if signin_resp.status_code != 200:
-                    return {"success": False, "error": f"Signin failed: HTTP {signin_resp.status_code}"}
+                    return {"success": False, "reason": "http", "error": f"Signin failed: HTTP {signin_resp.status_code}"}
 
                 _merge_cookies(labs_cookies, signin_resp.headers)
                 signin_data = signin_resp.json() or {}
                 redirect_url = signin_data.get("redirect") or signin_data.get("url")
                 if not redirect_url:
-                    return {"success": False, "error": f"No redirect URL: {json.dumps(signin_data)[:200]}"}
+                    return {"success": False, "reason": "http", "error": f"No redirect URL: {json.dumps(signin_data)[:200]}"}
                 redirect_url = _append_login_hint(redirect_url, email)
 
                 google_cookie_header = _build_cookie_header(google_cookies)
@@ -248,6 +271,14 @@ class ProtocolLogin:
                 current_url = redirect_url
 
                 for attempt in range(10):
+                    # The Google login jar goes to Google hosts only; any other hop ends the
+                    # replay before a single cookie is attached.
+                    if not _is_google_host(current_url):
+                        return {
+                            "success": False,
+                            "reason": "unexpected_redirect",
+                            "error": f"OAuth redirected to an unexpected host: {urlparse(current_url).hostname or '?'}",
+                        }
                     oauth_resp = await session.get(
                         current_url,
                         headers={
@@ -259,7 +290,7 @@ class ProtocolLogin:
                     location = (oauth_resp.headers.get("location") or "").strip()
                     if location:
                         location = urljoin(current_url, location)
-                        if "labs.google/fx/api/auth/callback/google" in location:
+                        if _is_labs_callback(location):
                             callback_url = location
                             break
                         current_url = location
@@ -267,13 +298,13 @@ class ProtocolLogin:
 
                     body = oauth_resp.text or ""
                     if "signin/rejected" in body.lower():
-                        return {"success": False, "error": "Google refused the login; cookies may be expired or flagged by risk control"}
+                        return {"success": False, "reason": "rejected", "error": "Google refused the login; cookies may be expired or flagged by risk control"}
 
                     if oauth_resp.status_code == 200:
                         html_redirect = _extract_redirect_from_html(body)
                         if html_redirect:
                             html_redirect = urljoin(current_url, html_redirect)
-                            if "labs.google/fx/api/auth/callback/google" in html_redirect:
+                            if _is_labs_callback(html_redirect):
                                 callback_url = html_redirect
                                 break
                             current_url = html_redirect
@@ -281,11 +312,12 @@ class ProtocolLogin:
 
                     return {
                         "success": False,
+                        "reason": "rejected",
                         "error": f"Google OAuth returned no redirect (HTTP {oauth_resp.status_code})",
                     }
 
                 if not callback_url:
-                    return {"success": False, "error": "Google OAuth flow did not return a callback URL"}
+                    return {"success": False, "reason": "rejected", "error": "Google OAuth flow did not return a callback URL"}
 
                 callback_resp = await session.get(
                     callback_url,
@@ -314,11 +346,12 @@ class ProtocolLogin:
                     session_token = _extract_session_token(callback_resp.headers)
 
                 if not session_token:
-                    return {"success": False, "error": "No session token received; the Google session may be expired"}
+                    return {"success": False, "reason": "no_session", "error": "No session token received; the Google session may be expired"}
                 return {"success": True, "session_token": session_token}
             except Exception as exc:
-                debug_logger.log_error(f"[PROTOCOL_LOGIN] Protocol login error: {exc}")
-                return {"success": False, "error": str(exc)}
+                # Transport failures (proxy down, timeout) are NOT a verdict on the cookies.
+                debug_logger.log_error(f"[PROTOCOL_LOGIN] Protocol login error: {type(exc).__name__}: {str(exc)[:200]}")
+                return {"success": False, "reason": "network", "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
 
 protocol_loginer = ProtocolLogin()

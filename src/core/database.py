@@ -588,6 +588,10 @@ class Database:
                     ("pool_mode", "TEXT DEFAULT 'auto'"),  # 'auto' | 'failed_image' (two-pool routing)
                     ("ext_version", "TEXT"),  # worker-extension version this device last reported
                     ("reserved_client", "TEXT DEFAULT ''"),  # per-caller routing: only this client may use the account
+                    # 2026-09-23 cookie-sync: when the worker last shared its Google login, and the
+                    # client-side sequence of that write (a stale push can never undo a newer clear).
+                    ("google_cookies_updated_at", "TIMESTAMP"),
+                    ("google_cookies_seq", "INTEGER DEFAULT 0"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -796,7 +800,10 @@ class Database:
                     redeem_proxy_url TEXT,
                     browser_user_agent TEXT,
                     pool_mode TEXT DEFAULT 'auto',
-                    ext_version TEXT
+                    ext_version TEXT,
+                    reserved_client TEXT DEFAULT '',
+                    google_cookies_updated_at TIMESTAMP,
+                    google_cookies_seq INTEGER DEFAULT 0
                 )
             """)
 

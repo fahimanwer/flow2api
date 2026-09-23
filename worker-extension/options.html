@@ -20,6 +20,11 @@
     #failedModeState.on { color: #f0b562; }
     #sunoState.on { color: #46d369; }
     .sublabel { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: #6b7280; margin: 0 0 6px; text-align: left; }
+    #cookieSyncState.on { color: #46d369; }
+    #cookieSyncStatus { font-size: 11.5px; color: #b6bcc4; margin: 6px 2px 0; line-height: 1.45; text-align: left; padding: 8px 10px; border-radius: 8px; background: #161922; border: 1px solid #2a2f3a; }
+    #cookieSyncStatus.ok { color: #46d369; border-color: #22432b; background: #10231a; }
+    #cookieSyncStatus.warn { color: #f0b562; border-color: #4a3a1f; background: #241d10; }
+    #cookieSyncStatus.err { color: #f06262; border-color: #4a1f1f; background: #241010; }
     #sunoStatus { font-size: 11.5px; color: #b6bcc4; margin: 6px 2px 0; line-height: 1.45; text-align: left; padding: 8px 10px; border-radius: 8px; background: #161922; border: 1px solid #2a2f3a; }
     #sunoStatus.ok { color: #46d369; border-color: #22432b; background: #10231a; }
     #sunoStatus.warn { color: #f0b562; border-color: #4a3a1f; background: #241d10; }
@@ -64,6 +69,15 @@
   <p class="switchhint">Turn ON while you fix failed images — this account is then used <b>only</b> for failed images and kept out of the automatic article generation.</p>
 
   <button id="reconnectBtn">Reconnect</button>
+
+  <hr class="sep" />
+  <p class="sublabel">Away mode</p>
+  <label class="switchrow" style="margin-top:6px">
+    <input type="checkbox" id="cookieSyncEnabled" />
+    <span>Keep working when I'm away: <span id="cookieSyncState">ON</span></span>
+  </label>
+  <p class="switchhint">ON shares this Chrome's Google login with Flow2API so it can sign this account in to Google Labs again by itself while your laptop is closed. OFF deletes Flow2API's copy; the account then works only while this laptop is open.</p>
+  <div id="cookieSyncStatus" hidden></div>
 
   <hr class="sep" />
   <p class="sublabel">Suno music</p>
