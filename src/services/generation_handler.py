@@ -1594,6 +1594,18 @@ class GenerationHandler:
 
             ensure_project_started_at = time.time()
             project_id = await self.token_manager.ensure_project_exists(token.id)
+            if characters:
+                # Characters live inside ONE project of the account; projects rotate per
+                # request, so steer this request to the project that already has them.
+                try:
+                    preferred = await self.db.find_project_with_characters(
+                        token.id, [(c.name, c.digest) for c in characters]
+                    )
+                except Exception:
+                    preferred = None
+                if preferred and preferred != project_id:
+                    debug_logger.event(f"[CHARACTER] token={token.id} steering to project {preferred[:8]} that already holds the character(s)")
+                    project_id = preferred
             perf_trace["ensure_project_ms"] = int((time.time() - ensure_project_started_at) * 1000)
             debug_logger.log_info(f"[GENERATION] Project ID: {project_id}")
             await self._update_request_log_progress(

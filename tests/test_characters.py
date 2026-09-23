@@ -185,3 +185,26 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectSteeringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_find_project_with_characters(self):
+        import tempfile, os
+        from src.core import database as dbm
+        d = tempfile.mkdtemp(); path = os.path.join(d, "t.db")
+        db = dbm.Database(path); await db.init_db(); await db.check_and_migrate_db({})
+        async with db._connect(write=True) as c:
+            await c.execute("INSERT INTO tokens (id, st, at, email) VALUES (7, 'st', 'at', 'x@y')")
+            await c.execute("INSERT INTO projects (project_id, token_id, project_name, is_active) VALUES ('pa', 7, 'a', 1)")
+            await c.execute("INSERT INTO projects (project_id, token_id, project_name, is_active) VALUES ('pb', 7, 'b', 1)")
+            await c.execute("INSERT INTO projects (project_id, token_id, project_name, is_active) VALUES ('pdead', 7, 'd', 0)")
+            await c.commit()
+        await db.upsert_flow_character(7, "pa", "Maya", "d1", "e1")
+        await db.upsert_flow_character(7, "pb", "Maya", "d1", "e2")
+        await db.upsert_flow_character(7, "pb", "Leo", "d2", "e3")
+        await db.upsert_flow_character(7, "pdead", "Maya", "d1", "e9")
+        self.assertEqual(await db.find_project_with_characters(7, [("Maya", "d1"), ("Leo", "d2")]), "pb")
+        self.assertIn(await db.find_project_with_characters(7, [("Maya", "d1")]), ("pa", "pb"))
+        self.assertIsNone(await db.find_project_with_characters(7, [("Zed", "d3")]))
+        self.assertIsNone(await db.find_project_with_characters(8, [("Maya", "d1")]))
+        self.assertIsNone(await db.find_project_with_characters(7, []))

@@ -1566,6 +1566,32 @@ class Database:
             )
             await db.commit()
 
+    async def find_project_with_characters(self, token_id: int, pairs: List[tuple]) -> Optional[str]:
+        """The account's ACTIVE project that already holds every (name, images_sha256) in
+        `pairs`, most recently used first; None when no project has them all. Characters are
+        project-scoped, so a request that carries them must land on that project to reuse them."""
+        if not pairs:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT c.project_id, c.name, c.images_sha256, c.last_used_at FROM flow_characters c "
+                "JOIN projects p ON p.project_id = c.project_id AND p.token_id = c.token_id "
+                "WHERE c.token_id = ? AND p.is_active = 1",
+                (token_id,),
+            )
+            rows = [dict(r) for r in await cursor.fetchall()]
+        wanted = {(str(n), str(d)) for n, d in pairs}
+        by_project: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            entry = by_project.setdefault(r["project_id"], {"have": set(), "last": ""})
+            entry["have"].add((r["name"], r["images_sha256"]))
+            entry["last"] = max(entry["last"], str(r["last_used_at"] or ""))
+        complete = [(e["last"], pid) for pid, e in by_project.items() if wanted <= e["have"]]
+        if not complete:
+            return None
+        return sorted(complete, reverse=True)[0][1]
+
     async def touch_flow_character(self, token_id: int, project_id: str, name: str, images_sha256: str):
         async with self._connect(write=True) as db:
             await db.execute(
