@@ -1073,14 +1073,16 @@ function onMintOrigin(tab) { return !!tab && tabUrlOf(tab).startsWith(MINT2_ORIG
 // must not both create a tab (two tabs, one tracked). budgetMs bounds every wait
 // inside, so a request's overall deadline is honoured through tab loads too.
 let mintChain = Promise.resolve();
-function ensureMintTab(preferWindowId, budgetMs) {
-  const run = () => _ensureMintTab(preferWindowId, budgetMs);
+function ensureMintTab(preferWindowId, deadlineAt) {
+  const run = () => _ensureMintTab(preferWindowId, deadlineAt);
   mintChain = mintChain.then(run, run);
   return mintChain;
 }
 
-async function _ensureMintTab(preferWindowId, budgetMs) {
-  const loadMs = Math.max(1000, Math.min(MINT_TAB_LOAD_MS, budgetMs == null ? MINT_TAB_LOAD_MS : budgetMs));
+async function _ensureMintTab(preferWindowId, deadlineAt) {
+  // Every wait below is cut from the same absolute deadline (queue wait included).
+  const budget = () => (deadlineAt == null ? MINT_TAB_LOAD_MS : Math.min(MINT_TAB_LOAD_MS, deadlineAt - Date.now()));
+  if (budget() < 1000) throw new Error("no time left to prepare the mint tab");
   const id = await readMintTabId();
   let tab = await getTab(id);
   if (tab && !onMintOrigin(tab)) {
@@ -1091,15 +1093,18 @@ async function _ensureMintTab(preferWindowId, budgetMs) {
       tab = null;
     }
   }
+  let waited = false;
   if (tab && tab.discarded) {
-    try { await chrome.tabs.reload(id, { bypassCache: false }); await waitForTabComplete(id, loadMs); tab = await getTab(id); } catch (_) { tab = null; }
+    try { await chrome.tabs.reload(id, { bypassCache: false }); await waitForTabComplete(id, budget()); waited = true; tab = await getTab(id); } catch (_) { tab = null; }
   }
   if (tab && onMintOrigin(tab) && tab.status === "complete") return id;
-  if (tab && onMintOrigin(tab)) {
-    // Still loading (or reload never reported complete): give it its load budget once.
-    await waitForTabComplete(id, loadMs);
+  if (tab && onMintOrigin(tab) && !waited) {
+    // Still loading: give it its load budget once (never twice for the same tab).
+    await waitForTabComplete(id, budget());
     const again = await getTab(id);
     if (again && onMintOrigin(again)) return id;
+  } else if (tab && onMintOrigin(tab)) {
+    return id; // reloaded but "complete" never fired: it is ours and on the page; try minting
   }
   // Replace: close what we tracked (window-safe) BEFORE creating, so we never
   // hold two tabs.
@@ -1110,12 +1115,18 @@ async function _ensureMintTab(preferWindowId, budgetMs) {
   const created = await createTabSafely(MINT2_URL, preferWindowId);
   await rememberMintTab(created.id);
   try { await chrome.tabs.update(created.id, { autoDiscardable: false }); } catch (_) {}
-  await waitForTabComplete(created.id, loadMs);
+  await waitForTabComplete(created.id, budget());
   const settled = await getTab(created.id);
   if (!onMintOrigin(settled)) {
+    const url = tabUrlOf(settled);
+    if (settled && (url === "about:blank" || url === "")) {
+      // Still loading when the budget ran out: keep tracking it (the next ensure
+      // reuses it) rather than leaving an untracked tab behind.
+      throw new Error("mint tab is still loading flow.google.com");
+    }
+    // Gone, or someone navigated it elsewhere while it loaded: not ours to close.
     await rememberMintTab(null);
-    if (settled && !(await isLastTabInWindow(settled))) { try { await chrome.tabs.remove(created.id); } catch (_) {} }
-    throw new Error("mint tab did not reach flow.google.com (" + (tabUrlOf(settled) || "gone") + ")");
+    throw new Error("mint tab did not reach flow.google.com (" + (url || "gone") + ")");
   }
   await sleep(500);
   await log("INFO", "Mint tab opened on flow.google.com", { tabId: created.id });
@@ -1288,7 +1299,7 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
       if (attempt === 2) await dropMintTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
       if (remaining() < 4000) throw new Error("no time left after the Labs tab check (" + Math.round(remaining()) + " ms remaining)");
       const labsTab = await getTab(labsTabId);
-      const tabId = await ensureMintTab(labsTab ? labsTab.windowId : undefined, remaining() - 3000);
+      const tabId = await ensureMintTab(labsTab ? labsTab.windowId : undefined, deadline - 3000);
 
       await paceMint(settings.mintIntervalMs);
       const mintBudget = Math.min(action === "VIDEO_GENERATION" ? 60000 : 20000, remaining() - 500);
