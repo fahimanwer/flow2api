@@ -273,10 +273,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠ Suno provider failed to start: {e}")
 
+    # Server-side reCAPTCHA fallback: idle/over-cap/disabled browser sweeper (2026-09-23).
+    fallback_sweeper_handle = None
+    try:
+        from .services.flow_page_captcha import FlowPageCaptchaService
+        fallback_sweeper_handle = asyncio.create_task(
+            (await FlowPageCaptchaService.get_instance()).run_idle_sweeper()
+        )
+    except Exception as e:
+        print(f"⚠ Fallback captcha sweeper failed to start: {e}")
+
     try:
         yield
     finally:
         await suno_service.close()
+        if fallback_sweeper_handle is not None:
+            fallback_sweeper_handle.cancel()
+            try:
+                await fallback_sweeper_handle
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             from .services.flow_page_captcha import FlowPageCaptchaService
             if FlowPageCaptchaService._instance is not None:

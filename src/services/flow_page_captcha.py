@@ -138,6 +138,8 @@ class FlowPageCaptchaService:
         self._unavailable_reason = ""
         self._warned_unavailable = False
         self._waiters = 0
+        self._executable: Optional[str] = None
+        self._pw_start_lock = asyncio.Lock()    # one Playwright driver, ever
         self.stats: Dict[str, int] = {"ok": 0, "fail": 0, "timeout": 0, "launches": 0}
 
     @classmethod
@@ -167,19 +169,32 @@ class FlowPageCaptchaService:
             debug_logger.op_warning(f"[FALLBACK_MINT] unavailable in this deployment: {reason}")
         return self._available
 
-    @staticmethod
-    def _chromium_present() -> bool:
+    def _chromium_present(self) -> bool:
+        """Resolve the executable launch() will use; available only when it exists."""
+        self._executable = None
         exe = os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip()
         if exe and os.path.exists(exe):
+            self._executable = exe
             return True
         for base in (
             os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip(),
             os.path.expanduser("~/.cache/ms-playwright"),
             "/ms-playwright",
         ):
-            if base and os.path.isdir(base) and any(n.startswith("chromium") for n in os.listdir(base)):
-                return True
-        return bool(shutil.which("chromium") or shutil.which("chromium-browser"))
+            if not (base and os.path.isdir(base)):
+                continue
+            for name in sorted(os.listdir(base)):
+                if not name.startswith("chromium"):
+                    continue
+                for rel in ("chrome-linux/chrome", "chrome-linux64/chrome", "chrome-mac/Chromium.app/Contents/MacOS/Chromium"):
+                    candidate = os.path.join(base, name, rel)
+                    if os.path.exists(candidate):
+                        return True  # Playwright's own download: launch() may use its default
+        system = shutil.which("chromium") or shutil.which("chromium-browser")
+        if system:
+            self._executable = system
+            return True
+        return False
 
     def _headed(self) -> bool:
         display = os.environ.get("DISPLAY", "").strip()
@@ -220,16 +235,19 @@ class FlowPageCaptchaService:
         outcome = "fail"
         slot: Optional[_BrowserSlot] = None
         try:
-            slot = await self._acquire_slot(proxy_url, deadline)
+            slot = await asyncio.wait_for(self._acquire_slot(proxy_url, deadline), timeout=max(0.0, deadline - started))
             if slot is None:
                 outcome = "timeout"
                 debug_logger.op_warning(f"[FALLBACK_MINT] token={token_id} egress={egress} no browser slot before deadline")
                 return None
+            # The switch may have been turned off while we queued.
+            if not config.captcha_server_fallback_enabled:
+                return None
             queue_ms = int((time.monotonic() - started) * 1000)
-            result = await asyncio.wait_for(
-                self._mint_on_slot(slot, action, token_id),
-                timeout=max(0.5, deadline - time.monotonic()),
-            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            result = await asyncio.wait_for(self._mint_on_slot(slot, action, token_id), timeout=remaining)
             if result:
                 outcome = "ok"
                 ms = int((time.monotonic() - started) * 1000)
@@ -243,7 +261,10 @@ class FlowPageCaptchaService:
             outcome = "timeout"
             if slot is not None:
                 slot.dirty = True  # a still-running execute must not overlap the next mint
-            debug_logger.op_warning(f"[FALLBACK_MINT] token={token_id} egress={egress} action={action} outcome=timeout")
+            debug_logger.op_warning(
+                f"[FALLBACK_MINT] token={token_id} egress={egress} action={action} outcome=timeout "
+                f"after_ms={int((time.monotonic() - started) * 1000)} stage={'mint' if slot is not None else 'queue'}"
+            )
             return None
         except asyncio.CancelledError:
             if slot is not None:
@@ -266,19 +287,26 @@ class FlowPageCaptchaService:
         self._waiters += 1
         try:
             while True:
-                async with self._pw_lock:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                try:
+                    await asyncio.wait_for(self._pw_lock.acquire(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return None
+                try:
                     slot = self._slots.get(proxy_url)
                     if slot is None:
                         cap = max(1, int(config.captcha_server_fallback_max_browsers))
                         if len(self._slots) >= cap:
                             victim = self._idle_victim()
-                            if victim is None:
-                                slot = None
-                            else:
+                            if victim is not None:
                                 await self._close_slot(victim.proxy_url, "evicted for another proxy")
-                        if slot is None and len(self._slots) < cap:
+                        if len(self._slots) < cap:
                             slot = _BrowserSlot(proxy_url)
                             self._slots[proxy_url] = slot
+                finally:
+                    self._pw_lock.release()
                 if slot is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -305,10 +333,11 @@ class FlowPageCaptchaService:
         return min(idle, key=lambda s: s.last_used)
 
     async def _ensure_playwright(self):
-        if self._playwright is None:
-            from playwright.async_api import async_playwright
-            self._playwright = await async_playwright().start()
-        return self._playwright
+        async with self._pw_start_lock:
+            if self._playwright is None:
+                from playwright.async_api import async_playwright
+                self._playwright = await async_playwright().start()
+            return self._playwright
 
     async def _launch(self, slot: _BrowserSlot) -> None:
         pw = await self._ensure_playwright()
@@ -317,7 +346,7 @@ class FlowPageCaptchaService:
             "--disable-blink-features=AutomationControlled", "--lang=en-US", "--window-size=1280,800",
             "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
         ]
-        exe = os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip() or None
+        exe = self._executable
         try:
             slot.browser = await pw.chromium.launch(
                 headless=not self._headed(), proxy=_parse_proxy(slot.proxy_url), args=args, executable_path=exe,
@@ -329,8 +358,9 @@ class FlowPageCaptchaService:
             slot.page = await slot.context.new_page()
             slot.dirty = True
             self.stats["launches"] += 1
-        except Exception:
-            await slot.close()
+        except BaseException:
+            # Includes CancelledError: a half-launched Chromium must never be orphaned.
+            await asyncio.shield(slot.close())
             raise
 
     async def _load_page(self, slot: _BrowserSlot) -> None:
@@ -385,10 +415,19 @@ class FlowPageCaptchaService:
 
     # -------------------------------------------------------------- lifecycle
     async def _close_slot(self, proxy_url: str, why: str) -> None:
-        slot = self._slots.pop(proxy_url, None)
-        if slot is not None:
-            await slot.close()
-            debug_logger.event(f"[FALLBACK_MINT] closed browser egress={mask_proxy_url(proxy_url)} ({why})")
+        slot = self._slots.get(proxy_url)
+        if slot is None:
+            return
+        try:
+            # Shielded so a cancelled caller cannot leave Chromium half-closed; bounded so
+            # one stuck browser cannot stall every mint behind the pool lock.
+            await asyncio.wait_for(asyncio.shield(slot.close()), timeout=8)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        finally:
+            if self._slots.get(proxy_url) is slot:
+                self._slots.pop(proxy_url, None)
+        debug_logger.event(f"[FALLBACK_MINT] closed browser egress={mask_proxy_url(proxy_url)} ({why})")
 
     async def sweep_idle(self, ttl_seconds: float = IDLE_BROWSER_TTL_SECONDS) -> int:
         """Close idle browsers (all of them when the feature is disabled or over the cap)."""
@@ -404,6 +443,17 @@ class FlowPageCaptchaService:
                     await self._close_slot(url, "disabled" if not config.captcha_server_fallback_enabled else ("over cap" if over_cap else "idle"))
                     closed += 1
         return closed
+
+    async def run_idle_sweeper(self, interval_seconds: float = 60.0) -> None:
+        """Background task (lifespan): closes idle / over-cap / disabled browsers."""
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                await self.sweep_idle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                debug_logger.op_warning(f"[FALLBACK_MINT] idle sweep failed: {type(exc).__name__}: {str(exc)[:120]}")
 
     async def close(self) -> None:
         async with self._pw_lock:

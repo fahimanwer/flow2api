@@ -1853,7 +1853,7 @@ class GenerationHandler:
         """处理图片生成 (同步返回)"""
         reset_mint = getattr(self.flow_client, "reset_mint_context", None)
         if callable(reset_mint):
-            reset_mint()
+            reset_mint(getattr(token, "id", None))
 
         if response_state is None:
             response_state = self._create_response_state()
@@ -2175,7 +2175,7 @@ class GenerationHandler:
         """处理视频生成 (异步轮询)"""
         reset_mint = getattr(self.flow_client, "reset_mint_context", None)
         if callable(reset_mint):
-            reset_mint()
+            reset_mint(getattr(token, "id", None))
 
         if response_state is None:
             response_state = self._create_response_state()

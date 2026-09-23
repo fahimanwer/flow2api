@@ -206,7 +206,7 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejected_extension_token_switches_the_rest_of_the_request_to_the_server(self):
         client = _client()
-        client.reset_mint_context()
+        client.reset_mint_context(5)
         with self._ext(client, "ext-tok") as ext_patch:
             await client._get_recaptcha_token("proj", "IMAGE_GENERATION", token_id=5)
             rejected = FlowAPIError(403, "PUBLIC_ERROR_UNUSUAL_ACTIVITY: reCAPTCHA evaluation failed", "PUBLIC_ERROR_UNUSUAL_ACTIVITY")
@@ -245,6 +245,32 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FlowClient._classify_flow_fail(429, "RESOURCE_EXHAUSTED"), "QUOTA")
         self.assertEqual(FlowClient._classify_flow_fail(401, "x"), "AUTH/ST_EXPIRED")
         self.assertEqual(FlowClient._classify_flow_fail(400, "PUBLIC_ERROR_UNSAFE_GENERATION"), "HTTP")
+        # Mixed messages: quota / policy / auth win over a stray "captcha" word.
+        self.assertEqual(FlowClient._classify_flow_fail(429, "quota exceeded; captcha"), "QUOTA")
+        self.assertEqual(FlowClient._classify_flow_fail(400, "PUBLIC_ERROR_UNSAFE_GENERATION recaptcha"), "HTTP")
+        self.assertEqual(FlowClient._classify_flow_fail(401, "unusual_activity"), "AUTH/ST_EXPIRED")
+
+    async def test_override_needs_a_usable_fallback(self):
+        # Flag on but the image has no Chromium: the extension keeps retrying, no override.
+        self.fallback.is_available.return_value = False
+        client = _client()
+        client.reset_mint_context(5)
+        client._mint_source_ctx.set("extension")
+        client._notify_browser_captcha_error = AsyncMock()
+        rejected = FlowAPIError(403, "reCAPTCHA evaluation failed", "PUBLIC_ERROR_UNUSUAL_ACTIVITY")
+        rejected.flow_fail_class = "RECAPTCHA"
+        with patch("asyncio.sleep", AsyncMock()):
+            await client._handle_retryable_generation_error(rejected, 0, 3, None, "proj", "[T] ")
+        self.assertIsNone(client._mint_override_ctx.get())
+        # Account without a proxy: same.
+        self.fallback.is_available.return_value = True
+        client = _client(proxy="")
+        client.reset_mint_context(5)
+        client._mint_source_ctx.set("extension")
+        client._notify_browser_captcha_error = AsyncMock()
+        with patch("asyncio.sleep", AsyncMock()):
+            await client._handle_retryable_generation_error(rejected, 0, 3, None, "proj", "[T] ")
+        self.assertIsNone(client._mint_override_ctx.get())
 
 
 class LoadBalancerEligibilityTests(unittest.IsolatedAsyncioTestCase):

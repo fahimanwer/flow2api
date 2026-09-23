@@ -79,6 +79,9 @@ class FlowClient:
         self._mint_override_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
             "flow_mint_override", default=None
         )
+        self._current_token_id_ctx: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+            "flow_mint_token_id", default=None
+        )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
 
         # Minimal browser-style headers only (what current Flow upstream still expects).
@@ -140,10 +143,11 @@ class FlowClient:
             return None
         return dict(fingerprint)
 
-    def reset_mint_context(self):
+    def reset_mint_context(self, token_id: Optional[int] = None):
         """Start of a generation request: forget the previous request's mint source/override."""
         self._mint_source_ctx.set(None)
         self._mint_override_ctx.set(None)
+        self._current_token_id_ctx.set(token_id)
 
     def last_mint_source(self) -> Optional[str]:
         return self._mint_source_ctx.get()
@@ -154,12 +158,14 @@ class FlowClient:
         FLOW_FAIL log line and the fallback decision. Returns RECAPTCHA / QUOTA /
         AUTH/ST_EXPIRED / HTTP."""
         _low = (text or "").lower()
-        if any(m in _low for m in ("recaptcha", "captcha", "evaluation failed", "unusual_activity")):
-            return "RECAPTCHA"
-        if any(m in _low for m in ("resource_exhausted", "resource has been exhausted", "quota")):
-            return "QUOTA"
         if status_code == 401 or "unauthenticated" in _low:
             return "AUTH/ST_EXPIRED"
+        if any(m in _low for m in ("resource_exhausted", "resource has been exhausted", "quota")):
+            return "QUOTA"
+        if any(m in _low for m in ("unsafe_generation", "prominent_people", "public_error_unsafe", "policy")):
+            return "HTTP"
+        if any(m in _low for m in ("recaptcha", "captcha", "evaluation failed", "unusual_activity")):
+            return "RECAPTCHA"
         return "HTTP"
 
     @staticmethod
@@ -658,7 +664,10 @@ class FlowClient:
                     )
 
             wrapped = Exception(f"Flow API request failed: {error_msg}")
-            wrapped.flow_fail_class = getattr(e, "flow_fail_class", None) or self._classify_flow_fail(None, error_msg)
+            inherited = getattr(e, "flow_fail_class", None)
+            if inherited is None and ("HTTP Error" in error_msg or "PUBLIC_ERROR" in error_msg):
+                inherited = self._classify_flow_fail(None, error_msg)  # urllib fallback path: same classifier
+            wrapped.flow_fail_class = inherited
             raise wrapped
 
     async def _make_text_request(
@@ -4282,7 +4291,7 @@ class FlowClient:
             self._is_recaptcha_rejection(error)
             and self._mint_source_ctx.get() == "extension"
             and self._mint_override_ctx.get() != "server"
-            and config.captcha_server_fallback_enabled
+            and await self._server_fallback_can_serve(self._current_token_id_ctx.get())
         ):
             self._mint_override_ctx.set("server")
             debug_logger.event(f"{log_prefix}extension token rejected by Google; remaining mints of this request go to the server fallback")
@@ -4751,6 +4760,20 @@ class FlowClient:
         target_timeout = 45 if action_name == "VIDEO_GENERATION" else 35
         return max(12, min(base_timeout, target_timeout))
 
+    async def _server_fallback_can_serve(self, token_id: Optional[int]) -> bool:
+        """Flag on, this image has Chromium, and the account has its own proxy."""
+        if not config.captcha_server_fallback_enabled or not token_id or not self.db:
+            return False
+        try:
+            from .flow_page_captcha import FlowPageCaptchaService
+            service = await FlowPageCaptchaService.get_instance()
+            if not service.is_available():
+                return False
+            token_row = await self.db.get_token(token_id)
+            return bool((getattr(token_row, "redeem_proxy_url", None) or "").strip()) if token_row else False
+        except Exception:
+            return False
+
     async def _server_fallback_mint(self, action: str, token_id: Optional[int], why: str = "") -> Optional[str]:
         """Server-side reCAPTCHA mint for this account (see flow_page_captcha). Returns the
         token and binds the redeem fingerprint (account proxy + the server Chromium's UA)."""
@@ -4836,6 +4859,8 @@ class FlowClient:
         if captcha_method == "extension":
             token = None
             extension_error: Optional[str] = None
+            if token_id:
+                self._current_token_id_ctx.set(token_id)
             if self._mint_override_ctx.get() != "server":
                 try:
                     from .browser_captcha_extension import ExtensionCaptchaService
