@@ -1573,7 +1573,8 @@ class TokenManager:
                 return normalized
         return None
 
-    async def cookie_login(self, token, google_cookies: Optional[str] = None, proxy: Optional[str] = None) -> Dict[str, Any]:
+    async def cookie_login(self, token, google_cookies: Optional[str] = None, proxy: Optional[str] = None,
+                           timeout: Optional[float] = None) -> Dict[str, Any]:
         """Replay the Labs "Sign in with Google" with the account's stored (or given) Google
         cookies through its proxy. Returns the protocol_login result dict, always with
         `reason` (no_cookies / no_proxy / timeout / network / rejected / …)."""
@@ -1585,6 +1586,8 @@ class TokenManager:
         proxy_url = proxy or self.cookie_login_proxy(token)
         if not proxy_url:
             return {"success": False, "reason": "no_proxy", "error": "No proxy for this account; refusing to log in from the server IP"}
+        budget = float(timeout) if timeout else self.COOKIE_LOGIN_TIMEOUT_SECONDS
+        budget = max(1.0, min(budget, self.COOKIE_LOGIN_TIMEOUT_SECONDS))
         try:
             result = await asyncio.wait_for(
                 protocol_loginer.login(
@@ -1592,10 +1595,10 @@ class TokenManager:
                     proxy=proxy_url,
                     email=(getattr(token, "email", "") or getattr(token, "login_account", "") or None),
                 ),
-                timeout=self.COOKIE_LOGIN_TIMEOUT_SECONDS,
+                timeout=budget,
             )
         except asyncio.TimeoutError:
-            result = {"success": False, "reason": "timeout", "error": f"Google login took longer than {self.COOKIE_LOGIN_TIMEOUT_SECONDS:.0f}s"}
+            result = {"success": False, "reason": "timeout", "error": f"Google login took longer than {budget:.0f}s"}
         result.setdefault("reason", "ok" if result.get("success") else "rejected")
         debug_logger.event(
             f"[COOKIE_LOGIN] token={getattr(token, 'id', '?')} via proxy={mask_proxy_url(proxy_url)} -> "
@@ -1802,9 +1805,12 @@ class TokenManager:
         outcome = await self._locked_refresh(token_id, new_st, latest)
         if outcome.success and outcome.verified:
             await self.db.update_token(token_id, last_st_refresh_at=now, last_st_refresh_result="success")
-            if not latest.is_active and (latest.ban_reason or "") in self.AUTH_DISABLE_REASONS:
+            # Re-enable only on the CURRENT state (verification took more network time):
+            # an admin disable or a cookie-sync OFF that landed meanwhile wins.
+            current = await self.db.get_token(token_id)
+            if current and not current.is_active and (current.ban_reason or "") in self.AUTH_DISABLE_REASONS and _eligible(current):
                 await self.enable_token(token_id)
-                debug_logger.event(f"[PROTOCOL_REFRESH] token={token_id} {latest.ban_reason} healed via cookie login — re-enabled")
+                debug_logger.event(f"[PROTOCOL_REFRESH] token={token_id} {current.ban_reason} healed via cookie login — re-enabled")
             debug_logger.log_info(f"[PROTOCOL_REFRESH] Token {token_id}: protocol ST/AT refresh succeeded")
         elif outcome.success:
             # Promoted but unverifiable (Google API unreachable): stored, nothing else.

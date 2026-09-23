@@ -31,11 +31,21 @@ When the Labs session dies, the server signs in to Labs again itself, replaying 
 
 ## The switch (extension popup)
 
-"Keep working when I'm away" is ON by default in 3.7.0. Turning it OFF sends
-`google_cookies: ""` right away and the server deletes its copy (`protocol_mode` back to
-`session`). Turning it ON pushes the current login immediately. The status line shows what the
-last push proved: "Server copy updated N min ago (K cookies)", "Not signed in to Google", or
-the server's error.
+"Keep working when I'm away" is ON by default in 3.7.0. Turning it OFF calls
+`POST /api/plugin/cookie-sync {action: clear}` right away (no Google round-trip, so it works
+even when the Labs login is broken) and the server deletes its copy (`protocol_mode` back to
+`session`); the switch shows "Deletion pending" and retries every minute until the server
+confirms. OFF does not revoke the Labs session the server already holds; that one simply
+expires on its own and is not renewed. Turning it ON pushes the current login immediately.
+The status line shows what the last push proved: "Server copy updated N min ago (K cookies)"
+means the server stored the cookies, not that a future renewal is guaranteed (Google can
+still refuse the replay; then the account waits for the laptop as before).
+
+Every cookie write carries a client sequence (`cookie_sync_seq`); the server applies a write
+only if its sequence is newer than the stored one, in a single conditional statement, so a
+slow ON push can never undo a later OFF. The clear call is addressed by the account's token id
+and authenticated with the shared plugin connection token: any worker holding that token can
+clear any account, which is the same trust level the session push already has.
 
 When the switch is ON the push also repeats whenever Google rotates a login cookie
 (`SID`, `HSID`, `SSID`, `LSID`, `__Secure-1PSID/3PSID`, `__Secure-1PSIDTS/3PSIDTS`), debounced
@@ -44,9 +54,13 @@ When the switch is ON the push also repeats whenever Google rotates a login cook
 ## How the server uses it
 
 1. `plugin_update_token`: a valid `session_token` is verified as before (validate-then-promote).
-   If the pushed session is dead (`st_expired`) or missing and cookies were sent, the server
-   derives a fresh session from the cookies first and verifies that one. Cookies are stored
-   only after a verified credential; a failed cookie login answers 400 and stores nothing.
+   If the pushed session is dead (Labs answers 401 or "no session"), missing, or its grant is
+   stale (`at_stale`) and cookies were sent, the server first checks whether the row already
+   holds a newer working session (from an earlier push or the healer) and reuses it; only
+   then does it replay the Google login (one at a time per account, inside a 23 s budget).
+   A transport failure talking to Google is a 503 (the worker retries), never a login replay.
+   Cookies are stored whenever the push proved the account's email, also on `at_stale`; a
+   failed cookie login for a dead session answers 400 and stores nothing.
 2. `TokenManager._try_protocol_refresh_st`: tried first whenever an access-token refresh fails
    (`_do_refresh_at` recovery attempt 1, before asking the extension). The login goes through
    `tokens.proxy_url` if set, else the account's `redeem_proxy_url` — never the datacenter IP.

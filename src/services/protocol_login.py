@@ -29,13 +29,21 @@ def google_cookies_usable(raw: str) -> bool:
 
 
 def _is_google_host(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
+    """HTTPS origin on google.com (default port only): the only hops that get the jar."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or parsed.port not in (None, 443):
+        return False
     return host in GOOGLE_COOKIE_HOSTS or host.endswith(GOOGLE_COOKIE_HOST_SUFFIXES)
 
 
-def _is_labs_callback(url: str) -> bool:
+def _is_labs_origin(url: str) -> bool:
     parsed = urlparse(url)
-    return parsed.scheme == "https" and (parsed.hostname or "").lower() == "labs.google" and parsed.path == LABS_CALLBACK_PATH
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() == "labs.google" and parsed.port in (None, 443)
+
+
+def _is_labs_callback(url: str) -> bool:
+    return _is_labs_origin(url) and urlparse(url).path == LABS_CALLBACK_PATH
 
 
 def _parse_google_cookies(raw: str) -> Dict[str, str]:
@@ -337,6 +345,8 @@ class ProtocolLogin:
                     location = (callback_resp.headers.get("location") or "").strip()
                     if not location or callback_resp.status_code not in (301, 302, 303, 307, 308):
                         break
+                    if not _is_labs_origin(urljoin(callback_url, location)):
+                        break  # Labs cookies stay on labs.google
                     callback_resp = await session.get(
                         urljoin(callback_url, location),
                         headers={"Cookie": _build_cookie_header(labs_cookies)},

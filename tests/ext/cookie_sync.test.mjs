@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const {
   googleHostMatches, serializeGoogleCookies, isGoogleLoginCookieChange, cookieSyncPushAllowed,
-  describeCookieSyncState, COOKIE_SYNC_MAX_COOKIES,
+  describeCookieSyncState, nextCookieSyncSeq, COOKIE_SYNC_MAX_COOKIES,
 } = require("../../worker-extension/cookie_sync.js");
 
 test("googleHostMatches accepts google.com and subdomains only", () => {
@@ -60,4 +60,10 @@ test("describeCookieSyncState never claims more than the last push proved", () =
   assert.equal(describeCookieSyncState(true, { status: "signed_out" }).cls, "warn");
   assert.equal(describeCookieSyncState(true, { status: "error", message: "boom" }).text, "boom");
   assert.match(describeCookieSyncState(true, null).text, /Waiting/);
+});
+
+test("nextCookieSyncSeq is strictly increasing even within one millisecond", () => {
+  const a = nextCookieSyncSeq(), b = nextCookieSyncSeq(), c = nextCookieSyncSeq();
+  assert.ok(a < b && b < c);
+  assert.ok(a >= Date.now() - 5000);
 });

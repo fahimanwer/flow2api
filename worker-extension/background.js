@@ -1603,7 +1603,8 @@ async function refreshSession(token_id = null, opts = {}) {
       const reloadedTab = await rollSessionTab(); // never throws; arms breaker on login bounce
       if (reloadedTab == null) {
         const auth = await getAuthState();
-        if (auth.state === "login_required") return { success: false, error: "login required", reason: "logged_out" };
+        // 3.7.0: a Labs sign-in bounce is no dead end when away mode can carry the push.
+        if (auth.state === "login_required" && !(await cookieSyncCanCarryPush())) return { success: false, error: "login required", reason: "logged_out" };
       } else {
         await sleep(COOKIE_SETTLE_MS);
       }
@@ -1625,17 +1626,23 @@ async function refreshSession(token_id = null, opts = {}) {
         const tabId = await rollSessionTab(); // never throws; arms breaker on login bounce
         if (tabId == null) {
           const auth = await getAuthState();
-          return {
-            success: false,
-            error: auth.state === "login_required"
-              ? "login required (Google Labs logged out)"
-              : "reload fallback failed (will retry)",
-            reason: auth.state === "login_required" ? "logged_out" : "network",
-          };
+          // 3.7.0: bounced to Labs sign-in but Google is signed in and away mode is ON:
+          // push the Google login alone; the server derives the Labs session from it.
+          if (!(auth.state === "login_required" && (await cookieSyncCanCarryPush()))) {
+            return {
+              success: false,
+              error: auth.state === "login_required"
+                ? "login required (Google Labs logged out)"
+                : "reload fallback failed (will retry)",
+              reason: auth.state === "login_required" ? "logged_out" : "network",
+            };
+          }
+          cookie = null;
+        } else {
+          await sleep(COOKIE_SETTLE_MS); // let NextAuth write the rolled cookie
+          cookie = await readSessionCookie();
         }
-        await sleep(COOKIE_SETTLE_MS); // let NextAuth write the rolled cookie
-        cookie = await readSessionCookie();
-        if (!cookie || !cookie.value) {
+        if (tabId != null && (!cookie || !cookie.value)) {
           // On Flow but still no cookie: unhealthy, not necessarily logged out.
           // Fail soft — next ALARM_SESSION retries; do NOT setLoginRequired here.
           // 3.7.0: with away mode ON and Google signed in, push the Google login alone —
@@ -1733,7 +1740,9 @@ async function refreshSession(token_id = null, opts = {}) {
       await setGrantExpired(result.message);
       return { success: false, message: result.message, action: result.action, reason: "relogin_required" };
     }
-    await clearLoginRequired(); // a valid cookie pushed -> session is healthy
+    // A valid Labs cookie pushed -> session is healthy. A cookies-only push (away mode)
+    // proves nothing about THIS browser's Labs login, so the breaker stays as it was.
+    if (pushBody.session_token) await clearLoginRequired();
     if (!result || result.credential_verified !== false) await clearGrantExpired();
     await log("SUCCESS", "Session token pushed to Flow2API", { action: result.action, message: result.message });
     return { success: true, message: result.message, action: result.action, reason: "refreshed" };

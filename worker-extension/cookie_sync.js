@@ -152,27 +152,42 @@ async function exportGoogleCookies() {
 //   OFF             : google_cookies="", protocol_mode="session"  (explicit clear)
 // `seq` is Date.now() at build time: the server ignores a write older than its last
 // one, so a slow ON push can never undo a later OFF.
+// Every ON/OFF bumps the generation; a reply to a push built under an older generation
+// is ignored (it could report "stored" after a later OFF, or "cleared" for an old OFF).
+let cookieSyncGen = 0;
+// Sequences are strictly increasing within this worker even when two pushes are built in
+// the same millisecond (the server treats an equal sequence as the same write).
+let cookieSyncLastSeq = 0;
+function nextCookieSyncSeq() {
+  cookieSyncLastSeq = Math.max(cookieSyncLastSeq + 1, Date.now());
+  return cookieSyncLastSeq;
+}
+
 async function cookieSyncPushFields() {
   const st = await cookieSyncStore();
-  const seq = Date.now();
+  const seq = nextCookieSyncSeq();
+  const gen = cookieSyncGen;
   if (st.cookieSyncEnabled === false) {
-    return { fields: { google_cookies: "", protocol_mode: "session" }, seq, count: 0, enabled: false };
+    return { fields: { google_cookies: "", protocol_mode: "session" }, seq, gen, count: 0, enabled: false };
   }
   const exported = await exportGoogleCookies();
   if (!exported) {
     await setCookieSyncState({ status: "signed_out", at: Date.now() });
-    return { fields: {}, seq, count: 0, enabled: true };
+    return { fields: {}, seq, gen, count: 0, enabled: true };
   }
-  return { fields: { google_cookies: exported.json, protocol_mode: "protocol" }, seq, count: exported.count, enabled: true, loginNames: exported.loginNames };
+  return { fields: { google_cookies: exported.json, protocol_mode: "protocol" }, seq, gen, count: exported.count, enabled: true, loginNames: exported.loginNames };
 }
 
 // Called by refreshSession() with the server's answer (its `cookie_sync` object).
 async function noteCookieSyncResult(sent, result) {
   if (!sent) return;
+  if (sent.gen !== cookieSyncGen) return; // built before a later ON/OFF: says nothing about now
   if (!sent.enabled) {
-    if (result && (result.cleared || result.stale)) {
+    if (result && result.cleared) {
       await chrome.storage.local.set({ cookieSyncPendingClear: null, cookieSyncState: { status: "cleared", at: Date.now() } });
     }
+    // `stale` = the server holds a NEWER write; it does not prove deletion, so a pending
+    // clear stays pending (the keepalive retry re-sends it with a fresh sequence).
     return;
   }
   if (!sent.count) return; // nothing was sent (signed out); state already says so
@@ -193,6 +208,7 @@ async function noteCookieSyncResult(sent, result) {
 // a dedicated clear call that needs no Google round-trip, retried every minute until
 // the server acknowledges it.
 async function clearCookiesOnServer(seq) {
+  const gen = cookieSyncGen;
   const settings = await getSettings();
   const tokenId = await getBoundTokenId();
   if (!settings.serverBase || !settings.connectionToken || tokenId == null) return { ok: false, reason: "unbound" };
@@ -207,10 +223,16 @@ async function clearCookiesOnServer(seq) {
     });
     if (!resp.ok) return { ok: false, reason: `server ${resp.status}` };
     const result = await resp.json();
-    if (result && result.cookie_sync && (result.cookie_sync.cleared || result.cookie_sync.stale)) {
+    if (gen !== cookieSyncGen) return { ok: false, reason: "superseded" }; // ON happened meanwhile
+    if (result && result.cookie_sync && result.cookie_sync.cleared) {
       await chrome.storage.local.set({ cookieSyncPendingClear: null, cookieSyncState: { status: "cleared", at: Date.now() } });
       await log("INFO", "Flow2API deleted its copy of the Google login");
       return { ok: true };
+    }
+    if (result && result.cookie_sync && result.cookie_sync.stale) {
+      // A newer write exists on the server: re-send the clear with a fresh sequence next time.
+      await chrome.storage.local.set({ cookieSyncPendingClear: { seq: nextCookieSyncSeq() } });
+      return { ok: false, reason: "stale" };
     }
     return { ok: false, reason: "not_acknowledged" };
   } catch (e) {
@@ -227,12 +249,13 @@ async function retryPendingCookieClear() {
 }
 
 async function cookieSyncSetEnabled(enabled) {
+  cookieSyncGen++;
   if (enabled !== false) {
     await chrome.storage.local.set({ cookieSyncEnabled: true, cookieSyncPendingClear: null, cookieSyncState: { status: "syncing", at: Date.now() } });
     await log("INFO", "Keep working when I'm away: ON — sharing the Google login now");
     return refreshSession();
   }
-  const seq = Date.now();
+  const seq = nextCookieSyncSeq();
   await chrome.storage.local.set({ cookieSyncEnabled: false, cookieSyncPendingClear: { seq }, cookieSyncState: { status: "clearing", at: Date.now() } });
   await log("INFO", "Keep working when I'm away: OFF — asking Flow2API to delete its copy of the Google login");
   const r = await clearCookiesOnServer(seq);
@@ -267,6 +290,6 @@ if (typeof chrome !== "undefined" && chrome.cookies && chrome.cookies.onChanged)
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     googleHostMatches, serializeGoogleCookies, isGoogleLoginCookieChange, cookieSyncPushAllowed,
-    describeCookieSyncState, GOOGLE_COOKIE_TRIGGER_NAMES, COOKIE_SYNC_MAX_COOKIES, COOKIE_SYNC_MAX_BYTES,
+    describeCookieSyncState, nextCookieSyncSeq, GOOGLE_COOKIE_TRIGGER_NAMES, COOKIE_SYNC_MAX_COOKIES, COOKIE_SYNC_MAX_BYTES,
   };
 }

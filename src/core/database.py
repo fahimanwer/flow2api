@@ -1376,6 +1376,19 @@ class Database:
                 await db.execute(query, params)
                 await db.commit()
 
+    async def update_token_cookie_sync(self, token_id: int, seq: int, **fields) -> int:
+        """Cookie-sync write guarded by the client sequence IN ONE statement: applies only
+        when the stored sequence is lower (a stale ON can never undo a newer OFF, and two
+        concurrent writes cannot both pass a read-then-write check). Returns rows changed."""
+        async with self._connect(write=True) as db:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            cur = await db.execute(
+                f"UPDATE tokens SET {sets}, google_cookies_seq = ? WHERE id = ? AND COALESCE(google_cookies_seq, 0) < ?",
+                [*fields.values(), seq, token_id, seq],
+            )
+            await db.commit()
+            return cur.rowcount if cur.rowcount is not None else 0
+
     # ---- Per-(token, model) daily-quota cooldown persistence (see TokenManager) ----
     async def upsert_model_quota_cooldown(self, token_id: int, model_key: str, until: datetime):
         async with self._connect(write=True) as db:

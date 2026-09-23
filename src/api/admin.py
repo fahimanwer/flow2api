@@ -2957,13 +2957,21 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     if token_id_override is not None and not bound_row:
         raise HTTPException(status_code=404, detail=f"Token {token_id_override} not found")
     derived_from_cookies = False
+    # One budget for the whole recovery (the worker gives up on the POST after 25 s).
+    request_started = time.monotonic()
+
+    def _remaining() -> float:
+        return COOKIE_RECOVERY_BUDGET_SECONDS - (time.monotonic() - request_started)
 
     async def _derive_st_from_cookies() -> str:
         nonlocal derived_from_cookies
+        if _remaining() < 6.0:
+            raise HTTPException(status_code=503, detail="No time left for a Google login in this push; retry")
         proxy = reported_proxy_url or (token_manager.cookie_login_proxy(bound_row) if bound_row else None)
         login = await token_manager.cookie_login(
             bound_row or SimpleNamespace(id="new", email=None, login_account=None),
             google_cookies=google_cookies, proxy=proxy,
+            timeout=min(token_manager.COOKIE_LOGIN_TIMEOUT_SECONDS, _remaining() - 1.0),
         )
         if login.get("success") and login.get("session_token"):
             derived_from_cookies = True
@@ -2991,24 +2999,51 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 pass
         return result, at, at_expires, email
 
+    async def _reuse_stored_credential():
+        """Cookie-recovery guard (Codex 2026-09-23): a previous push may already have put
+        a working, server-derived session on the bound row. Verify THAT before any new
+        Google login. Returns (result, at, at_expires, email) or None."""
+        if not bound_row:
+            return None
+        latest = await db.get_token(bound_row.id)
+        if not latest or not (latest.st or "").strip() or latest.st == session_token:
+            return None
+        try:
+            probe = await _validate(latest.st)
+        except Exception:
+            return None
+        debug_logger.log_info(f"[COOKIE_SYNC] token={bound_row.id} stored session still valid; no Google login needed")
+        return latest.st, probe
+
     try:
         if not session_token:
-            session_token = await _derive_st_from_cookies()
-            result, at, at_expires, email = await _validate(session_token)
+            reused = await _reuse_stored_credential()
+            if reused:
+                session_token, (result, at, at_expires, email) = reused
+            else:
+                session_token = await _derive_st_from_cookies()
+                result, at, at_expires, email = await _validate(session_token)
         else:
             try:
                 result, at, at_expires, email = await _validate(session_token)
             except HTTPException:
                 raise
             except Exception as direct_error:
-                if not google_cookies:
+                if not google_cookies or not _is_dead_session_error(direct_error):
                     raise
                 debug_logger.log_info(f"[COOKIE_SYNC] pushed session token is dead ({str(direct_error)[:80]}); trying the cookies")
-                session_token = await _derive_st_from_cookies()
-                result, at, at_expires, email = await _validate(session_token)
+                reused = await _reuse_stored_credential()
+                if reused:
+                    session_token, (result, at, at_expires, email) = reused
+                else:
+                    session_token = await _derive_st_from_cookies()
+                    result, at, at_expires, email = await _validate(session_token)
     except HTTPException:
         raise
     except Exception as e:
+        if not _is_dead_session_error(e):
+            # Google/Labs unreachable: not a verdict on the session. The worker retries.
+            raise HTTPException(status_code=503, detail=f"Could not verify session with Google ({str(e)[:120]}); retry")
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
 
     # Step 2: Resolve which token row this update applies to.
@@ -3045,11 +3080,32 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             if not outcome.success and outcome.reason in ("st_expired", "at_stale") and google_cookies and not derived_from_cookies:
                 # The pushed session is dead, or Google stopped renewing its grant: a fresh
                 # login from the cookies is exactly what "sign out / sign in" would do.
+                # Serialized per token, and a working credential already on the row (from
+                # an earlier push or the healer) is verified FIRST — no login replay then.
                 bound_row = existing_token
-                session_token = await _derive_st_from_cookies()
-                outcome = await token_manager.validate_and_promote(
-                    existing_token.id, session_token, source="plugin_push_cookies"
-                )
+                async with _cookie_recovery_lock(existing_token.id):
+                    latest_row = await db.get_token(existing_token.id)
+                    reused_outcome = None
+                    if latest_row and (latest_row.st or "").strip() and latest_row.st != session_token:
+                        reused_outcome = await token_manager.validate_and_promote(
+                            existing_token.id, latest_row.st, source="plugin_push_stored"
+                        )
+                    if reused_outcome is not None and reused_outcome.success and reused_outcome.verified:
+                        debug_logger.log_info(f"[COOKIE_SYNC] token={existing_token.id} stored session still valid; no Google login needed")
+                        outcome = reused_outcome
+                    else:
+                        try:
+                            session_token = await _derive_st_from_cookies()
+                        except HTTPException:
+                            if outcome.reason == "st_expired":
+                                raise
+                            # at_stale: the push still proved the account, so the cookie
+                            # backup is stored below and the healer retries the login later.
+                            debug_logger.log_info(f"[COOKIE_SYNC] token={existing_token.id} at_stale and the cookie login failed now; cookies kept for the healer")
+                        else:
+                            outcome = await token_manager.validate_and_promote(
+                                existing_token.id, session_token, source="plugin_push_cookies"
+                            )
             if not outcome.success and outcome.reason == "st_expired":
                 raise HTTPException(status_code=400, detail="Invalid session token (expired)")
             if not outcome.success and outcome.reason == "account_mismatch":
@@ -3254,6 +3310,34 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
 
 
 COOKIE_SYNC_MAX_BYTES = 256 * 1024
+COOKIE_RECOVERY_BUDGET_SECONDS = 23.0   # the worker abandons the push POST after 25 s
+_cookie_recovery_locks: Dict[int, asyncio.Lock] = {}
+
+
+def _cookie_recovery_lock(token_id: int) -> asyncio.Lock:
+    lock = _cookie_recovery_locks.get(int(token_id))
+    if lock is None:
+        lock = _cookie_recovery_locks[int(token_id)] = asyncio.Lock()
+    return lock
+
+
+def _is_dead_session_error(error: Exception) -> bool:
+    """A Labs answer that means "this session token is dead" (401/UNAUTHENTICATED, or a
+    200 without access_token/email) — as opposed to a transport failure, which must never
+    start a Google login replay."""
+    if token_manager is not None:
+        try:
+            if token_manager._is_auth_error(error):
+                return True
+            fc = token_manager.flow_client
+            if fc._is_timeout_error(error) or fc._is_proxy_connection_error(error):
+                return False
+        except Exception:
+            pass
+    if isinstance(error, KeyError) and "access_token" in str(error):
+        return True
+    text = str(error).lower()
+    return "access_token" in text or "email from session" in text or "no session" in text
 
 
 def _parse_cookie_sync_field(value) -> Optional[str]:
@@ -3290,27 +3374,36 @@ async def _apply_cookie_sync(token_row, google_cookies: Optional[str], cookie_se
     out = {"stored": False, "cleared": False, "stale": False, "cookies": 0}
     if google_cookies is None:
         return out
-    latest = await db.get_token(token_row.id) or token_row
-    stored_seq = int(getattr(latest, "google_cookies_seq", 0) or 0)
-    if cookie_seq and stored_seq and cookie_seq < stored_seq:
+    if cookie_seq <= 0:
+        # Every cookie write carries the worker's sequence; without one nothing is ordered.
+        out["stale"] = True
+        out["reason"] = "no_seq"
+        return out
+    now = datetime.now(timezone.utc)
+    count = len(_parse_google_cookies(google_cookies)) if google_cookies else 0
+    if google_cookies == "":
+        fields = dict(google_cookies="", protocol_mode="session", login_account="", google_cookies_updated_at=now)
+    else:
+        fields = dict(google_cookies=google_cookies, protocol_mode="protocol", login_account=(email or "").strip(), google_cookies_updated_at=now)
+    # One conditional statement: applies only if the stored sequence is lower.
+    changed = await db.update_token_cookie_sync(token_row.id, cookie_seq, **fields)
+    if not changed:
+        latest = await db.get_token(token_row.id)
+        stored_seq = int(getattr(latest, "google_cookies_seq", 0) or 0) if latest else 0
+        if stored_seq == cookie_seq:
+            # The same write again (retry): report the state it produced, idempotently.
+            has = bool((getattr(latest, "google_cookies", "") or "").strip())
+            out["cleared"] = (google_cookies == "" and not has)
+            out["stored"] = (google_cookies != "" and has)
+            out["cookies"] = count if out["stored"] else 0
+            return out
         out["stale"] = True
         debug_logger.log_info(f"[COOKIE_SYNC] token={token_row.id} stale write ignored (seq {cookie_seq} < {stored_seq})")
         return out
-    now = datetime.now(timezone.utc)
     if google_cookies == "":
-        await db.update_token(
-            token_row.id, google_cookies="", protocol_mode="session", login_account="",
-            google_cookies_updated_at=now, google_cookies_seq=cookie_seq,
-        )
         out["cleared"] = True
-        if (getattr(latest, "google_cookies", "") or "").strip():
-            debug_logger.event(f"[COOKIE_SYNC] token={token_row.id} ({email}) Google login deleted (switch OFF)")
+        debug_logger.event(f"[COOKIE_SYNC] token={token_row.id} ({email}) Google login deleted (switch OFF)")
         return out
-    count = len(_parse_google_cookies(google_cookies))
-    await db.update_token(
-        token_row.id, google_cookies=google_cookies, protocol_mode="protocol", login_account=(email or "").strip(),
-        google_cookies_updated_at=now, google_cookies_seq=cookie_seq,
-    )
     out["stored"] = True
     out["cookies"] = count
     debug_logger.event(f"[COOKIE_SYNC] token={token_row.id} ({email}) Google login stored ({count} cookies)")

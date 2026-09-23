@@ -49,6 +49,13 @@ class _FakeDB:
             for k, v in fields.items():
                 setattr(self.token, k, v)
 
+    async def update_token_cookie_sync(self, token_id, seq, **fields):
+        if not self.token or self.token.id != token_id or int(self.token.google_cookies_seq or 0) >= seq:
+            return 0
+        fields = dict(fields, google_cookies_seq=seq)
+        await self.update_token(token_id, **fields)
+        return 1
+
 
 class PluginPushTests(unittest.TestCase):
     """HTTP-level: the real endpoint with a fake db / token manager."""
@@ -63,6 +70,10 @@ class PluginPushTests(unittest.TestCase):
         self.tm.AUTH_DISABLE_REASONS = TokenManager.AUTH_DISABLE_REASONS
         self.tm.cookie_login_proxy = TokenManager.cookie_login_proxy
         self.tm.cookie_login = AsyncMock(return_value={"success": True, "session_token": "st-derived", "reason": "ok"})
+        self.tm.COOKIE_LOGIN_TIMEOUT_SECONDS = 20.0
+        self.tm._is_auth_error = lambda e: "401" in str(e)
+        self.tm.flow_client._is_timeout_error = lambda e: isinstance(e, TimeoutError)
+        self.tm.flow_client._is_proxy_connection_error = lambda e: False
         self._saved = (admin_module.db, admin_module.token_manager)
         admin_module.db = self.db
         admin_module.token_manager = self.tm
@@ -121,11 +132,21 @@ class PluginPushTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["cookie_sync"]["stale"])
         self.assertNotIn("google_cookies", self._stored())
+        # equal sequence = the same write again: idempotent report, no second mutation
+        self.db.token.google_cookies = ""
+        r = self._push({"session_token": "st-new", "google_cookies": "", "cookie_sync_seq": 500})
+        self.assertTrue(r.json()["cookie_sync"]["cleared"])
+        self.assertNotIn("google_cookies", self._stored())
+        # no sequence at all = unordered: refused, nothing written
+        r = self._push({"session_token": "st-new", "google_cookies": COOKIES})
+        self.assertEqual(r.json()["cookie_sync"]["reason"], "no_seq")
+        self.assertNotIn("google_cookies", self._stored())
 
     def test_dead_session_is_replaced_by_one_derived_from_the_cookies(self):
         self.tm.flow_client.st_to_at = AsyncMock(side_effect=[Exception("HTTP 401 UNAUTHENTICATED"),
                                                               {"access_token": "at-new", "expires": None, "user": {"email": "me@x.com"}}])
-        r = self._push({"session_token": "st-dead", "google_cookies": COOKIES, "proxy_url": "http://u:p@disp.example:8004", "cookie_sync_seq": 1})
+        self.db.token.st = "st-dead"  # the row holds the same dead session: nothing to reuse
+        r = self._push({"session_token": "st-dead", "google_cookies": COOKIES, "proxy_url": "http://u:p@disp.example:8004", "cookie_sync_seq": 1, "token_id": 55})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["cookie_sync"]["derived_from_cookies"])
         kw = self.tm.cookie_login.await_args.kwargs
@@ -135,6 +156,7 @@ class PluginPushTests(unittest.TestCase):
         self.assertEqual(self._stored()["google_cookies"], COOKIES)
 
     def test_no_session_token_but_cookies_derives_one(self):
+        self.db.token.st = ""  # nothing stored to reuse
         r = self._push({"google_cookies": COOKIES, "proxy_url": "http://u:p@disp.example:8004", "token_id": 55})
         self.assertEqual(r.status_code, 200, r.text)
         self.tm.cookie_login.assert_awaited_once()
@@ -154,10 +176,60 @@ class PluginPushTests(unittest.TestCase):
 
     def test_promote_st_expired_falls_back_to_cookies(self):
         self.tm.validate_and_promote = AsyncMock(side_effect=[RefreshOutcome(False, "st_expired"), RefreshOutcome(True, "ok", verified=True)])
-        r = self._push({"session_token": "st-new", "google_cookies": COOKIES})
+        self.db.token.st = "st-new"  # the row holds nothing newer than the pushed session
+        r = self._push({"session_token": "st-new", "google_cookies": COOKIES, "cookie_sync_seq": 2})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["cookie_sync"]["derived_from_cookies"])
         self.assertEqual(self.tm.validate_and_promote.await_args_list[1].args, (55, "st-derived"))
+
+    def test_at_stale_with_failed_cookie_login_keeps_the_cookie_backup(self):
+        # The push proved the email; Google is not renewing its grant; the cookie login
+        # failed right now (proxy down). Store the cookies anyway: the healer retries.
+        self.tm.validate_and_promote = AsyncMock(return_value=RefreshOutcome(False, "at_stale", verified=False))
+        self.tm.cookie_login = AsyncMock(return_value={"success": False, "reason": "network", "error": "proxy down"})
+        self.db.token.st = "st-new"
+        r = self._push({"session_token": "st-new", "google_cookies": COOKIES, "ext_version": "3.7.0", "cookie_sync_seq": 4})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["action"], "relogin_required")
+        self.assertTrue(r.json()["cookie_sync"]["stored"])
+        self.assertEqual(self._stored()["google_cookies"], COOKIES)
+
+    def test_transport_failure_at_first_conversion_is_503_and_no_google_login(self):
+        self.tm._is_auth_error = lambda e: False
+        self.tm.flow_client._is_timeout_error = lambda e: isinstance(e, TimeoutError)
+        self.tm.flow_client._is_proxy_connection_error = lambda e: False
+        self.tm.flow_client.st_to_at = AsyncMock(side_effect=TimeoutError("session endpoint timeout"))
+        r = self._push({"session_token": "st-new", "google_cookies": COOKIES, "cookie_sync_seq": 5})
+        self.assertEqual(r.status_code, 503)
+        self.tm.cookie_login.assert_not_awaited()
+        self.assertEqual(self.db.updates, [])
+
+    def test_stored_server_session_is_verified_before_any_new_google_login(self):
+        # The row already holds a server-derived session (from an earlier push/healer) that
+        # differs from the browser's stale one: verify it, do NOT replay the login.
+        self.db.token.st = "st-server"
+        self.tm.validate_and_promote = AsyncMock(side_effect=[RefreshOutcome(False, "at_stale", verified=False), RefreshOutcome(True, "ok", verified=True)])
+        r = self._push({"session_token": "st-browser", "google_cookies": COOKIES, "cookie_sync_seq": 6, "token_id": 55})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.tm.cookie_login.assert_not_awaited()
+        self.assertEqual(self.tm.validate_and_promote.await_args_list[1].args, (55, "st-server"))
+        self.assertTrue(r.json()["credential_verified"])
+        self.assertFalse(r.json()["cookie_sync"]["derived_from_cookies"])
+
+    def test_dead_browser_session_reuses_a_live_stored_one_when_bound(self):
+        self.db.token.st = "st-server"
+        calls = []
+
+        async def st_to_at(st):
+            calls.append(st)
+            if st == "st-browser":
+                raise Exception("HTTP 401 UNAUTHENTICATED")
+            return {"access_token": "at-new", "expires": None, "user": {"email": "me@x.com"}}
+        self.tm.flow_client.st_to_at = AsyncMock(side_effect=st_to_at)
+        r = self._push({"session_token": "st-browser", "google_cookies": COOKIES, "cookie_sync_seq": 7, "token_id": 55})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(calls, ["st-browser", "st-server"])
+        self.tm.cookie_login.assert_not_awaited()
 
     def test_account_mismatch_from_promote_is_409(self):
         self.tm.validate_and_promote = AsyncMock(return_value=RefreshOutcome(False, "account_mismatch"))
@@ -190,7 +262,7 @@ class PluginPushTests(unittest.TestCase):
         seen = []
         with patch.object(admin_module.debug_logger, "event", side_effect=lambda m, *a, **k: seen.append(m)), \
              patch.object(admin_module.debug_logger, "log_info", side_effect=lambda m, *a, **k: seen.append(m)):
-            r = self._push({"session_token": "st-new", "google_cookies": COOKIES})
+            r = self._push({"session_token": "st-new", "google_cookies": COOKIES, "cookie_sync_seq": 3})
         self.assertEqual(r.status_code, 200)
         self.assertNotIn(SENTINEL, r.text)
         self.assertFalse(any(SENTINEL in m for m in seen), seen)
@@ -291,6 +363,12 @@ class TokenManagerCookieLoginTests(unittest.IsolatedAsyncioTestCase):
         from datetime import datetime, timezone
         await tm._refresh_protocol_token(tok, datetime.now(timezone.utc))
         tm.enable_token.assert_awaited_once_with(2)
+        # the row was disabled by an admin (ban_reason cleared) while the credential was
+        # being verified: promoted (same account, valid session) but NOT re-enabled
+        tm.enable_token.reset_mock()
+        tm.db.get_token = AsyncMock(side_effect=[tok, tok, _token(id=2, is_active=False, ban_reason=None, protocol_mode="protocol", google_cookies=COOKIES)])
+        await tm._refresh_protocol_token(tok, datetime.now(timezone.utc))
+        tm.enable_token.assert_not_awaited()
         # the switch was turned OFF during the login: nothing promoted
         tm.enable_token.reset_mock(); tm._locked_refresh.reset_mock()
         tm.db.get_token = AsyncMock(side_effect=[tok, _token(id=2, is_active=False, ban_reason="auto_st_expired", protocol_mode="session", google_cookies="")])
@@ -307,6 +385,9 @@ class ProtocolLoginSafetyTests(unittest.TestCase):
 
     def test_google_host_and_exact_callback_matching(self):
         self.assertTrue(pl._is_google_host("https://accounts.google.com/o/oauth2/auth?x=1"))
+        self.assertFalse(pl._is_google_host("http://accounts.google.com/o/oauth2/auth"))
+        self.assertFalse(pl._is_google_host("https://accounts.google.com:8443/o/oauth2/auth"))
+        self.assertFalse(pl._is_labs_callback("https://labs.google:8443/fx/api/auth/callback/google"))
         self.assertTrue(pl._is_google_host("https://accounts.google.co.uk.google.com/"))
         self.assertFalse(pl._is_google_host("https://evil.io/accounts.google.com/"))
         self.assertFalse(pl._is_google_host("https://google.com.evil.io/"))
