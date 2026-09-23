@@ -1472,6 +1472,13 @@ class TokenManager:
                 if token is not None
                 else self.flow_client.st_to_at(st)
             )
+            if not isinstance(result, dict) or not result.get("access_token"):
+                # NextAuth answers 200 {} for a session it no longer knows: the ST is
+                # dead. Before 2026-09-23 this surfaced as KeyError → "unknown", and no
+                # ST refresh (extension or cookie login) was ever attempted for it.
+                debug_logger.op_warning(f"[AT_REFRESH] token={token_id} Labs returned no session for this ST — st_expired")
+                record_token_refresh("at", "failure")
+                return RefreshOutcome(False, "st_expired", verified=False)
             new_at = result["access_token"]
             expires = result.get("expires")
 

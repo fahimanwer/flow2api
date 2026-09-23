@@ -257,6 +257,16 @@ class TokenManagerCookieLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out.reason, "account_mismatch")
         tm.db.update_token.assert_not_awaited()
 
+    async def test_empty_session_answer_is_st_expired_not_unknown(self):
+        # Labs/NextAuth answers 200 {} for a dead session token; that must trigger the ST
+        # refresh path (cookie login / extension), not end as "unknown".
+        tm = self._tm()
+        tm.flow_client.st_to_at = AsyncMock(return_value={})
+        tm._flow_call_for_token = lambda token, call: call()
+        out = await tm._do_refresh_at(55, "dead", _token())
+        self.assertEqual(out.reason, "st_expired")
+        tm.db.update_token.assert_not_awaited()
+
     async def test_healer_only_touches_auth_disabled_rows(self):
         tm = self._tm()
         tm.db.get_token_refresh_config = AsyncMock(return_value=types.SimpleNamespace(enabled=True, refresh_interval_minutes=120))
