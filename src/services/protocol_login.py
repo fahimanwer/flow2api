@@ -199,7 +199,7 @@ class ProtocolLogin:
         if not any(name in google_cookies for name in GOOGLE_COOKIE_NAMES):
             return {
                 "success": False,
-                "error": "未找到有效的 Google cookie（需要 SID/HSID/SSID/APISID/SAPISID 中至少一个）",
+                "error": "No valid Google cookie found (need at least one of SID/HSID/SSID/APISID/SAPISID)",
             }
 
         session_kwargs: Dict[str, Any] = {"impersonate": IMPERSONATE, "trust_env": False}
@@ -211,10 +211,10 @@ class ProtocolLogin:
             try:
                 csrf_resp = await session.get(f"{LABS_BASE}/api/auth/csrf")
                 if csrf_resp.status_code != 200:
-                    return {"success": False, "error": f"CSRF 失败: HTTP {csrf_resp.status_code}"}
+                    return {"success": False, "error": f"CSRF failed: HTTP {csrf_resp.status_code}"}
                 csrf_token = (csrf_resp.json() or {}).get("csrfToken")
                 if not csrf_token:
-                    return {"success": False, "error": "CSRF 响应缺少 csrfToken"}
+                    return {"success": False, "error": "CSRF response is missing csrfToken"}
 
                 labs_cookies: Dict[str, str] = {}
                 _merge_cookies(labs_cookies, csrf_resp.headers)
@@ -234,13 +234,13 @@ class ProtocolLogin:
                     allow_redirects=False,
                 )
                 if signin_resp.status_code != 200:
-                    return {"success": False, "error": f"Signin 失败: HTTP {signin_resp.status_code}"}
+                    return {"success": False, "error": f"Signin failed: HTTP {signin_resp.status_code}"}
 
                 _merge_cookies(labs_cookies, signin_resp.headers)
                 signin_data = signin_resp.json() or {}
                 redirect_url = signin_data.get("redirect") or signin_data.get("url")
                 if not redirect_url:
-                    return {"success": False, "error": f"无重定向 URL: {json.dumps(signin_data)[:200]}"}
+                    return {"success": False, "error": f"No redirect URL: {json.dumps(signin_data)[:200]}"}
                 redirect_url = _append_login_hint(redirect_url, email)
 
                 google_cookie_header = _build_cookie_header(google_cookies)
@@ -267,7 +267,7 @@ class ProtocolLogin:
 
                     body = oauth_resp.text or ""
                     if "signin/rejected" in body.lower():
-                        return {"success": False, "error": "Google 拒绝登录，Cookies 可能已过期或被风控"}
+                        return {"success": False, "error": "Google refused the login; cookies may be expired or flagged by risk control"}
 
                     if oauth_resp.status_code == 200:
                         html_redirect = _extract_redirect_from_html(body)
@@ -281,11 +281,11 @@ class ProtocolLogin:
 
                     return {
                         "success": False,
-                        "error": f"Google OAuth 未返回重定向（HTTP {oauth_resp.status_code}）",
+                        "error": f"Google OAuth returned no redirect (HTTP {oauth_resp.status_code})",
                     }
 
                 if not callback_url:
-                    return {"success": False, "error": "Google OAuth 流程中未获得 callback URL"}
+                    return {"success": False, "error": "Google OAuth flow did not return a callback URL"}
 
                 callback_resp = await session.get(
                     callback_url,
@@ -314,10 +314,10 @@ class ProtocolLogin:
                     session_token = _extract_session_token(callback_resp.headers)
 
                 if not session_token:
-                    return {"success": False, "error": "未获取到 session token，Google session 可能已过期"}
+                    return {"success": False, "error": "No session token received; the Google session may be expired"}
                 return {"success": True, "session_token": session_token}
             except Exception as exc:
-                debug_logger.log_error(f"[PROTOCOL_LOGIN] 协议登录异常: {exc}")
+                debug_logger.log_error(f"[PROTOCOL_LOGIN] Protocol login error: {exc}")
                 return {"success": False, "error": str(exc)}
 
 

@@ -235,7 +235,7 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.generate_video_text(
             at="at-token",
             project_id="project-1",
-            prompt="猫猫",
+            prompt="a cat",
             model_key="veo_3_1_t2v_lite",
             aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
             use_v2_model_config=True,
@@ -247,7 +247,7 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("batchId", json_data["mediaGenerationContext"])
         self.assertEqual(
             request_data["textInput"]["structuredPrompt"]["parts"][0]["text"],
-            "猫猫",
+            "a cat",
         )
         self.assertNotIn("prompt", request_data["textInput"])
         self.assertEqual(request_data["videoModelKey"], "veo_3_1_t2v_lite")
@@ -288,7 +288,7 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
         result = await self.client.generate_video_text(
             at="at-token",
             project_id="project-1",
-            prompt="猫猫",
+            prompt="a cat",
             model_key="veo_3_1_t2v_lite",
             aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
             use_v2_model_config=True,
@@ -319,12 +319,12 @@ class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
         request = ChatCompletionRequest(
             model="gemini-3.0-pro-image",
             messages=[
-                ChatMessage(role="user", content="先生成一张图"),
+                ChatMessage(role="user", content="Generate an image first"),
                 ChatMessage(
                     role="assistant",
                     content="![cat](https://example.com/cat.png)",
                 ),
-                ChatMessage(role="user", content="基于上一张图继续编辑"),
+                ChatMessage(role="user", content="Keep editing the previous image"),
             ],
         )
 
@@ -399,7 +399,7 @@ class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
         await self.client.generate_video_start_end(
             at="at-token",
             project_id="project-1",
-            prompt="变身猫猫",
+            prompt="turn into a cat",
             model_key="veo_3_1_interpolation_lite",
             aspect_ratio="VIDEO_ASPECT_RATIO_PORTRAIT",
             start_media_id="start-media",
@@ -416,7 +416,7 @@ class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request_data["endImage"]["mediaId"], "end-media")
         self.assertEqual(
             request_data["textInput"]["structuredPrompt"]["parts"][0]["text"],
-            "变身猫猫",
+            "turn into a cat",
         )
 
 

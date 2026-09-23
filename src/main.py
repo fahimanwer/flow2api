@@ -112,7 +112,7 @@ async def lifespan(app: FastAPI):
         await db.check_and_migrate_db(config_dict)
         print("Database migration check completed.")
 
-    # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
+    # On startup, sync DB config into memory so personal/browser runtime settings are not missed.
     await db.reload_config_to_memory()
     # Per-caller routing policies (client_policies table) into memory; admin POST reloads them.
     from .core.client_policy import client_policy_store
@@ -121,7 +121,7 @@ async def lifespan(app: FastAPI):
     cache_cleanup_enabled = await generation_handler.file_cache.refresh_cleanup_task()
     captcha_config = await db.get_captcha_config()
 
-    # 尽量在浏览器服务启动前就拿到 token 快照，后续并发管理和预热共用。
+    # Take a token snapshot before browser services start; concurrency and warmup share it.
     tokens = await token_manager.get_all_tokens()
 
     # Initialize browser captcha service if needed
@@ -169,7 +169,7 @@ async def lifespan(app: FastAPI):
         elif tokens:
             print("Browser captcha resident warmup skipped: no tab warmed successfully")
         else:
-            # 没有任何可用 token 时，打开登录窗口供用户手动操作
+            # No usable token: open a login window for the user
             await browser_service.open_login_window()
             print("No active token found, opened login window for manual setup")
     elif captcha_config.captcha_method == "browser":
@@ -343,7 +343,7 @@ generation_handler = GenerationHandler(
     load_balancer,
     db,
     concurrency_manager,
-    proxy_manager  # 添加 proxy_manager 参数
+    proxy_manager  # Pass proxy_manager
 )
 
 # Set dependencies

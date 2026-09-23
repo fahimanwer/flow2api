@@ -63,7 +63,7 @@ config/setting.toml
 config/setting_warp.toml
 config/setting_warp_example.toml
 
-# 根目录临时测试文件
+# Temporary test files in the repo root
 /test_*
 tests/__pycache__/
 *.har

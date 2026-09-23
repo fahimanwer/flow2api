@@ -77,7 +77,7 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
             request_calls.append(kwargs)
             if kwargs["url"].endswith("/flow/uploadImage"):
                 raise RuntimeError("HTTP 500: upstream failed")
-            self.fail("带 project_id 的上传不应回退到 legacy 接口")
+            self.fail("An upload with a project_id must not fall back to the legacy endpoint")
 
         client._make_request = AsyncMock(side_effect=fake_make_request)
 

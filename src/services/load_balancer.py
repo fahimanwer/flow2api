@@ -81,11 +81,11 @@ class LoadBalancer:
                     self._video_pending[token_id] = current - 1
 
     async def _get_token_load(self, token_id: int, for_image_generation: bool, for_video_generation: bool) -> tuple[int, Optional[int]]:
-        """获取 token 当前负载。
+        """Get the token's current load.
 
         Returns:
             (inflight, remaining)
-            remaining 为 None 表示无限制
+            remaining is None when there is no limit
         """
         if not self.concurrency_manager:
             return 0, None
@@ -111,7 +111,7 @@ class LoadBalancer:
         return 0, None
 
     async def _reserve_slot(self, token_id: int, for_image_generation: bool, for_video_generation: bool) -> bool:
-        """尝试为当前 token 预占一个生成槽位。"""
+        """Try to reserve a generation slot for this token."""
         if not self.concurrency_manager:
             return True
 
@@ -175,10 +175,10 @@ class LoadBalancer:
 
             available = service.describe_routes() or "none"
             if route_key:
-                return False, f"扩展路由 {route_key} 未连接（可用路由: {available}）"
-            return False, f"扩展路由未配置或匿名插件未连接（可用路由: {available}）"
+                return False, f"Extension route {route_key} not connected (available routes: {available})"
+            return False, f"Extension route not set or anonymous extension not connected (available routes: {available})"
         except Exception as exc:
-            return False, f"扩展路由检查失败: {exc}"
+            return False, f"Extension route check failed: {exc}"
 
     async def select_token(
         self,
@@ -211,8 +211,8 @@ class LoadBalancer:
             Selected token or None if no available tokens
         """
         debug_logger.log_info(
-            f"[LOAD_BALANCER] 开始选择Token (图片生成={for_image_generation}, "
-            f"视频生成={for_video_generation}, 模型={model}, 预占槽位={reserve})"
+            f"[LOAD_BALANCER] Selecting token (image={for_image_generation}, "
+            f"video={for_video_generation}, model={model}, reserve={reserve})"
         )
 
         # Ensure persisted per-model quota cooldowns are loaded before we filter on them.
@@ -222,10 +222,10 @@ class LoadBalancer:
         active_tokens = await self.token_manager.get_active_tokens()
         # Two-pool routing: keep failed_image accounts out of the auto pool (and vice versa).
         active_tokens = select_pool(active_tokens, pool)
-        debug_logger.log_info(f"[LOAD_BALANCER] 获取到 {len(active_tokens)} 个活跃Token (pool={pool})")
+        debug_logger.log_info(f"[LOAD_BALANCER] Found {len(active_tokens)} active tokens (pool={pool})")
 
         if not active_tokens:
-            debug_logger.log_info(f"[LOAD_BALANCER] ❌ 没有活跃的Token")
+            debug_logger.log_info(f"[LOAD_BALANCER] ❌ No active tokens")
             return None
 
         available_tokens = []
@@ -237,13 +237,13 @@ class LoadBalancer:
             # flagged account is rested so we don't re-trigger more "unusual activity"
             # failures. Progressive backoff lives in TokenManager.mark_recaptcha_failure.
             if self.token_manager.is_recaptcha_cooldown(token.id):
-                filtered_reasons[token.id] = "reCAPTCHA 冷却中（账号级）"
+                filtered_reasons[token.id] = "reCAPTCHA cooldown (account level)"
                 continue
             # Account-health pause (at_stale: Google stopped renewing this account's access
             # token — cookie alive, API 401). Skip it entirely; the refresh leader handles
             # device reload / threshold disable. See TokenManager._handle_at_stale.
             if self.token_manager.is_health_cooldown(token.id):
-                filtered_reasons[token.id] = self.token_manager.health_cooldown_reason(token.id) or "账号健康冷却中"
+                filtered_reasons[token.id] = self.token_manager.health_cooldown_reason(token.id) or "Account health cooldown"
                 continue
             # Per-caller routing (client_policy.py): a token reserved for another client, or
             # below the tier this client's policy demands, is out. Unidentified callers use
@@ -256,16 +256,16 @@ class LoadBalancer:
             # Image generation is exempt from paygate-tier gating (free accounts
             # can generate images on Flow); only video enforces account tier.
             if model and not for_image_generation and not supports_model_for_tier(model, normalized_tier):
-                filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)
+                filtered_reasons[token.id] = 'Account tier too low, needs ' + get_paygate_tier_label(required_tier)
                 continue
             # Per-model quota: skip this token only for the specific model it has
             # exhausted; it stays available for every other model (separate quotas).
             if model and self.token_manager.is_model_quota_exhausted(token.id, model):
-                filtered_reasons[token.id] = f"模型配额已用尽，冷却中: {model}"
+                filtered_reasons[token.id] = f"Model quota used up, cooling down: {model}"
                 continue
             if for_image_generation:
                 if not token.image_enabled:
-                    filtered_reasons[token.id] = "图片生成已禁用"
+                    filtered_reasons[token.id] = "Image generation disabled"
                     continue
 
                 route_ok, route_reason = await self._check_extension_route(token)
@@ -278,12 +278,12 @@ class LoadBalancer:
                     and self.concurrency_manager
                     and not await self.concurrency_manager.can_use_image(token.id)
                 ):
-                    filtered_reasons[token.id] = "图片并发已满"
+                    filtered_reasons[token.id] = "Image concurrency full"
                     continue
 
             if for_video_generation:
                 if not token.video_enabled:
-                    filtered_reasons[token.id] = "视频生成已禁用"
+                    filtered_reasons[token.id] = "Video generation disabled"
                     continue
 
                 route_ok, route_reason = await self._check_extension_route(token)
@@ -296,7 +296,7 @@ class LoadBalancer:
                     and self.concurrency_manager
                     and not await self.concurrency_manager.can_use_video(token.id)
                 ):
-                    filtered_reasons[token.id] = "视频并发已满"
+                    filtered_reasons[token.id] = "Video concurrency full"
                     continue
 
             inflight, remaining = await self._get_token_load(
@@ -313,15 +313,15 @@ class LoadBalancer:
             })
 
         if filtered_reasons:
-            debug_logger.log_info(f"[LOAD_BALANCER] 已过滤Token:")
+            debug_logger.log_info(f"[LOAD_BALANCER] Filtered tokens:")
             for token_id, reason in filtered_reasons.items():
                 debug_logger.log_info(f"[LOAD_BALANCER]   - Token {token_id}: {reason}")
 
         if not available_tokens:
-            debug_logger.log_info(f"[LOAD_BALANCER] ❌ 没有可用的Token (图片生成={for_image_generation}, 视频生成={for_video_generation})")
+            debug_logger.log_info(f"[LOAD_BALANCER] ❌ No usable token (image={for_image_generation}, video={for_video_generation})")
             return None
 
-        # 最低 in-flight 优先；有并发上限时，剩余槽位更多的 token 优先；最后随机打散
+        # Lowest in-flight first; with a concurrency cap, tokens with more free slots first; then random shuffle
         call_mode = config.call_logic_mode
         if call_mode == "polling":
             scenario = "default"
@@ -373,7 +373,7 @@ class LoadBalancer:
             if mine:
                 available_tokens = mine + [item for item in available_tokens if token_reserved_for(item["token"]) != client]
 
-        debug_logger.log_info("[LOAD_BALANCER] 候选Token负载:")
+        debug_logger.log_info("[LOAD_BALANCER] Candidate token load:")
         for item in available_tokens:
             token = item["token"]
             remaining = "unlimited" if item["remaining"] is None else item["remaining"]
@@ -383,30 +383,30 @@ class LoadBalancer:
                 f"needs_refresh={item['needs_refresh']}, credits={token.credits}"
             )
 
-        # 只为候选列表中真正尝试到的 token 做 AT 校验，避免每次请求把所有 token 全扫一遍
+        # Only check AT for candidates actually tried, so each request does not scan every token
         for item in available_tokens:
             token = item["token"]
             token_id = token.id
 
             token = await self.token_manager.ensure_valid_token(token)
             if not token:
-                debug_logger.log_info(f"[LOAD_BALANCER] 跳过 Token {token_id}: AT无效或已过期")
+                debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token_id}: AT invalid or expired")
                 continue
 
             if reserve and not await self._reserve_slot(token.id, for_image_generation, for_video_generation):
-                debug_logger.log_info(f"[LOAD_BALANCER] 跳过 Token {token.id}: 预占槽位失败")
+                debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token.id}: slot reservation failed")
                 continue
 
             if track_pending:
                 await self._add_pending(token.id, for_image_generation, for_video_generation)
 
             debug_logger.log_info(
-                f"[LOAD_BALANCER] ✅ 已选择Token {token.id} ({token.email}) - "
-                f"余额: {token.credits}, inflight={item['inflight']}"
+                f"[LOAD_BALANCER] ✅ Selected token {token.id} ({token.email}) - "
+                f"credits: {token.credits}, inflight={item['inflight']}"
             )
             return token
 
-        debug_logger.log_info(f"[LOAD_BALANCER] ❌ 候选Token均不可用 (图片生成={for_image_generation}, 视频生成={for_video_generation})")
+        debug_logger.log_info(f"[LOAD_BALANCER] ❌ No candidate token usable (image={for_image_generation}, video={for_video_generation})")
         return None
 
     @staticmethod
@@ -429,7 +429,7 @@ class LoadBalancer:
         pool: str = "auto",
         client: str = "",
     ) -> Optional[str]:
-        """给出更明确的“无可用账号”原因，优先用于分辨率/tier 档位提示。"""
+        """Give a clearer "no account available" reason, mainly for resolution/tier hints."""
         detail = await self.get_unavailable_detail(
             for_image_generation=for_image_generation,
             for_video_generation=for_video_generation,

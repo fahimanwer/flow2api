@@ -17,7 +17,7 @@ RUN apt-get update \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-# 在镜像构建阶段预装 Playwright Chromium，供 personal/browser 模式复用
+# Pre-install Playwright Chromium at build time (used by the personal/browser captcha modes and the server fallback)
 COPY requirements.txt ./
 
 RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt \

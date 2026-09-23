@@ -45,7 +45,7 @@ class FileCache:
         return self.default_timeout <= 0
 
     def _get_request_fingerprint(self) -> Optional[Dict[str, Any]]:
-        """读取当前请求链路里绑定的浏览器指纹。"""
+        """Read the browser fingerprint bound to the current request."""
         if not self.flow_client or not hasattr(self.flow_client, "get_request_fingerprint"):
             return None
 
@@ -63,7 +63,7 @@ class FileCache:
         media_type: str,
         fingerprint: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """根据媒体类型解析下载代理地址。"""
+        """Pick the download proxy URL based on media type."""
         if isinstance(fingerprint, dict):
             fingerprint_proxy = str(fingerprint.get("proxy_url") or "").strip()
             # Slice B: image/video DOWNLOADS must NOT ride the fingerprint proxy — in
@@ -77,15 +77,15 @@ class FileCache:
             return None
 
         try:
-            # 媒体下载（图片/视频）优先使用独立的上传/下载代理
+            # Media downloads (image/video) prefer the dedicated upload/download proxy
             if media_type in ("image", "video") and hasattr(self.proxy_manager, "get_media_proxy_url"):
                 return await self.proxy_manager.get_media_proxy_url()
 
-            # 其他下载走请求代理
+            # Other downloads use the request proxy
             if hasattr(self.proxy_manager, "get_request_proxy_url"):
                 return await self.proxy_manager.get_request_proxy_url()
 
-            # 向后兼容旧实现
+            # Backward compatibility with the old implementation
             if hasattr(self.proxy_manager, "get_proxy_url"):
                 return await self.proxy_manager.get_proxy_url()
         except Exception as e:
@@ -94,7 +94,7 @@ class FileCache:
         return None
 
     def _guess_extension(self, url: str, media_type: str) -> str:
-        """尽量保留原始扩展名，未知时回退到默认值。"""
+        """Keep the original file extension when possible, else use the default."""
         path = urlparse(url).path or ""
         guessed, _ = mimetypes.guess_type(path)
         suffix = Path(path).suffix.lower()
@@ -130,7 +130,7 @@ class FileCache:
         media_type: str,
         fingerprint: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
-        """构建媒体下载请求头，优先复用当前打码浏览器指纹。"""
+        """Build media download headers, reusing the current captcha browser fingerprint when available."""
         headers = {
             "Accept": (
                 "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
@@ -170,7 +170,7 @@ class FileCache:
         return headers
 
     def _write_cached_content(self, file_path: Path, content: bytes):
-        """先写临时文件，再原子替换，避免并发读到半截文件。"""
+        """Write to a temp file then atomically replace, so concurrent readers never see a partial file."""
         temp_path = file_path.with_suffix(f"{file_path.suffix}.part")
         try:
             with open(temp_path, "wb") as f:
@@ -268,17 +268,17 @@ class FileCache:
         return f"{url_hash}{ext}"
 
     def _normalize_cache_error(self, error: Exception) -> str:
-        """整理缓存错误，避免将底层命令异常直接暴露给用户。"""
+        """Clean up cache errors so raw low-level command errors are not shown to users."""
         if isinstance(error, FileNotFoundError):
             missing_name = Path(getattr(error, "filename", "") or "curl").name or "curl"
-            return f"本机未安装 {missing_name}"
+            return f"{missing_name} is not installed on this machine"
 
         message = str(error or "").strip()
         if not message:
-            return "未知错误"
+            return "unknown error"
 
         if message.startswith("Failed to cache file:"):
-            message = message.split(":", 1)[1].strip() or "未知错误"
+            message = message.split(":", 1)[1].strip() or "unknown error"
 
         return message
 

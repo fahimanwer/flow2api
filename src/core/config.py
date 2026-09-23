@@ -40,8 +40,8 @@ class Config:
 
         if config_path.exists() and not config_path.is_file():
             print(
-                f"[Config] 检测到 {config_path} 不是普通文件，"
-                f"将回退到 {fallback_path.name}。请检查 Docker 挂载或本地配置路径。"
+                f"[Config] {config_path} is not a regular file, "
+                f"falling back to {fallback_path.name}. Check the Docker mount or local config path."
             )
             config_path = fallback_path
         elif not config_path.exists():
@@ -49,8 +49,8 @@ class Config:
 
         if not config_path.is_file():
             raise FileNotFoundError(
-                f"配置文件不存在或不可读取: {config_path}. "
-                f"请确认 config 目录下存在可用的 setting.toml 或 setting_example.toml"
+                f"Config file missing or unreadable: {config_path}. "
+                f"Make sure the config directory has a usable setting.toml or setting_example.toml"
             )
 
         with open(config_path, "rb") as f:
@@ -119,7 +119,7 @@ class Config:
 
     @property
     def flow_image_request_timeout(self) -> int:
-        """图片生成单次 HTTP 请求超时(秒)。"""
+        """Timeout (seconds) for a single image generation HTTP request."""
         default_timeout = min(self.flow_timeout, 40)
         timeout = self._config.get("flow", {}).get(
             "image_request_timeout",
@@ -132,7 +132,7 @@ class Config:
 
     @property
     def flow_image_timeout_retry_count(self) -> int:
-        """图片生成遇到网络超时时的快速重试次数。"""
+        """Quick retries for image generation on a network timeout."""
         retry_count = self._config.get("flow", {}).get("image_timeout_retry_count", 1)
         try:
             return max(0, min(3, int(retry_count)))
@@ -141,7 +141,7 @@ class Config:
 
     @property
     def flow_image_timeout_retry_delay(self) -> float:
-        """图片生成网络超时重试前等待秒数。"""
+        """Seconds to wait before retrying image generation after a network timeout."""
         delay = self._config.get("flow", {}).get("image_timeout_retry_delay", 0.8)
         try:
             return max(0.0, min(5.0, float(delay)))
@@ -150,7 +150,7 @@ class Config:
 
     @property
     def flow_image_timeout_use_media_proxy_fallback(self) -> bool:
-        """网络超时时是否切换媒体代理重试。"""
+        """Whether to retry via the media proxy on a network timeout."""
         return bool(
             self._config.get("flow", {}).get(
                 "image_timeout_use_media_proxy_fallback",
@@ -160,7 +160,7 @@ class Config:
 
     @property
     def flow_image_prefer_media_proxy(self) -> bool:
-        """图片生成是否优先走媒体代理链路。"""
+        """Whether image generation prefers the media proxy path."""
         return bool(
             self._config.get("flow", {}).get(
                 "image_prefer_media_proxy",
@@ -170,7 +170,7 @@ class Config:
 
     @property
     def flow_image_slot_wait_timeout(self) -> float:
-        """图片硬并发槽位等待超时(秒)。"""
+        """Wait timeout (seconds) for an image hard-concurrency slot."""
         timeout = self._config.get("flow", {}).get("image_slot_wait_timeout", 120)
         try:
             return max(1.0, min(600.0, float(timeout)))
@@ -179,7 +179,7 @@ class Config:
 
     @property
     def flow_image_launch_soft_limit(self) -> int:
-        """图片生成前置发车软并发上限(0 表示关闭软整形，仅使用硬并发)。"""
+        """Image pre-launch soft concurrency cap (0 = soft shaping off, hard concurrency only)."""
         value = self._config.get("flow", {}).get("image_launch_soft_limit", 0)
         try:
             return max(0, min(200, int(value)))
@@ -188,7 +188,7 @@ class Config:
 
     @property
     def flow_image_launch_wait_timeout(self) -> float:
-        """图片前置发车软并发等待超时(秒)。"""
+        """Image pre-launch soft concurrency wait timeout (seconds)."""
         timeout = self._config.get("flow", {}).get("image_launch_wait_timeout", 180)
         try:
             return max(1.0, min(600.0, float(timeout)))
@@ -197,7 +197,7 @@ class Config:
 
     @property
     def flow_image_launch_stagger_ms(self) -> int:
-        """图片请求前置发车间隔(毫秒)，用于平滑同批突发。"""
+        """Image request pre-launch spacing (ms), to smooth same-batch bursts."""
         value = self._config.get("flow", {}).get("image_launch_stagger_ms", 0)
         try:
             return max(0, min(5000, int(value)))
@@ -206,7 +206,7 @@ class Config:
 
     @property
     def flow_video_slot_wait_timeout(self) -> float:
-        """视频硬并发槽位等待超时(秒)。"""
+        """Wait timeout (seconds) for a video hard-concurrency slot."""
         timeout = self._config.get("flow", {}).get("video_slot_wait_timeout", 120)
         try:
             return max(1.0, min(600.0, float(timeout)))
@@ -215,7 +215,7 @@ class Config:
 
     @property
     def flow_video_launch_soft_limit(self) -> int:
-        """视频生成前置发车软并发上限(0 表示关闭软整形，仅使用硬并发)。"""
+        """Video pre-launch soft concurrency cap (0 = soft shaping off, hard concurrency only)."""
         value = self._config.get("flow", {}).get("video_launch_soft_limit", 0)
         try:
             return max(0, min(200, int(value)))
@@ -224,7 +224,7 @@ class Config:
 
     @property
     def flow_video_launch_wait_timeout(self) -> float:
-        """视频前置发车软并发等待超时(秒)。"""
+        """Video pre-launch soft concurrency wait timeout (seconds)."""
         timeout = self._config.get("flow", {}).get("video_launch_wait_timeout", 180)
         try:
             return max(1.0, min(600.0, float(timeout)))
@@ -233,7 +233,7 @@ class Config:
 
     @property
     def flow_video_launch_stagger_ms(self) -> int:
-        """视频请求前置发车间隔(毫秒)，用于平滑同批突发。"""
+        """Video request pre-launch spacing (ms), to smooth same-batch bursts."""
         value = self._config.get("flow", {}).get("video_launch_stagger_ms", 0)
         try:
             return max(0, min(5000, int(value)))
@@ -437,11 +437,11 @@ class Config:
 
     @property
     def browser_launch_background(self) -> bool:
-        """有头浏览器打码是否默认后台启动，避免抢占前台窗口。"""
+        """Whether headed-browser captcha starts in the background by default, so it does not steal focus."""
         return self._config.get("captcha", {}).get("browser_launch_background", True)
 
     def set_browser_launch_background(self, enabled: bool):
-        """设置有头浏览器打码是否后台启动。"""
+        """Set whether headed-browser captcha starts in the background."""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["browser_launch_background"] = bool(enabled)
@@ -475,7 +475,7 @@ class Config:
 
     @property
     def browser_count(self) -> int:
-        """浏览器打码实例数量，browser/personal 模式共用。"""
+        """Number of browser captcha instances, shared by browser/personal modes."""
         value = self._config.get("captcha", {}).get("browser_count", 1)
         try:
             return max(1, min(20, int(value)))
@@ -483,14 +483,14 @@ class Config:
             return 1
 
     def set_browser_count(self, value: int):
-        """设置浏览器打码实例数量。"""
+        """Set the number of browser captcha instances."""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["browser_count"] = max(1, min(20, int(value)))
 
     @property
     def browser_recaptcha_settle_seconds(self) -> float:
-        """有头打码在 reload/clr 就绪后的额外等待秒数。"""
+        """Extra seconds headed captcha waits after reload/clr is ready."""
         value = self._config.get("captcha", {}).get("browser_recaptcha_settle_seconds", 3.0)
         try:
             return max(0.0, min(10.0, float(value)))
@@ -507,7 +507,7 @@ class Config:
 
     @property
     def browser_captcha_max_retries(self) -> int:
-        """browser 模式单次打码最大重试次数。"""
+        """Max retries for one solve in browser mode."""
         value = self._config.get("captcha", {}).get("browser_captcha_max_retries", 5)
         try:
             return max(1, min(20, int(value)))
@@ -516,7 +516,7 @@ class Config:
 
     @property
     def browser_captcha_generation_retries(self) -> int:
-        """生成接口因 reCAPTCHA 评估失败时允许的总重试次数。"""
+        """Total retries allowed when generation fails reCAPTCHA evaluation."""
         # 2 (was 6): a reCAPTCHA evaluation failure is a risk signal on the account;
         # retrying six times makes it look worse and burned ~55 s per failed image.
         # Adapted from Gurumigun/flow2api 61e2d013.
@@ -559,16 +559,16 @@ class Config:
 
     @property
     def personal_max_resident_tabs(self) -> int:
-        """内置浏览器打码单实例共享标签页上限"""
+        """Max shared captcha tabs per built-in browser instance"""
         value = self._config.get("captcha", {}).get("personal_max_resident_tabs", 5)
         try:
-            return max(1, min(50, int(value)))  # 限制在1-50之间
+            return max(1, min(50, int(value)))  # Clamp to 1-50
         except Exception:
             return 5
 
     @property
     def personal_project_pool_size(self) -> int:
-        """单个 Token 默认维护的项目池数量，仅影响项目轮换。"""
+        """Default project pool size per token; only affects project rotation."""
         value = self._config.get("captcha", {}).get("personal_project_pool_size", 4)
         try:
             return max(1, min(50, int(value)))
@@ -577,7 +577,7 @@ class Config:
 
     @property
     def personal_idle_tab_ttl_seconds(self) -> int:
-        """内置浏览器打码标签页空闲超时(秒)"""
+        """Built-in browser captcha tab idle timeout (seconds)"""
         value = self._config.get("captcha", {}).get("personal_idle_tab_ttl_seconds", 600)
         try:
             return max(60, int(value))
@@ -586,33 +586,33 @@ class Config:
 
     @property
     def personal_headless(self) -> bool:
-        """personal 内置浏览器是否强制无头；默认按有头模式运行。"""
+        """Whether the personal built-in browser is forced headless; runs headed by default."""
         env_value = os.getenv("PERSONAL_BROWSER_HEADLESS")
         if env_value is not None:
             return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
         return bool(self._config.get("captcha", {}).get("personal_headless", False))
 
     def set_personal_max_resident_tabs(self, value: int):
-        """设置内置浏览器打码单实例共享标签页上限"""
+        """Set the max shared captcha tabs per built-in browser instance"""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["personal_max_resident_tabs"] = max(1, min(50, int(value)))
 
     def set_personal_project_pool_size(self, value: int):
-        """设置单个 Token 默认维护的项目池数量，仅影响项目轮换"""
+        """Set the default project pool size per token; only affects project rotation"""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["personal_project_pool_size"] = max(1, min(50, int(value)))
 
     def set_personal_idle_tab_ttl_seconds(self, value: int):
-        """设置内置浏览器打码标签页空闲超时(秒)"""
+        """Set the built-in browser captcha tab idle timeout (seconds)"""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["personal_idle_tab_ttl_seconds"] = max(60, int(value))
 
     @property
     def browser_personal_fresh_restart_every_n_solves(self) -> int:
-        """内置浏览器成功打码多少次后使用全新 profile 重启，0 表示禁用。"""
+        """Restart the built-in browser with a fresh profile after this many successful solves, 0 = disabled."""
         value = self._config.get("captcha", {}).get("browser_personal_fresh_restart_every_n_solves", 10)
         try:
             return max(0, int(value))
@@ -620,7 +620,7 @@ class Config:
             return 10
 
     def set_browser_personal_fresh_restart_every_n_solves(self, value: int):
-        """设置内置浏览器 fresh profile 轮换阈值。"""
+        """Set the built-in browser fresh-profile rotation threshold."""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["browser_personal_fresh_restart_every_n_solves"] = max(0, int(value))
