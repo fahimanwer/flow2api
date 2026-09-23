@@ -1030,7 +1030,7 @@ async function maybeEnsurePersistentTab() {
       return; // still backing off
     }
   }
-  ensurePersistentTab().catch(() => {});
+  ensurePersistentTab().then(() => maybeEnsureMintTab(), () => {});
 }
 
 /* ------------------------------- minting ----------------------------- */
@@ -1038,33 +1038,75 @@ async function maybeEnsurePersistentTab() {
 // The flow.google.com/about mint tab. Not in the owned-tab registry on purpose:
 // the sweeps and MAX_OWNED_TABS ceiling are about Labs tabs, and this one must
 // never be mistaken for a Labs tab that "drifted off the mint page". Reuses the
-// same tab for every mint (reCAPTCHA stays loaded, so a mint is ~1-2 s); a tab
-// that is gone, discarded by Chrome's memory saver, or navigated away is fixed
-// in place or recreated in the given window (the Labs tab's, so neither tab is
-// ever the last one in a window that the other's removal could close).
-async function ensureMintTab(preferWindowId) {
-  if (mintTabId == null) {
-    const { mintTabId: saved } = await chrome.storage.local.get(["mintTabId"]);
+// same tab for every mint (reCAPTCHA stays loaded, so a mint is ~1-2 s).
+//
+// Ownership rules (Codex review 2026-09-23):
+// - the id lives in chrome.storage.session, which Chrome clears on browser
+//   restart: tab ids are only unique within a session, so a persisted id could
+//   name a staff member's unrelated tab after a restart;
+// - a tracked tab that is no longer on flow.google.com is never navigated or
+//   closed (someone may be using it): it is simply forgotten;
+// - at most ONE mint tab is tracked; a tab we replace is closed first (window-
+//   safe) so failures cannot leak untracked tabs.
+const MINT_TAB_LOAD_MS = 10000;
+
+async function readMintTabId() {
+  if (mintTabId != null) return mintTabId;
+  try {
+    const { mintTabId: saved } = await chrome.storage.session.get(["mintTabId"]);
     if (saved != null) mintTabId = saved;
+  } catch (_) {}
+  return mintTabId;
+}
+
+async function rememberMintTab(id) {
+  mintTabId = id;
+  try {
+    if (id == null) await chrome.storage.session.remove("mintTabId");
+    else await chrome.storage.session.set({ mintTabId: id });
+  } catch (_) {}
+}
+
+function onMintOrigin(tab) { return !!tab && tabUrlOf(tab).startsWith(MINT2_ORIGIN); }
+
+async function ensureMintTab(preferWindowId) {
+  const id = await readMintTabId();
+  let tab = await getTab(id);
+  if (tab && !onMintOrigin(tab)) {
+    // Not ours to steer any more (about:blank while loading is ours; anything else is not).
+    if (tabUrlOf(tab) !== "about:blank" && tabUrlOf(tab) !== "") {
+      await log("WARN", "Mint tab left flow.google.com; forgetting it (not closing it)", { tabId: id, url: shortUrl(tabUrlOf(tab)) });
+      await rememberMintTab(null);
+      tab = null;
+    }
   }
-  let tab = await getTab(mintTabId);
   if (tab && tab.discarded) {
-    try { await chrome.tabs.reload(mintTabId, { bypassCache: false }); await waitForTabComplete(mintTabId); tab = await getTab(mintTabId); } catch (_) { tab = null; }
+    try { await chrome.tabs.reload(id, { bypassCache: false }); await waitForTabComplete(id, MINT_TAB_LOAD_MS); tab = await getTab(id); } catch (_) { tab = null; }
   }
-  if (tab && tabUrlOf(tab).startsWith(MINT2_ORIGIN)) return mintTabId;
+  if (tab && onMintOrigin(tab) && tab.status === "complete") return id;
+  if (tab && onMintOrigin(tab)) {
+    // Still loading (or reload never reported complete): give it its load budget once.
+    await waitForTabComplete(id, MINT_TAB_LOAD_MS);
+    const again = await getTab(id);
+    if (again && onMintOrigin(again)) return id;
+  }
+  // Replace: close what we tracked (window-safe) BEFORE creating, so we never
+  // hold two tabs.
   if (tab) {
-    try {
-      await chrome.tabs.update(mintTabId, { url: MINT2_URL });
-      await waitForTabComplete(mintTabId);
-      const again = await getTab(mintTabId);
-      if (again && tabUrlOf(again).startsWith(MINT2_ORIGIN)) { await sleep(800); return mintTabId; }
-    } catch (_) {}
+    await rememberMintTab(null);
+    if (!(await isLastTabInWindow(tab))) { try { await chrome.tabs.remove(id); } catch (_) {} }
   }
   const created = await createTabSafely(MINT2_URL, preferWindowId);
-  mintTabId = created.id;
-  await chrome.storage.local.set({ mintTabId: created.id });
-  await waitForTabComplete(created.id);
-  await sleep(800);
+  await rememberMintTab(created.id);
+  try { await chrome.tabs.update(created.id, { autoDiscardable: false }); } catch (_) {}
+  await waitForTabComplete(created.id, MINT_TAB_LOAD_MS);
+  const settled = await getTab(created.id);
+  if (!onMintOrigin(settled)) {
+    await rememberMintTab(null);
+    if (settled && !(await isLastTabInWindow(settled))) { try { await chrome.tabs.remove(created.id); } catch (_) {} }
+    throw new Error("mint tab did not reach flow.google.com (" + (tabUrlOf(settled) || "gone") + ")");
+  }
+  await sleep(500);
   await log("INFO", "Mint tab opened on flow.google.com", { tabId: created.id });
   return created.id;
 }
@@ -1072,14 +1114,25 @@ async function ensureMintTab(preferWindowId) {
 // Close the mint tab (never if it is the last tab in its window) and forget it,
 // so the next ensureMintTab() starts fresh. Used after a failed mint attempt.
 async function dropMintTab(why) {
-  const id = mintTabId;
-  mintTabId = null;
-  await chrome.storage.local.remove("mintTabId");
+  const id = await readMintTabId();
   if (id == null) return;
   const tab = await getTab(id);
-  if (!tab) return;
-  if (await isLastTabInWindow(tab)) { await log("INFO", "Left the mint tab open: last tab in its window", { tabId: id, why }); return; }
-  try { await chrome.tabs.remove(id); } catch (_) {}
+  if (tab && await isLastTabInWindow(tab)) {
+    await log("INFO", "Left the mint tab open: last tab in its window", { tabId: id, why });
+  } else if (tab) {
+    try { await chrome.tabs.remove(id); } catch (_) {}
+  }
+  await rememberMintTab(null);
+}
+
+// Warm the mint tab right after the Labs tab, so the first real request does not
+// pay the page load inside the server's 25 s budget.
+async function maybeEnsureMintTab() {
+  try {
+    const labsId = await findUsableLabsTab();
+    const labsTab = await getTab(labsId);
+    await ensureMintTab(labsTab ? labsTab.windowId : undefined);
+  } catch (_) {}
 }
 
 // Mint a reCAPTCHA token in the given tab's MAIN world.
@@ -1108,10 +1161,17 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
       const ok = (t) => done(Object.assign({ ok: true, token: t }, ctx()));
       const fail = (err) => done(Object.assign({ ok: false, err: String(err || "unknown") }, ctx()));
       try {
-        const run = () => {
-          const real = window.__f2aRealExecute;
-          const exec = real ? () => real(siteKey, { action }) : () => grecaptcha.enterprise.execute(siteKey, { action });
+        // pageProvided: reCAPTCHA was already on the page (so its public execute may
+        // be the booby-trapped wrapper). Decide which function to call INSIDE ready,
+        // when the genuine one has had every chance to be captured; never fall back
+        // to the public function on a page-provided instance.
+        const run = (pageProvided) => {
           grecaptcha.enterprise.ready(() => {
+            const real = window.__f2aRealExecute;
+            let exec;
+            if (real) exec = () => real(siteKey, { action });
+            else if (!pageProvided) exec = () => grecaptcha.enterprise.execute(siteKey, { action });
+            else { fail("page loaded reCAPTCHA itself and the genuine execute was not captured (trap)"); return; }
             exec()
               .then((t) => (t ? ok(t) : fail("recaptcha returned an empty token")))
               .catch((e) => fail(e && e.message ? e.message : "recaptcha execute failed"));
@@ -1136,12 +1196,12 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
           const nonced = document.querySelector("script[nonce]");
           if (nonced && nonced.nonce) s.nonce = nonced.nonce;
           s.src = url;
-          s.onload = run;
+          s.onload = () => run(false);
           s.onerror = () => fail("failed to load enterprise.js (blocked by CSP?)");
           (document.head || document.documentElement).appendChild(s);
         };
-        if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise && grecaptcha.enterprise.execute) run();
-        else inject();
+        if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise && grecaptcha.enterprise.execute) run(!window.__f2aInjected);
+        else { try { Object.defineProperty(window, "__f2aInjected", { value: true, enumerable: false, configurable: true }); } catch (_) {} inject(); }
         setTimeout(() => fail("timeout minting recaptcha token"), timeoutMs);
       } catch (e) {
         fail(e && e.message ? e.message : e);
@@ -1170,8 +1230,11 @@ async function handleGetToken(data, settings, responseSocket = ws) {
 
 async function _handleGetToken(data, settings, responseSocket = ws) {
   const action = data.action || "IMAGE_GENERATION";
-  // Video mints take longer (server waits 75 s for VIDEO_GENERATION).
-  const timeoutMs = action === "VIDEO_GENERATION" ? 60000 : 20000;
+  // The server waits 25 s for an image mint and 75 s for a video mint (flow_client
+  // _get_recaptcha_token); everything here — tab loads, retries, the mint itself —
+  // must fit inside that, or the server has already given up while we still work.
+  const deadline = Date.now() + (action === "VIDEO_GENERATION" ? 70000 : 23000);
+  const remaining = () => deadline - Date.now();
   let lastMintError = null; // attempt 1's failure, carried into the replacement log line
 
   // Try up to twice: a stale persistent tab is recreated on the second attempt.
@@ -1182,27 +1245,27 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
       // login_required when the session cookie is gone) and keeps the NextAuth
       // session rolling. Since 2026-09-23 the token itself is minted in the
       // separate flow.google.com tab (see MINT2_URL).
+      if (attempt === 2 && remaining() < 6000) {
+        sendWS({ req_id: data.req_id, status: "error", error: "worker failed: " + String(lastMintError || "") + " (no time left to retry)" }, responseSocket);
+        return;
+      }
       let labsTabId;
       if (settings.tabMode === "ephemeral") {
         ephemeralTabId = await openLabsTab();
         labsTabId = ephemeralTabId;
       } else {
-        if (attempt === 2) {
-          // First mint failed. If the current tab isn't a usable Flow tab, the
-          // breaker/auth gate will handle it; if it IS Flow but still failing,
-          // swap it for a fresh one (no sticky bad tab). Create-then-remove, same
-          // window — never the old remove-then-create that closed the window.
-          labsTabId = await replacePersistentTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
-        } else {
-          labsTabId = await ensurePersistentTab();
-        }
+        // The Labs tab is only the login gate now; a failed mint happened in the
+        // mint tab, so on retry only the mint tab is replaced.
+        labsTabId = await ensurePersistentTab();
       }
       if (attempt === 2) await dropMintTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
       const labsTab = await getTab(labsTabId);
       const tabId = await ensureMintTab(labsTab ? labsTab.windowId : undefined);
 
       await paceMint(settings.mintIntervalMs);
-      const token = await mintTokenInTab(tabId, action, timeoutMs);
+      const mintBudget = Math.min(action === "VIDEO_GENERATION" ? 60000 : 20000, remaining() - 500);
+      if (mintBudget < 2000) throw new Error("no time left to mint (" + Math.round(remaining()) + " ms remaining)");
+      const token = await mintTokenInTab(tabId, action, mintBudget);
       sendWS({ req_id: data.req_id, status: "success", token }, responseSocket);
       return;
     } catch (e) {
@@ -1219,8 +1282,7 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
       }
     } finally {
       if (ephemeralTabId != null) {
-        try { await chrome.tabs.remove(ephemeralTabId); } catch (_) {}
-        await removeOwned(ephemeralTabId);
+        await removeOwnedTabSafely(ephemeralTabId, "ephemeral mint tab");
       }
     }
   }
