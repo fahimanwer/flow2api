@@ -33,6 +33,7 @@ MINT_URL = "https://flow.google.com/about"
 DEFAULT_MINT_DEADLINE_SECONDS = 30.0
 PAGE_LOAD_TIMEOUT_MS = 15000
 EXECUTE_TIMEOUT_MS = 10000
+READY_TIMEOUT_MS = 15000
 IDLE_BROWSER_TTL_SECONDS = 600
 WARMUP_DWELL_SECONDS = 4.0
 
@@ -346,11 +347,21 @@ class FlowPageCaptchaService:
         verdict = await page.evaluate(_INJECT_SCRIPT, [RECAPTCHA_SITE_KEY])
         if not verdict or not verdict.get("ok"):
             raise RuntimeError(f"reCAPTCHA load failed: {(verdict or {}).get('err', 'unknown')}")
-        for _ in range(40):
-            if await page.evaluate("!!(window.grecaptcha&&grecaptcha.enterprise&&grecaptcha.enterprise.execute)"):
-                break
-            await page.wait_for_timeout(250)
+        if not await self._wait_ready(page, READY_TIMEOUT_MS):
+            raise RuntimeError("reCAPTCHA did not become ready after loading")
         slot.dirty = False
+
+    @staticmethod
+    async def _wait_ready(page, timeout_ms: int) -> bool:
+        """grecaptcha.enterprise.execute exists (the inner library has loaded). On a busy
+        box this takes longer than the page load itself, so it gets its own budget."""
+        waited = 0
+        while waited <= timeout_ms:
+            if await page.evaluate("!!(window.grecaptcha&&grecaptcha.enterprise&&grecaptcha.enterprise.execute)"):
+                return True
+            await page.wait_for_timeout(250)
+            waited += 250
+        return False
 
     async def _mint_on_slot(self, slot: _BrowserSlot, action: str, token_id: Optional[int]) -> Optional[str]:
         if slot.browser is None or slot.page is None or slot.page.is_closed():
@@ -358,6 +369,9 @@ class FlowPageCaptchaService:
             await self._launch(slot)
         page = slot.page
         if slot.dirty or not (page.url or "").startswith("https://flow.google.com/"):
+            await self._load_page(slot)
+        elif not await self._wait_ready(page, 5000):
+            slot.dirty = True
             await self._load_page(slot)
         verdict = await page.evaluate(_EXECUTE_SCRIPT, [RECAPTCHA_SITE_KEY, action, EXECUTE_TIMEOUT_MS])
         if verdict and verdict.get("ok") and verdict.get("token"):

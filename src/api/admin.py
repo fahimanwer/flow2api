@@ -164,13 +164,18 @@ def _guess_client_hints_from_user_agent(user_agent: str) -> Dict[str, str]:
 
 
 def _validate_browser_proxy_url_local(proxy_url: str) -> tuple[bool, Optional[str]]:
+    """Accepts one proxy URL or a comma / newline / semicolon separated list (the
+    browser pool rotates through a list; the validator used to reject the very
+    list the settings page had stored, so nothing on that page could be saved)."""
     if not proxy_url:
         return True, None
-    normalized = proxy_url.strip()
-    if not re.match(r"^(http|https|socks5h?|socks5)://", normalized):
-        normalized = f"http://{normalized}"
-    if not re.match(r"^(socks5h?|socks5|http|https)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$", normalized):
-        return False, "代理格式错误"
+    candidates = [p.strip() for p in re.split(r"[,\n;]+", proxy_url) if p.strip()]
+    for candidate in candidates:
+        normalized = candidate
+        if not re.match(r"^(http|https|socks5h?|socks5)://", normalized):
+            normalized = f"http://{normalized}"
+        if not re.match(r"^(socks5h?|socks5|http|https)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$", normalized):
+            return False, f"代理格式错误: {candidate[:60]}"
     return True, None
 
 

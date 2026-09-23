@@ -288,3 +288,11 @@ class OmniApprovalMintFailureTests(unittest.TestCase):
     def test_omni_approval_mint_failure_is_a_mint_failure_not_a_strike(self):
         from src.services.token_manager import _is_captcha_mint_failure
         self.assertTrue(_is_captcha_mint_failure("Failed to obtain reCAPTCHA token (Omni approval stage)"))
+
+
+class ProxyListValidatorTests(unittest.TestCase):
+    def test_comma_separated_proxy_list_is_valid(self):
+        from src.api.admin import _validate_browser_proxy_url_local as v
+        self.assertEqual(v("http://u:p@a.example:8003,http://u:p@a.example:8004")[0], True)
+        self.assertEqual(v("http://u:p@a.example:8003")[0], True)
+        self.assertEqual(v("http://u:p@a.example:8003, not a proxy")[0], False)
