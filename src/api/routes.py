@@ -117,9 +117,16 @@ def _build_model_description(model_config: Dict[str, Any]) -> str:
     """Build a human-readable description for model listing endpoints."""
     description = f"{model_config['type'].capitalize()} generation"
     if model_config["type"] == "image":
-        description += f" - {model_config['model_name']}"
+        description += f" - {model_config['model_name']} · up to 10 reference images · characters (@Name) up to 10"
     else:
         description += f" - {model_config['model_key']}"
+        video_type = model_config.get("video_type")
+        if video_type in ("r2v", "omni"):
+            description += f" · ingredients up to {model_config.get('max_images', 3)} images · characters (@Name) up to 3"
+        elif video_type == "i2v":
+            description += " · start/end frame images · no characters"
+        elif video_type == "t2v":
+            description += " · text only"
     return description
 
 
@@ -886,7 +893,20 @@ async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_fle
     return _build_gemini_model_resource(model, description)
 
 
-@router.post("/v1/chat/completions")
+@router.post(
+    "/v1/chat/completions",
+    summary="Generate an image or video (OpenAI chat format)",
+    description=(
+        "Pick a model from /v1/models. The last user message is the prompt; `image_url` parts are reference "
+        "images (start/end frames for i2v models, ingredients for r2v/omni models, references for image models).\n\n"
+        "**Characters** — to keep a person or object consistent, add `characters` and write `@Name` in the prompt:\n\n"
+        "```json\n{\n  \"model\": \"nano-banana-2-lite-square\",\n  \"messages\": [{\"role\": \"user\", \"content\": "
+        "\"@Maya sits in a sunny cafe, smiling at the camera\"}],\n  \"characters\": [{\"name\": \"Maya\", \"images\": "
+        "[\"data:image/jpeg;base64,...\"]}]\n}\n```\n\n"
+        "Videos with characters need an ingredients model (omni-r2v, omni, omni-flash, veo-r2v, veo-r2v-lite). "
+        "Bad character input answers 400 before anything is generated."
+    ),
+)
 async def create_chat_completion(
     request: ChatCompletionRequest,
     raw_request: Request,

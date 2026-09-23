@@ -1,6 +1,6 @@
 """Data models for Flow2API"""
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List, Union, Any, Literal
 from datetime import datetime
 
@@ -277,10 +277,23 @@ class TokenRefreshConfig(BaseModel):
 
 # OpenAI Compatible Request Models
 class CharacterInput(BaseModel):
-    """A named person/thing built from 1-3 photos, referenced in the prompt as @name (2026-09-23)."""
+    """A character: a named person or thing built from 1-3 photos. Write `@Name` in the
+    prompt and Flow keeps that face/object consistent across images and videos."""
 
-    name: str
-    images: List[str]  # data URLs or http(s) URLs
+    name: str = Field(
+        ...,
+        description="1-40 characters: letters, digits, space, _ or -. Unique per request. Use it in the prompt as @Name.",
+        examples=["Maya"],
+    )
+    images: List[str] = Field(
+        ...,
+        description="1-3 photos of the character, as data URLs (data:image/jpeg;base64,...) or http(s) URLs, up to 12 MB each.",
+        examples=[["data:image/jpeg;base64,/9j/4AAQ...", "https://example.com/maya-side.jpg"]],
+    )
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"name": "Maya", "images": ["data:image/jpeg;base64,/9j/4AAQ...", "https://example.com/maya-side.jpg"]}
+    })
 
 
 class ChatMessage(BaseModel):
@@ -346,7 +359,10 @@ class GeminiGenerateContentRequest(BaseModel):
     contents: List[GeminiContent]
     generationConfig: Optional[GenerationConfigParam] = None
     systemInstruction: Optional[GeminiContent] = None
-    characters: Optional[List[CharacterInput]] = None  # Flow Characters (docs/flow-characters.md)
+    characters: Optional[List[CharacterInput]] = Field(
+        default=None,
+        description="Flow Characters (same as on /v1/chat/completions): name + 1-3 photos each, referenced as @Name in the prompt.",
+    )
 
     model_config = ConfigDict(extra="allow")
 
@@ -365,6 +381,14 @@ class ChatCompletionRequest(BaseModel):
     # Gemini extension parameters (from extra_body or top-level)
     generationConfig: Optional[GenerationConfigParam] = None
     contents: Optional[List[Any]] = None  # Gemini native contents
-    characters: Optional[List[CharacterInput]] = None  # Flow Characters (docs/flow-characters.md)
+    characters: Optional[List[CharacterInput]] = Field(
+        default=None,
+        description=(
+            "Flow Characters: people/objects that must look the same across generations. Give each a name and 1-3 "
+            "photos, then write @Name in the prompt (e.g. \"@Maya sits in a sunny cafe\"). Images: up to 10 characters. "
+            "Videos: up to 3, only on ingredients models (omni-r2v, omni, omni-flash, veo-r2v, veo-r2v-lite). "
+            "Character photos are NOT reference images; you may still add image_url parts as ordinary references."
+        ),
+    )
 
     model_config = ConfigDict(extra="allow")  # Allow extra fields like extra_body passthrough
