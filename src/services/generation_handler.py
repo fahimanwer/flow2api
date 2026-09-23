@@ -19,6 +19,15 @@ from ..core.account_tiers import (
 )
 from .file_cache import FileCache
 from .watermark_remover import clean_image_bytes
+from .characters import (
+    MAX_CHARACTERS_IMAGE,
+    MAX_CHARACTERS_VIDEO,
+    CharacterService,
+    CharacterSetupError,
+    LoadedCharacter,
+    build_prompt_parts,
+    validate_characters,
+)
 
 
 # Reference-image limits, from Flow's own model list (GET aisandbox-pa /v1/flow/models,
@@ -1395,6 +1404,7 @@ class GenerationHandler:
         video_media_id: Optional[str] = None,
         pool: str = "auto",
         client: str = "",
+        characters: Optional[List[LoadedCharacter]] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1445,6 +1455,8 @@ class GenerationHandler:
         if generation_type == "video":
             request_payload["video_duration_seconds"] = model_config.get("reference_duration")
             request_payload["video_credit_cost"] = _estimate_video_credit_cost_for_log(model, model_config)
+        if characters:
+            request_payload["characters"] = [{"name": c.name, "images": len(c.images)} for c in characters]
         debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}...")
 
         # Create the request log BEFORE any network work, for streaming and
@@ -1608,7 +1620,8 @@ class GenerationHandler:
                     generation_result=generation_result,
                     response_state=response_state,
                     request_log_state=request_log_state,
-                    pending_token_state=pending_token_state
+                    pending_token_state=pending_token_state,
+                    characters=characters,
                 ):
                     yield chunk
             else:  # video
@@ -1621,6 +1634,7 @@ class GenerationHandler:
                     request_log_state=request_log_state,
                     pending_token_state=pending_token_state,
                     video_media_id=video_media_id,
+                    characters=characters,
                 ):
                     yield chunk
             perf_trace["generation_pipeline_ms"] = int((time.time() - generation_pipeline_started_at) * 1000)
@@ -1848,7 +1862,8 @@ class GenerationHandler:
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
-        pending_token_state: Optional[Dict[str, bool]] = None
+        pending_token_state: Optional[Dict[str, bool]] = None,
+        characters: Optional[List[LoadedCharacter]] = None,
     ) -> AsyncGenerator:
         """处理图片生成 (同步返回)"""
         reset_mint = getattr(self.flow_client, "reset_mint_context", None)
@@ -1873,6 +1888,30 @@ class GenerationHandler:
             await self._update_request_log_progress(request_log_state, token_id=token.id, status_text="uploading_images", progress=28)
         else:
             await self._update_request_log_progress(request_log_state, token_id=token.id, status_text="submitting_image", progress=28)
+
+        # Flow Characters: validated and created BEFORE any upload or generation, so a bad
+        # request or a Google-side setup failure costs nothing and is never an account strike.
+        character_entities: Dict[str, str] = {}
+        if characters:
+            char_error = validate_characters(characters, MAX_CHARACTERS_IMAGE)
+            if char_error:
+                self._mark_generation_failed(generation_result, char_error)
+                yield self._create_error_response(char_error, status_code=400)
+                return
+            try:
+                characters_started_at = time.time()
+                if stream:
+                    yield self._create_stream_chunk(f"Preparing {len(characters)} character(s)...\n")
+                character_entities = await CharacterService.get_instance().ensure(
+                    self.flow_client, self.db, token, project_id, characters
+                )
+                if image_trace is not None:
+                    image_trace["characters_ms"] = int((time.time() - characters_started_at) * 1000)
+            except CharacterSetupError as exc:
+                self._mark_generation_failed(generation_result, str(exc))
+                yield self._create_error_response(str(exc), status_code=exc.status_code)
+                return
+        prompt_parts, reference_entities = (build_prompt_parts(prompt, character_entities) if character_entities else (None, None))
 
         try:
             # 上传图片 (如果有)
@@ -1930,6 +1969,8 @@ class GenerationHandler:
                 token_id=token.id,
                 token_image_concurrency=token.image_concurrency,
                 progress_callback=_image_progress_callback,
+                prompt_parts=prompt_parts,
+                reference_entities=reference_entities,
             )
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
@@ -2171,6 +2212,7 @@ class GenerationHandler:
         request_log_state: Optional[Dict[str, Any]] = None,
         pending_token_state: Optional[Dict[str, bool]] = None,
         video_media_id: Optional[str] = None,
+        characters: Optional[List[LoadedCharacter]] = None,
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""
         reset_mint = getattr(self.flow_client, "reset_mint_context", None)
@@ -2220,6 +2262,23 @@ class GenerationHandler:
             # 图片数量
             image_count = len(images) if images else 0
 
+            # Flow Characters: only ingredients models can carry them; omni* is forced onto the
+            # reference route (a first/last-frame video cannot reference a character).
+            character_entities: Dict[str, str] = {}
+            if characters:
+                if video_type not in ("r2v", "omni"):
+                    error_msg = "Characters need an ingredients model (omni-r2v, omni, veo-r2v, veo-r2v-lite)"
+                    self._mark_generation_failed(generation_result, error_msg)
+                    yield self._create_error_response(error_msg, status_code=400)
+                    return
+                char_error = validate_characters(characters, MAX_CHARACTERS_VIDEO)
+                if char_error:
+                    self._mark_generation_failed(generation_result, char_error)
+                    yield self._create_error_response(char_error, status_code=400)
+                    return
+                if video_type == "omni":
+                    model_config["reference_only"] = True
+
             # ========== 验证和处理图片 ==========
 
             # T2V: 文生视频 - 不支持图片
@@ -2233,7 +2292,7 @@ class GenerationHandler:
 
             # Omni: 无图走 T2V，有图走当前上游 Reference Images 直连链路
             elif video_type == "omni":
-                if model_config.get("reference_only") and image_count < 1:
+                if model_config.get("reference_only") and image_count < 1 and not characters:
                     error_msg = "Omni ingredients models need at least 1 reference image"
                     if stream:
                         yield self._create_stream_chunk(f"{error_msg}\n")
@@ -2267,6 +2326,22 @@ class GenerationHandler:
                     self._mark_generation_failed(generation_result, error_msg)
                     yield self._create_error_response(error_msg, status_code=400)
                     return
+
+            if characters:
+                try:
+                    characters_started_at = time.time()
+                    if stream:
+                        yield self._create_stream_chunk(f"Preparing {len(characters)} character(s)...\n")
+                    character_entities = await CharacterService.get_instance().ensure(
+                        self.flow_client, self.db, token, project_id, characters
+                    )
+                    if video_trace is not None:
+                        video_trace["characters_ms"] = int((time.time() - characters_started_at) * 1000)
+                except CharacterSetupError as exc:
+                    self._mark_generation_failed(generation_result, str(exc))
+                    yield self._create_error_response(str(exc), status_code=exc.status_code)
+                    return
+            prompt_parts, reference_entities = (build_prompt_parts(prompt, character_entities) if character_entities else (None, None))
 
             # ========== 上传图片 ==========
             start_media_id = None
@@ -2377,7 +2452,7 @@ class GenerationHandler:
                     )
 
             # R2V: 多图生成
-            elif video_type == "r2v" and reference_images:
+            elif video_type == "r2v" and (reference_images or character_entities):
                 result = await self.flow_client.generate_video_reference_images(
                     at=token.at,
                     project_id=project_id,
@@ -2388,6 +2463,8 @@ class GenerationHandler:
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
+                    prompt_parts=prompt_parts,
+                    reference_entities=reference_entities,
                 )
 
             # Omni: 有图走 Reference Images 直连链路，无图走纯文本链路
@@ -2427,7 +2504,7 @@ class GenerationHandler:
                     )
 
             # Omni 1.1: three or more images → reference-images route.
-            elif video_type == "omni" and reference_images:
+            elif video_type == "omni" and (reference_images or character_entities):
                 if stream:
                     yield self._create_stream_chunk("提交 Omni 参考图视频任务...\n")
                 result = await self.flow_client.generate_video_reference_images(
@@ -2440,6 +2517,8 @@ class GenerationHandler:
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
+                    prompt_parts=prompt_parts,
+                    reference_entities=reference_entities,
                 )
 
             # Extend: 视频续写

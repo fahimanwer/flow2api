@@ -4,6 +4,7 @@ import json
 import contextvars
 import time
 import uuid
+import urllib.parse
 import random
 import base64
 import gzip
@@ -1690,6 +1691,8 @@ class FlowClient:
         token_id: Optional[int] = None,
         token_image_concurrency: Optional[int] = None,
         progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
+        prompt_parts: Optional[List[Dict[str, Any]]] = None,
+        reference_entities: Optional[List[str]] = None,
     ) -> tuple[dict, str, Dict[str, Any]]:
         """生成图片(同步返回)
 
@@ -1792,12 +1795,15 @@ class FlowClient:
                 "imageModelName": model_name,
                 "imageAspectRatio": aspect_ratio,
                 "structuredPrompt": {
-                    "parts": [{
+                    "parts": prompt_parts or [{
                         "text": prompt
                     }]
                 },
                 "imageInputs": image_inputs or []
             }
+            if reference_entities:
+                # Flow Characters: named entities the prompt refers to (@Name -> entity part above)
+                request_data["referenceEntities"] = [{"entityId": eid} for eid in reference_entities]
 
             json_data = {
                 "clientContext": client_context,
@@ -1958,11 +1964,13 @@ class FlowClient:
                 return name.strip()
         return None
 
-    def _build_video_text_input(self, prompt: str, use_v2_model_config: bool = False) -> Dict[str, Any]:
+    def _build_video_text_input(
+        self, prompt: str, use_v2_model_config: bool = False, prompt_parts: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
         # 当前 Flow 上游视频链路统一使用 structuredPrompt，不再兼容旧 prompt 字段。
         return {
             "structuredPrompt": {
-                "parts": [{
+                "parts": prompt_parts or [{
                     "text": prompt
                 }]
             }
@@ -2753,6 +2761,35 @@ class FlowClient:
             raise RuntimeError(f"flow.createEntity 响应缺少 entityId: keys={list(result.keys())}")
         return entity_id
 
+    async def create_character_entity(self, at: str, project_id: str, display_name: str, account_id: Optional[str] = None) -> str:
+        """Flow Characters (2026-09-23): create an empty CHARACTER entity in the project; photos are
+        attached afterwards with copy_project_media_to_character_slot. Returns the entityId."""
+        payload = {
+            "entity": {
+                "projectId": project_id,
+                "entityInfo": {"entityType": "CHARACTER", "displayName": display_name, "characterInfo": {}},
+            }
+        }
+        result = await self._aisandbox_request(
+            "POST", "/flow/entities", at=at, raw_body=self._compact_json_dumps(payload), account_id=account_id,
+        )
+        entity_id = ((result or {}).get("entity") or {}).get("entityId") if isinstance(result, dict) else None
+        if not entity_id:
+            raise RuntimeError(f"Flow createEntity returned no entityId: {str(result)[:200]}")
+        return str(entity_id)
+
+    async def batch_get_entities(self, at: str, entity_ids: List[str], account_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """GET /flow/entities:batchGet -> the `results` list, one item per id
+        ({"entity": …} or {"error": {"code": 5, …}} for a missing one)."""
+        if not entity_ids:
+            return []
+        query = "&".join(f"entityIds={urllib.parse.quote(str(e), safe='')}" for e in entity_ids)
+        result = await self._aisandbox_request(
+            "GET", f"/flow/entities:batchGet?{query}", at=at, account_id=account_id,
+        )
+        results = (result or {}).get("results") if isinstance(result, dict) else None
+        return list(results) if isinstance(results, list) else []
+
     async def copy_project_media_to_character_slot(
         self,
         at: str,
@@ -3107,6 +3144,8 @@ class FlowClient:
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        prompt_parts: Optional[List[Dict[str, Any]]] = None,
+        reference_entities: Optional[List[str]] = None,
     ) -> dict:
         """图生视频,返回task_id
 
@@ -3193,9 +3232,10 @@ class FlowClient:
                 "requests": [{
                     "aspectRatio": aspect_ratio,
                     "seed": request_seed,
-                    "textInput": self._build_video_text_input(prompt, use_v2_model_config=True),
+                    "textInput": self._build_video_text_input(prompt, use_v2_model_config=True, prompt_parts=prompt_parts),
                     "videoModelKey": model_key,
                     "referenceImages": reference_images,
+                    **({"referenceEntities": [{"entityId": eid} for eid in reference_entities]} if reference_entities else {}),
                     "metadata": {}
                 }],
                 "useV2ModelConfig": True

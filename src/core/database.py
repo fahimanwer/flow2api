@@ -886,6 +886,20 @@ class Database:
                 "INSERT OR IGNORE INTO client_policies (client, image_tier, video_tier, note) VALUES (?, ?, ?, ?)",
                 ("default", "any", "any", "Callers with no X-Flow-Client header. 'any' = unchanged behaviour."),
             )
+            # Flow Characters cache (2026-09-23): one row per account+project+name+photo digest,
+            # written only after the entity exists with all its photos (docs/flow-characters.md).
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS flow_characters (
+                    token_id INTEGER NOT NULL,
+                    project_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    images_sha256 TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (token_id, project_id, name, images_sha256)
+                )
+            """)
             await db.execute(
                 "INSERT OR IGNORE INTO client_policies (client, image_tier, video_tier, note) VALUES (?, ?, ?, ?)",
                 ("pinterest-factory", "ultra", "ultra", "Pin images must be watermark-free: Ultra accounts only."),
@@ -1531,6 +1545,43 @@ class Database:
             await db.commit()
             return cur.rowcount if cur.rowcount is not None else 0
 
+    # ---- Flow Characters cache (docs/flow-characters.md) ----
+    async def get_flow_character(self, token_id: int, project_id: str, name: str, images_sha256: str) -> Optional[Dict[str, Any]]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM flow_characters WHERE token_id = ? AND project_id = ? AND name = ? AND images_sha256 = ?",
+                (token_id, project_id, name, images_sha256),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def upsert_flow_character(self, token_id: int, project_id: str, name: str, images_sha256: str, entity_id: str):
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "INSERT INTO flow_characters (token_id, project_id, name, images_sha256, entity_id, created_at, last_used_at) "
+                "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(token_id, project_id, name, images_sha256) DO UPDATE SET entity_id = excluded.entity_id, last_used_at = CURRENT_TIMESTAMP",
+                (token_id, project_id, name, images_sha256, entity_id),
+            )
+            await db.commit()
+
+    async def touch_flow_character(self, token_id: int, project_id: str, name: str, images_sha256: str):
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "UPDATE flow_characters SET last_used_at = CURRENT_TIMESTAMP WHERE token_id = ? AND project_id = ? AND name = ? AND images_sha256 = ?",
+                (token_id, project_id, name, images_sha256),
+            )
+            await db.commit()
+
+    async def delete_flow_character(self, token_id: int, project_id: str, name: str, images_sha256: str):
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "DELETE FROM flow_characters WHERE token_id = ? AND project_id = ? AND name = ? AND images_sha256 = ?",
+                (token_id, project_id, name, images_sha256),
+            )
+            await db.commit()
+
     async def delete_token(self, token_id: int):
         """Delete token and related data"""
         async with self._connect(write=True) as db:
@@ -1538,6 +1589,7 @@ class Database:
             await db.execute("DELETE FROM tasks WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM token_stats WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM projects WHERE token_id = ?", (token_id,))
+            await db.execute("DELETE FROM flow_characters WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
             await db.commit()
 
@@ -1578,6 +1630,7 @@ class Database:
         """Delete project"""
         async with self._connect(write=True) as db:
             await db.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
+            await db.execute("DELETE FROM flow_characters WHERE project_id = ?", (project_id,))
             await db.commit()
 
     # Task operations

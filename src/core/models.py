@@ -276,6 +276,13 @@ class TokenRefreshConfig(BaseModel):
 
 
 # OpenAI Compatible Request Models
+class CharacterInput(BaseModel):
+    """A named person/thing built from 1-3 photos, referenced in the prompt as @name (2026-09-23)."""
+
+    name: str
+    images: List[str]  # data URLs or http(s) URLs
+
+
 class ChatMessage(BaseModel):
     """Chat message"""
 
@@ -339,6 +346,7 @@ class GeminiGenerateContentRequest(BaseModel):
     contents: List[GeminiContent]
     generationConfig: Optional[GenerationConfigParam] = None
     systemInstruction: Optional[GeminiContent] = None
+    characters: Optional[List[CharacterInput]] = None  # Flow Characters (docs/flow-characters.md)
 
     model_config = ConfigDict(extra="allow")
 
@@ -357,5 +365,6 @@ class ChatCompletionRequest(BaseModel):
     # Gemini extension parameters (from extra_body or top-level)
     generationConfig: Optional[GenerationConfigParam] = None
     contents: Optional[List[Any]] = None  # Gemini native contents
+    characters: Optional[List[CharacterInput]] = None  # Flow Characters (docs/flow-characters.md)
 
     model_config = ConfigDict(extra="allow")  # Allow extra fields like extra_body passthrough

@@ -587,3 +587,6 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=TheSmallHanCat/flow2api&type=date&legend=top-left)](https://star-history.dera.page/#TheSmallHanCat/flow2api&type=date&legend=top-left)
 
+## Characters (consistent people / objects)
+
+Send `characters: [{"name": "Maya", "images": [...]}]` with a request and write `@Maya` in the prompt. See [docs/flow-characters.md](docs/flow-characters.md).

@@ -23,6 +23,7 @@ from ..core.models import (
     GeminiGenerateContentRequest,
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
+from ..services.characters import MAX_PHOTOS_PER_CHARACTER, LoadedCharacter
 from ..services.browser_captcha_extension import ExtensionCaptchaService
 
 router = APIRouter()
@@ -81,6 +82,23 @@ class NormalizedGenerationRequest:
     images: List[bytes]
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
+    characters: Optional[List[LoadedCharacter]] = None
+
+
+async def _load_characters(raw: Optional[List[Any]]) -> Optional[List[LoadedCharacter]]:
+    """Turn request `characters` (name + image URLs) into bytes. Shared by every entry point."""
+    if not raw:
+        return None
+    loaded: List[LoadedCharacter] = []
+    for item in raw:
+        name = item.get("name") if isinstance(item, dict) else getattr(item, "name", None)
+        images = item.get("images") if isinstance(item, dict) else getattr(item, "images", None)
+        if not isinstance(name, str) or not isinstance(images, list):
+            raise HTTPException(status_code=400, detail="Each character needs a 'name' and an 'images' list")
+        if len(images) > MAX_PHOTOS_PER_CHARACTER:
+            raise HTTPException(status_code=400, detail=f"Character {name!r}: at most {MAX_PHOTOS_PER_CHARACTER} photos")
+        loaded.append(LoadedCharacter(name=name, images=[await _load_image_bytes_from_uri(u) for u in images]))
+    return loaded
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -441,12 +459,14 @@ async def _normalize_openai_request(
             images=images,
             messages=request.messages,
             video_media_id=video_media_id,
+            characters=await _load_characters(request.characters),
         )
 
     if request.contents:
         gemini_request = GeminiGenerateContentRequest(
             contents=_coerce_gemini_contents(request.contents),
             generationConfig=request.generationConfig,
+            characters=request.characters,
         )
         normalized = await _normalize_gemini_request(request.model, gemini_request)
         normalized.messages = request.messages
@@ -482,6 +502,7 @@ async def _normalize_gemini_request(
         model=resolved_model,
         prompt=prompt,
         images=images,
+        characters=await _load_characters(request.characters),
     )
 
 
@@ -493,6 +514,7 @@ async def _collect_non_stream_result(
     video_media_id: Optional[str] = None,
     pool: str = "auto",
     client: str = "",
+    characters: Optional[List[LoadedCharacter]] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -505,6 +527,7 @@ async def _collect_non_stream_result(
         video_media_id=video_media_id,
         pool=pool,
         client=client,
+        characters=characters,
     ):
         result = chunk
 
@@ -738,6 +761,7 @@ async def _iterate_openai_stream(
         video_media_id=normalized.video_media_id,
         pool=pool,
         client=client,
+        characters=normalized.characters,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -764,6 +788,7 @@ async def _iterate_gemini_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
         client=client,
+        characters=normalized.characters,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -902,6 +927,7 @@ async def create_chat_completion(
                 video_media_id=normalized.video_media_id,
                 pool=pool,
                 client=client,
+                characters=normalized.characters,
             )
         )
         return _build_openai_json_response(payload)
@@ -939,6 +965,7 @@ async def generate_content(
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
                     client=client,
+                    characters=normalized.characters,
                 )
             )
         )
