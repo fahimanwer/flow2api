@@ -35,6 +35,8 @@ PAGE_LOAD_TIMEOUT_MS = 15000
 EXECUTE_TIMEOUT_MS = 10000
 READY_TIMEOUT_MS = 15000
 IDLE_BROWSER_TTL_SECONDS = 600
+IDLE_PAGE_PARK_SECONDS = 60      # park a warm page on about:blank after this (the /about page animates = CPU)
+_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 WARMUP_DWELL_SECONDS = 4.0
 
 _PROXY_RE = re.compile(r"^(https?|socks5h?)://(?:([^:]+):([^@]+)@)?([^:/]+):(\d+)/?$")
@@ -98,6 +100,16 @@ def _parse_proxy(proxy_url: str) -> Optional[Dict[str, str]]:
         out["username"] = user
         out["password"] = password or ""
     return out
+
+
+async def _block_heavy_resources(route) -> None:
+    try:
+        if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+        else:
+            await route.continue_()
+    except Exception:
+        pass
 
 
 class _BrowserSlot:
@@ -345,6 +357,8 @@ class FlowPageCaptchaService:
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-http2", "--disable-quic",
             "--disable-blink-features=AutomationControlled", "--lang=en-US", "--window-size=1280,800",
             "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
+            # Xvfb has no GPU: the GPU process and its software compositor only burn CPU.
+            "--disable-gpu", "--disable-software-rasterizer",
         ]
         exe = self._executable
         try:
@@ -355,7 +369,13 @@ class FlowPageCaptchaService:
                 bypass_csp=True, viewport={"width": 1280, "height": 800}, locale="en-US", timezone_id="Asia/Kolkata",
             )
             await slot.context.add_init_script(_INIT_SCRIPT)
+            # The mint page only needs its scripts: no images/media/fonts, no animations.
+            await slot.context.route("**/*", _block_heavy_resources)
             slot.page = await slot.context.new_page()
+            try:
+                await slot.page.emulate_media(reduced_motion="reduce")
+            except Exception:
+                pass
             slot.dirty = True
             self.stats["launches"] += 1
         except BaseException:
@@ -442,6 +462,17 @@ class FlowPageCaptchaService:
                 if (not config.captcha_server_fallback_enabled) or over_cap or now - slot.last_used > ttl_seconds:
                     await self._close_slot(url, "disabled" if not config.captcha_server_fallback_enabled else ("over cap" if over_cap else "idle"))
                     closed += 1
+                elif (
+                    slot.page is not None and not slot.dirty
+                    and now - slot.last_used > IDLE_PAGE_PARK_SECONDS
+                ):
+                    # Keep the browser (launch is the expensive part) but stop the page
+                    # from rendering Flow's animated /about while nobody needs a token.
+                    try:
+                        await asyncio.wait_for(slot.page.goto("about:blank"), timeout=5)
+                    except Exception:
+                        pass
+                    slot.dirty = True
         return closed
 
     async def run_idle_sweeper(self, interval_seconds: float = 60.0) -> None:
