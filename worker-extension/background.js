@@ -36,6 +36,15 @@ const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 // SAME site key, and keeps the same NextAuth session alive (/fx/api/auth/session)
 // for migrated and non-migrated accounts alike — so that is where we mint.
 const MINT_URL = "https://labs.google/fx";
+// 2026-09-23: Google's backend now accepts ONLY tokens minted on flow.google.com
+// (a labs.google-hosted token is refused: "reCAPTCHA evaluation failed"), and the
+// flow.google.com app booby-traps grecaptcha.enterprise.execute (see
+// recaptcha_hook.js). So the Labs tab above stays for the session cookie only, and
+// minting happens in a SEPARATE, unowned tab on flow.google.com/about — a page that
+// does not load reCAPTCHA itself, where we load it with the same site key (Trusted
+// Types policy + the page's own script nonce satisfy its CSP).
+const MINT2_URL = "https://flow.google.com/about";
+const MINT2_ORIGIN = "https://flow.google.com/";
 // A tab is "on Flow" (not bounced to login/consent) on either origin, so a
 // redirect to flow.google.com is never mistaken for a sign-out ...
 const FLOW_ORIGINS = ["https://labs.google/fx", "https://flow.google.com"];
@@ -103,6 +112,7 @@ let lastReloadAt = 0;     // timestamp of last proactive reload (in-mem rate cap
 let heartbeatInterval = null;
 let reconnectTimer = null;
 let persistentTabId = null;           // in-memory cache of the live persistent tab id
+let mintTabId = null;                 // the flow.google.com/about mint tab (NOT owned; sweeps ignore it)
 let tokenQueue = Promise.resolve();   // serialize token requests
 let ensureChain = Promise.resolve();  // serialize persistent-tab ensures within this SW life
 let ownedQueue = Promise.resolve();   // serialize owned-tab-id storage mutations
@@ -1025,7 +1035,61 @@ async function maybeEnsurePersistentTab() {
 
 /* ------------------------------- minting ----------------------------- */
 
-// Run grecaptcha.enterprise.execute in the given tab's MAIN world.
+// The flow.google.com/about mint tab. Not in the owned-tab registry on purpose:
+// the sweeps and MAX_OWNED_TABS ceiling are about Labs tabs, and this one must
+// never be mistaken for a Labs tab that "drifted off the mint page". Reuses the
+// same tab for every mint (reCAPTCHA stays loaded, so a mint is ~1-2 s); a tab
+// that is gone, discarded by Chrome's memory saver, or navigated away is fixed
+// in place or recreated in the given window (the Labs tab's, so neither tab is
+// ever the last one in a window that the other's removal could close).
+async function ensureMintTab(preferWindowId) {
+  if (mintTabId == null) {
+    const { mintTabId: saved } = await chrome.storage.local.get(["mintTabId"]);
+    if (saved != null) mintTabId = saved;
+  }
+  let tab = await getTab(mintTabId);
+  if (tab && tab.discarded) {
+    try { await chrome.tabs.reload(mintTabId, { bypassCache: false }); await waitForTabComplete(mintTabId); tab = await getTab(mintTabId); } catch (_) { tab = null; }
+  }
+  if (tab && tabUrlOf(tab).startsWith(MINT2_ORIGIN)) return mintTabId;
+  if (tab) {
+    try {
+      await chrome.tabs.update(mintTabId, { url: MINT2_URL });
+      await waitForTabComplete(mintTabId);
+      const again = await getTab(mintTabId);
+      if (again && tabUrlOf(again).startsWith(MINT2_ORIGIN)) { await sleep(800); return mintTabId; }
+    } catch (_) {}
+  }
+  const created = await createTabSafely(MINT2_URL, preferWindowId);
+  mintTabId = created.id;
+  await chrome.storage.local.set({ mintTabId: created.id });
+  await waitForTabComplete(created.id);
+  await sleep(800);
+  await log("INFO", "Mint tab opened on flow.google.com", { tabId: created.id });
+  return created.id;
+}
+
+// Close the mint tab (never if it is the last tab in its window) and forget it,
+// so the next ensureMintTab() starts fresh. Used after a failed mint attempt.
+async function dropMintTab(why) {
+  const id = mintTabId;
+  mintTabId = null;
+  await chrome.storage.local.remove("mintTabId");
+  if (id == null) return;
+  const tab = await getTab(id);
+  if (!tab) return;
+  if (await isLastTabInWindow(tab)) { await log("INFO", "Left the mint tab open: last tab in its window", { tabId: id, why }); return; }
+  try { await chrome.tabs.remove(id); } catch (_) {}
+}
+
+// Mint a reCAPTCHA token in the given tab's MAIN world.
+//
+// On flow.google.com/about the page does not load reCAPTCHA, so we load
+// enterprise.js ourselves: the page's CSP needs a Trusted Types policy for the
+// script URL and the page's own nonce on the <script>. If the page HAS loaded
+// reCAPTCHA (a project page, or /about in a future build), its public execute is
+// the booby-trapped wrapper — recaptcha_hook.js captured the genuine one at
+// document_start as window.__f2aRealExecute, and that is what we call.
 //
 // The injected function NEVER rejects. A rejected promise does not survive the
 // executeScript boundary — Chrome hands back `result: undefined` and the reason is
@@ -1039,36 +1103,45 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
     world: "MAIN",
     func: (siteKey, action, timeoutMs) => new Promise((resolve) => {
       let settled = false;
-      const ctx = () => ({ url: location.href, hadGrecaptcha: typeof grecaptcha !== "undefined" });
+      const ctx = () => ({ url: location.href, hadGrecaptcha: typeof grecaptcha !== "undefined", real: !!window.__f2aRealExecute });
       const done = (v) => { if (!settled) { settled = true; resolve(v); } };
       const ok = (t) => done(Object.assign({ ok: true, token: t }, ctx()));
       const fail = (err) => done(Object.assign({ ok: false, err: String(err || "unknown") }, ctx()));
       try {
         const run = () => {
+          const real = window.__f2aRealExecute;
+          const exec = real ? () => real(siteKey, { action }) : () => grecaptcha.enterprise.execute(siteKey, { action });
           grecaptcha.enterprise.ready(() => {
-            grecaptcha.enterprise.execute(siteKey, { action })
+            exec()
               .then((t) => (t ? ok(t) : fail("recaptcha returned an empty token")))
               .catch((e) => fail(e && e.message ? e.message : "recaptcha execute failed"));
           });
         };
         const inject = () => {
+          // trustedtypes=true makes the loader insert its own inner script through a
+          // Trusted Types policy; without it the loader loads but reCAPTCHA never
+          // initialises under flow.google.com's CSP (mint hangs to timeout).
+          let url = "https://www.google.com/recaptcha/enterprise.js?trustedtypes=true&render=" + siteKey;
+          try {
+            if (window.trustedTypes && trustedTypes.createPolicy) {
+              let pol = window.__f2aTrustedTypes;
+              if (!pol) {
+                pol = trustedTypes.createPolicy("f2a-recaptcha", { createScriptURL: (u) => u });
+                Object.defineProperty(window, "__f2aTrustedTypes", { value: pol, enumerable: false, configurable: true });
+              }
+              url = pol.createScriptURL(url);
+            }
+          } catch (e) { fail("trusted types policy refused: " + (e && e.message ? e.message : e)); return; }
           const s = document.createElement("script");
-          s.src = "https://www.google.com/recaptcha/enterprise.js?render=" + siteKey;
+          const nonced = document.querySelector("script[nonce]");
+          if (nonced && nonced.nonce) s.nonce = nonced.nonce;
+          s.src = url;
           s.onload = run;
-          s.onerror = () => fail("failed to load enterprise.js");
-          document.head.appendChild(s);
+          s.onerror = () => fail("failed to load enterprise.js (blocked by CSP?)");
+          (document.head || document.documentElement).appendChild(s);
         };
-        // The page loads grecaptcha itself (labs.google/fx does so within ~250 ms of
-        // load). Give it up to 8 s before falling back to injecting the script — on a
-        // Trusted-Types page (flow.google.com) injection is blocked and fails loudly.
-        const started = Date.now();
-        const waitForPage = () => {
-          if (settled) return;
-          if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) { run(); return; }
-          if (Date.now() - started > 8000) { inject(); return; }
-          setTimeout(waitForPage, 200);
-        };
-        waitForPage();
+        if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise && grecaptcha.enterprise.execute) run();
+        else inject();
         setTimeout(() => fail("timeout minting recaptcha token"), timeoutMs);
       } catch (e) {
         fail(e && e.message ? e.message : e);
@@ -1081,7 +1154,7 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
   // No verdict at all means the injection itself failed (tab navigated away, no
   // host permission) — say that rather than blaming reCAPTCHA.
   if (!r) throw new Error("mint injection returned nothing (tab gone or not injectable)");
-  throw new Error(`${r.err} [url=${r.url}, grecaptcha=${r.hadGrecaptcha ? "present" : "absent"}]`);
+  throw new Error(`${r.err} [url=${r.url}, grecaptcha=${r.hadGrecaptcha ? "present" : "absent"}, real=${r.real ? "captured" : "none"}]`);
 }
 
 async function handleGetToken(data, settings, responseSocket = ws) {
@@ -1105,21 +1178,28 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     let ephemeralTabId = null;
     try {
-      let tabId;
+      // The Labs tab is still ensured first: it is the login gate (throws
+      // login_required when the session cookie is gone) and keeps the NextAuth
+      // session rolling. Since 2026-09-23 the token itself is minted in the
+      // separate flow.google.com tab (see MINT2_URL).
+      let labsTabId;
       if (settings.tabMode === "ephemeral") {
         ephemeralTabId = await openLabsTab();
-        tabId = ephemeralTabId;
+        labsTabId = ephemeralTabId;
       } else {
         if (attempt === 2) {
           // First mint failed. If the current tab isn't a usable Flow tab, the
           // breaker/auth gate will handle it; if it IS Flow but still failing,
           // swap it for a fresh one (no sticky bad tab). Create-then-remove, same
           // window — never the old remove-then-create that closed the window.
-          tabId = await replacePersistentTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
+          labsTabId = await replacePersistentTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
         } else {
-          tabId = await ensurePersistentTab();
+          labsTabId = await ensurePersistentTab();
         }
       }
+      if (attempt === 2) await dropMintTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
+      const labsTab = await getTab(labsTabId);
+      const tabId = await ensureMintTab(labsTab ? labsTab.windowId : undefined);
 
       await paceMint(settings.mintIntervalMs);
       const token = await mintTokenInTab(tabId, action, timeoutMs);
@@ -1589,6 +1669,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabId === persistentTabId) {
     persistentTabId = null;
     chrome.storage.local.remove("persistentTabId");
+  }
+  if (tabId === mintTabId) {
+    mintTabId = null;
+    chrome.storage.local.remove("mintTabId");
   }
 });
 
