@@ -93,10 +93,10 @@ docker-compose logs -f
 
 ```bash
 # Start with the WARP proxy
-docker-compose -f docker-compose.warp.yml up -d
+docker-compose -f docker-compose.proxy.yml up -d
 
 # View logs
-docker-compose -f docker-compose.warp.yml logs -f
+docker-compose -f docker-compose.proxy.yml logs -f
 ```
 
 #### Docker headed captcha mode (browser / personal)
