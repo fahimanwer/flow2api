@@ -1069,7 +1069,18 @@ async function rememberMintTab(id) {
 
 function onMintOrigin(tab) { return !!tab && tabUrlOf(tab).startsWith(MINT2_ORIGIN); }
 
-async function ensureMintTab(preferWindowId) {
+// Serialized: the warm-up on connect and a request arriving at the same moment
+// must not both create a tab (two tabs, one tracked). budgetMs bounds every wait
+// inside, so a request's overall deadline is honoured through tab loads too.
+let mintChain = Promise.resolve();
+function ensureMintTab(preferWindowId, budgetMs) {
+  const run = () => _ensureMintTab(preferWindowId, budgetMs);
+  mintChain = mintChain.then(run, run);
+  return mintChain;
+}
+
+async function _ensureMintTab(preferWindowId, budgetMs) {
+  const loadMs = Math.max(1000, Math.min(MINT_TAB_LOAD_MS, budgetMs == null ? MINT_TAB_LOAD_MS : budgetMs));
   const id = await readMintTabId();
   let tab = await getTab(id);
   if (tab && !onMintOrigin(tab)) {
@@ -1081,12 +1092,12 @@ async function ensureMintTab(preferWindowId) {
     }
   }
   if (tab && tab.discarded) {
-    try { await chrome.tabs.reload(id, { bypassCache: false }); await waitForTabComplete(id, MINT_TAB_LOAD_MS); tab = await getTab(id); } catch (_) { tab = null; }
+    try { await chrome.tabs.reload(id, { bypassCache: false }); await waitForTabComplete(id, loadMs); tab = await getTab(id); } catch (_) { tab = null; }
   }
   if (tab && onMintOrigin(tab) && tab.status === "complete") return id;
   if (tab && onMintOrigin(tab)) {
     // Still loading (or reload never reported complete): give it its load budget once.
-    await waitForTabComplete(id, MINT_TAB_LOAD_MS);
+    await waitForTabComplete(id, loadMs);
     const again = await getTab(id);
     if (again && onMintOrigin(again)) return id;
   }
@@ -1099,7 +1110,7 @@ async function ensureMintTab(preferWindowId) {
   const created = await createTabSafely(MINT2_URL, preferWindowId);
   await rememberMintTab(created.id);
   try { await chrome.tabs.update(created.id, { autoDiscardable: false }); } catch (_) {}
-  await waitForTabComplete(created.id, MINT_TAB_LOAD_MS);
+  await waitForTabComplete(created.id, loadMs);
   const settled = await getTab(created.id);
   if (!onMintOrigin(settled)) {
     await rememberMintTab(null);
@@ -1113,15 +1124,31 @@ async function ensureMintTab(preferWindowId) {
 
 // Close the mint tab (never if it is the last tab in its window) and forget it,
 // so the next ensureMintTab() starts fresh. Used after a failed mint attempt.
-async function dropMintTab(why) {
+function dropMintTab(why) {
+  const run = () => _dropMintTab(why);
+  mintChain = mintChain.then(run, run);
+  return mintChain;
+}
+
+async function _dropMintTab(why) {
   const id = await readMintTabId();
   if (id == null) return;
   const tab = await getTab(id);
-  if (tab && await isLastTabInWindow(tab)) {
-    await log("INFO", "Left the mint tab open: last tab in its window", { tabId: id, why });
-  } else if (tab) {
-    try { await chrome.tabs.remove(id); } catch (_) {}
+  if (!tab) { await rememberMintTab(null); return; }
+  if (!onMintOrigin(tab)) {
+    // Someone navigated it elsewhere: not ours to close. Forget it.
+    await log("WARN", "Mint tab left flow.google.com; forgetting it (not closing it)", { tabId: id, url: shortUrl(tabUrlOf(tab)), why });
+    await rememberMintTab(null);
+    return;
   }
+  if (await isLastTabInWindow(tab)) {
+    // Closing it would close the window: reload it in place and keep tracking it,
+    // so the next ensure reuses this tab instead of opening a second one.
+    await log("INFO", "Mint tab is the last tab in its window; reloading it in place instead of closing", { tabId: id, why });
+    try { await chrome.tabs.reload(id, { bypassCache: false }); } catch (_) { await rememberMintTab(null); }
+    return;
+  }
+  try { await chrome.tabs.remove(id); } catch (_) {}
   await rememberMintTab(null);
 }
 
@@ -1259,8 +1286,9 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
         labsTabId = await ensurePersistentTab();
       }
       if (attempt === 2) await dropMintTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
+      if (remaining() < 4000) throw new Error("no time left after the Labs tab check (" + Math.round(remaining()) + " ms remaining)");
       const labsTab = await getTab(labsTabId);
-      const tabId = await ensureMintTab(labsTab ? labsTab.windowId : undefined);
+      const tabId = await ensureMintTab(labsTab ? labsTab.windowId : undefined, remaining() - 3000);
 
       await paceMint(settings.mintIntervalMs);
       const mintBudget = Math.min(action === "VIDEO_GENERATION" ? 60000 : 20000, remaining() - 500);
@@ -1732,10 +1760,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     persistentTabId = null;
     chrome.storage.local.remove("persistentTabId");
   }
-  if (tabId === mintTabId) {
-    mintTabId = null;
-    chrome.storage.local.remove("mintTabId");
-  }
+  if (tabId === mintTabId) rememberMintTab(null).catch(() => {});
 });
 
 // On SW boot/wake: drop a stale (expired) creation lease, restore the badge, and
