@@ -9,6 +9,11 @@ export DISPLAY=:99
 WINDOW="${FU_WINDOW:-1400x1000}"
 mkdir -p /profile/browser /profile/logs
 rm -f /profile/browser/SingletonLock /profile/browser/SingletonSocket /profile/browser/SingletonCookie
+# Chromium keeps the extension's service-worker SCRIPT in its service-worker cache and, for an unpacked
+# extension, fires "installed" on a version change but keeps running the OLD cached script (seen twice on
+# this box: 3.5.1 on 2026-09-22, 3.7.3 on 2026-09-24). Dropping the cache forces a fresh read of every
+# worker script at start; sites' service workers simply re-register. Cookies/logins are untouched.
+rm -rf "/profile/browser/Default/Service Worker"
 ver="$(cat /opt/releases/current 2>/dev/null || true)"
 [ -n "$ver" ] && [ -f "/opt/releases/$ver/manifest.json" ] || { echo "no usable release in /opt/releases (current='$ver')" >&2; exit 1; }
 # A real directory, not a symlink: Chromium resolves symlinks when deriving the extension id, so a link would give
