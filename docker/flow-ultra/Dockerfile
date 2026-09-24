@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY entrypoint.sh /opt/entrypoint.sh
 RUN chmod +x /opt/entrypoint.sh && useradd -m -u 1000 -s /bin/bash fu \
-    && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix && mkdir -p /profile /opt/ext && chown -R fu:fu /profile
+    && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix && mkdir -p /profile && chown -R fu:fu /profile /opt
 VOLUME ["/profile"]
 USER fu
 WORKDIR /home/fu
