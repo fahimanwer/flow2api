@@ -32,6 +32,9 @@ if gone:
 PRUNE
 echo "extension release $ver"
 
+# `docker restart` keeps the container /tmp: a stale X lock from the previous run would make Xvfb exit at
+# once ("Server is already active for display 99") and the container restart forever (2026-09-24).
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 Xvfb :99 -screen 0 "${WINDOW}x24" -nolisten tcp -ac +extension RANDR >/profile/logs/xvfb.log 2>&1 &
 XVFB=$!
 for i in $(seq 1 50); do xdpyinfo -display :99 >/dev/null 2>&1 && break; sleep 0.1; done
@@ -52,8 +55,9 @@ cleanup() {
   kill -TERM "$BR" 2>/dev/null || true
   for i in $(seq 1 250); do kill -0 "$BR" 2>/dev/null || break; sleep 0.1; done
   kill -0 "$BR" 2>/dev/null && { echo "chromium did not exit in 25 s; killing" >&2; kill -KILL "$BR" 2>/dev/null || true; }
-  # 2. then the display stack
+  # 2. then the display stack (and wait for Xvfb so it removes its lock)
   kill -TERM "$VNC" "$WM" "$XVFB" 2>/dev/null || true
+  for i in $(seq 1 30); do kill -0 "$XVFB" 2>/dev/null || break; sleep 0.1; done
 }
 trap 'cleanup; exit 0' INT TERM
 trap cleanup EXIT
