@@ -1868,11 +1868,20 @@ chrome.runtime.onStartup.addListener(async () => {
 // labs.google/fx), clear the login breaker and push — no waiting for the hourly alarm, no
 // Reconnect click. Debounced: NextAuth rewrites the cookie a few times during sign-in.
 let flowCookiePushTimer = null;
+let lastCookiePushAt = 0;
+// A cookie-triggered push is rate-limited: NextAuth rewrites the cookie every time the Labs tab
+// loads, and while the server says the grant is DEAD (relogin_required) each push just reopens the
+// tab and rewrites the cookie again — a push every few seconds, 216 server log lines in 10 min on
+// flow-ultra-01 (2026-09-24). While the grant is dead, at most one push per 10 min (a real
+// sign-out/sign-in also fires the hourly alarm and Reconnect); otherwise at most one per minute.
 chrome.cookies.onChanged.addListener((changeInfo) => {
   if (!FlowSessionState.isFlowSessionCookieSet(changeInfo)) return;
   clearTimeout(flowCookiePushTimer);
   flowCookiePushTimer = setTimeout(async () => {
     try {
+      const minGap = (await isGrantExpired()) ? 10 * 60 * 1000 : 60 * 1000;
+      if (Date.now() - lastCookiePushAt < minGap) return;
+      lastCookiePushAt = Date.now();
       await clearLoginRequired();
       await log("INFO", "Google Labs session cookie appeared — pushing it to the server now");
       await refreshSession();

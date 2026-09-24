@@ -14,6 +14,22 @@ ver="$(cat /opt/releases/current 2>/dev/null || true)"
 # A real directory, not a symlink: Chromium resolves symlinks when deriving the extension id, so a link would give
 # every release a NEW id (fresh storage, new route key → the account's binding breaks). Copy (≈100 KB) instead.
 rm -rf /opt/ext && cp -a "/opt/releases/$ver" /opt/ext
+# Only /opt/ext may be an installed extension. An unpacked extension loaded once from any other path stays
+# registered in the profile and keeps loading (a second worker with its own identity ran for an hour on
+# 2026-09-24 after a symlink experiment). Prune such entries before Chromium starts.
+python3 - <<'PRUNE' || true
+import json
+f = "/profile/browser/Default/Preferences"
+try:
+    p = json.load(open(f))
+except Exception:
+    raise SystemExit
+s = p.get("extensions", {}).get("settings", {})
+gone = [k for k, v in s.items() if str(v.get("path", "")).startswith("/opt/") and v.get("path") != "/opt/ext"]
+for k in gone: del s[k]
+if gone:
+    json.dump(p, open(f, "w")); print("pruned stale extension entries:", gone)
+PRUNE
 echo "extension release $ver"
 
 Xvfb :99 -screen 0 "${WINDOW}x24" -nolisten tcp -ac +extension RANDR >/profile/logs/xvfb.log 2>&1 &
