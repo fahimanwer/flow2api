@@ -58,9 +58,11 @@ if [ -f "$tmp/ext/manifest.json" ]; then inner="$tmp/ext"; else inner=$(dirname 
 got=$(ver_of "$inner/manifest.json")
 [ "$got" = "$latest" ] || { echo "downloaded $got but server advertises $latest; not installing"; exit 1; }
 for f in manifest.json background.js options.html options.js; do [ -f "$inner/$f" ] || { echo "package lacks $f; not installing"; exit 1; }; done
-[ -f "$inner/site.json" ] && { echo "published package contains site.json — refusing (credentials would spread)"; exit 1; }
+{ [ -f "$inner/site.json" ] || [ -f "$inner/site.js" ]; } && { echo "published package contains site.json/site.js — refusing (credentials would spread)"; exit 1; }
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SITE" || { echo "$SITE is not valid JSON"; exit 1; }
 install -m 0644 "$SITE" "$inner/site.json"
+# the worker loads its overrides as a script (importScripts), generated from the box json
+printf 'globalThis.FlowSite = %s;\n' "$(cat "$SITE")" > "$inner/site.js"
 
 # 2. install as a new release folder (the old one stays until the new one is verified running)
 dest="$REL/$got"; [ "$got" = "$current" ] && dest="$REL/$got-$(date +%s)"   # --force / site.json change: fresh folder

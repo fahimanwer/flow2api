@@ -27,6 +27,11 @@ importScripts("suno.js");
 importScripts("session_state.js");
 importScripts("cookie_sync.js");
 importScripts("site_config.js");
+// Server-run browsers only: site.js (generated on the box from its site.json by ext-sync.sh) sets
+// globalThis.FlowSite. importScripts throws for a missing file, so staff builds simply get {}.
+// (A fetch() of the packaged file from the service worker did NOT work on Chromium 153 — 2026-09-24.)
+let SITE_CONFIG = {};
+try { importScripts("site.js"); SITE_CONFIG = FlowSiteConfig.sanitizeSiteConfig(globalThis.FlowSite); } catch (_) {}
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 // Where the worker tab is opened to mint. 2026-09-04: Google now bounces migrated
@@ -71,6 +76,8 @@ const PUSH_TIMEOUT_MS     = 25 * 1000;            // hard bound on the session-p
 // WebSocket heartbeat: keep the MV3 service worker alive (Chrome 116+ resets the
 // idle timer on WS traffic). 15s gives margin under the ~30s idle limit + timer jitter.
 const HEARTBEAT_MS = 15000;
+const DEAD_SOCKET_MS = 50000;  // > 3 missed pongs; an old server that never pongs is still detected by get_token/register_ack traffic
+let lastServerMsgAt = 0;
 
 // Tab-creation safety rails.
 const LEASE_MS = 25000;            // creation lease lifetime (> worst-case tab load ~16s)
@@ -125,21 +132,8 @@ let connecting = false;
 
 /* ----------------------------- settings ----------------------------- */
 
-// Optional site.json next to manifest.json (server-run browsers only; see site_config.js). Read once per
-// service-worker life; a missing file is the normal staff case and yields {}.
-let siteConfigPromise = null;
-function getSiteConfig() {
-  if (!siteConfigPromise) {
-    siteConfigPromise = fetch(chrome.runtime.getURL("site.json"))
-      .then((r) => (r.ok ? r.json() : {}))
-      .catch(() => ({}))
-      .then((j) => FlowSiteConfig.sanitizeSiteConfig(j));
-  }
-  return siteConfigPromise;
-}
-
 async function getSettings() {
-  const site = await getSiteConfig();
+  const site = SITE_CONFIG;
   return new Promise((resolve) => {
     chrome.storage.local.get(DEFAULT_SETTINGS, (stored) => {
       const build = (routeKey) => resolve({
@@ -1401,14 +1395,28 @@ async function connectWS() {
     log("SUCCESS", "Captcha WebSocket connected", { routeKey: settings.routeKey || "(empty)" });
     sendWS({ type: "register", route_key: settings.routeKey, client_label: settings.clientLabel, pool_mode: settings.failedImageMode ? "failed_image" : "auto", ext_version: extVersion() }, socket);
     if (heartbeatInterval) clearInterval(heartbeatInterval);
-    heartbeatInterval = setInterval(() => sendWS({ type: "ping" }, socket), HEARTBEAT_MS);
+    lastServerMsgAt = Date.now();
+    heartbeatInterval = setInterval(() => {
+      // A socket through a proxy can stay "open" after the server is gone (redeploy): the proxy
+      // swallows our pings. The server answers each ping with a pong (3.7.3+); no pong for
+      // DEAD_SOCKET_MS ⇒ close, so onclose reconnects (live: flow-ultra-01 sat on a dead socket for
+      // 25 min after a deploy, 2026-09-24).
+      if (Date.now() - lastServerMsgAt > DEAD_SOCKET_MS) {
+        log("WARN", "No answer from the server for a while — reconnecting the captcha socket");
+        try { socket.close(); } catch (_) {}
+        return;
+      }
+      sendWS({ type: "ping" }, socket);
+    }, HEARTBEAT_MS);
     // Warm the persistent tab so the first real request is fast (login-aware).
     maybeEnsurePersistentTab();
   };
 
   socket.onmessage = (event) => {
+    lastServerMsgAt = Date.now();
     let data;
     try { data = JSON.parse(event.data); } catch (_) { return; }
+    if (data.type === "pong") return;
     if (data.type === "register_ack") return;
     if (data.type === "get_token") {
       // Reply on the exact socket the request arrived on (falls back to current).
@@ -1868,7 +1876,6 @@ chrome.runtime.onStartup.addListener(async () => {
 // labs.google/fx), clear the login breaker and push — no waiting for the hourly alarm, no
 // Reconnect click. Debounced: NextAuth rewrites the cookie a few times during sign-in.
 let flowCookiePushTimer = null;
-let lastCookiePushAt = 0;
 // A cookie-triggered push is rate-limited: NextAuth rewrites the cookie every time the Labs tab
 // loads, and while the server says the grant is DEAD (relogin_required) each push just reopens the
 // tab and rewrites the cookie again — a push every few seconds, 216 server log lines in 10 min on
@@ -1880,8 +1887,12 @@ chrome.cookies.onChanged.addListener((changeInfo) => {
   flowCookiePushTimer = setTimeout(async () => {
     try {
       const minGap = (await isGrantExpired()) ? 10 * 60 * 1000 : 60 * 1000;
-      if (Date.now() - lastCookiePushAt < minGap) return;
-      lastCookiePushAt = Date.now();
+      // Persisted: the cookie event itself wakes a fresh service worker, so an in-memory stamp
+      // would be 0 on every event and the limit would never apply (seen live 2026-09-24).
+      const store = chrome.storage.session || chrome.storage.local;
+      const { lastCookiePushAt: last = 0 } = await store.get(["lastCookiePushAt"]);
+      if (Date.now() - last < minGap) return;
+      await store.set({ lastCookiePushAt: Date.now() });
       await clearLoginRequired();
       await log("INFO", "Google Labs session cookie appeared — pushing it to the server now");
       await refreshSession();

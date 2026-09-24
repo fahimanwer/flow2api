@@ -194,6 +194,15 @@ class ExtensionCaptchaService:
             payload = json.loads(data)
             message_type = payload.get("type")
 
+            if message_type == "ping":
+
+                # Worker 3.7.3+ closes a socket that gets no pong (a proxy can keep a dead socket "open").
+
+                await websocket.send_json({"type": "pong"})
+
+                return
+
+
             if message_type == "register":
                 conn = self._find_connection(websocket)
                 if conn:

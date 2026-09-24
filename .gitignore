@@ -71,3 +71,4 @@ Flow2API-Worker.zip
 
 # server-run browser overrides (contain proxy credentials; never commit or publish)
 worker-extension/site.json
+worker-extension/site.js
