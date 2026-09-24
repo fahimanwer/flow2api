@@ -26,6 +26,7 @@
 importScripts("suno.js");
 importScripts("session_state.js");
 importScripts("cookie_sync.js");
+importScripts("site_config.js");
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 // Where the worker tab is opened to mint. 2026-09-04: Google now bounces migrated
@@ -124,7 +125,21 @@ let connecting = false;
 
 /* ----------------------------- settings ----------------------------- */
 
-function getSettings() {
+// Optional site.json next to manifest.json (server-run browsers only; see site_config.js). Read once per
+// service-worker life; a missing file is the normal staff case and yields {}.
+let siteConfigPromise = null;
+function getSiteConfig() {
+  if (!siteConfigPromise) {
+    siteConfigPromise = fetch(chrome.runtime.getURL("site.json"))
+      .then((r) => (r.ok ? r.json() : {}))
+      .catch(() => ({}))
+      .then((j) => FlowSiteConfig.sanitizeSiteConfig(j));
+  }
+  return siteConfigPromise;
+}
+
+async function getSettings() {
+  const site = await getSiteConfig();
   return new Promise((resolve) => {
     chrome.storage.local.get(DEFAULT_SETTINGS, (stored) => {
       const build = (routeKey) => resolve({
@@ -132,7 +147,7 @@ function getSettings() {
         apiKey: (stored.apiKey || "").trim(),
         connectionToken: (stored.connectionToken || "").trim(),
         routeKey,
-        clientLabel: (stored.clientLabel || "").trim(),
+        clientLabel: (site.clientLabel || stored.clientLabel || "").trim(),
         refreshIntervalMinutes: Math.max(5, parseInt(stored.refreshIntervalMinutes, 10) || 60),
         tabMode: stored.tabMode === "ephemeral" ? "ephemeral" : "persistent",
         mintIntervalMs: Math.max(0, parseInt(stored.mintIntervalMs, 10) || 2000),
@@ -140,7 +155,9 @@ function getSettings() {
         // generate call from the same residential IP the extension minted from, so a
         // profile stuck on "direct egress" would break reCAPTCHA alignment. Not toggleable.
         proxyAuto: true,
-        proxyUrl: (stored.proxyUrl || "").trim(),
+        proxyUrl: (site.proxyUrl || stored.proxyUrl || "").trim(),
+        // site.json only: route EVERY host through the proxy (server-run browser).
+        proxyAllHosts: site.proxyAllHosts === true,
         // "Failed-image mode" switch: when ON this account is reserved for staff-driven
         // failed-image regeneration (reported as pool_mode=failed_image, kept out of the
         // automatic article pool).
@@ -370,20 +387,10 @@ async function applyProxy(settings) {
   // "sign in to the proxy" dialog can never appear after an extension update / worker restart.
   try { await chrome.storage.local.set({ proxyCreds }); } catch (_) {}
   const P = pacProxyToken(p);
-  const pac = [
-    "function FindProxyForURL(url, host) {",
-    "  var P = '" + P + "';",
-    "  if (dnsDomainIs(host, 'labs.google')) return P;",                 // the Flow site + its session
-    "  if (dnsDomainIs(host, 'flow.google.com')) return P;",             // Flow's new home (2026-09)
-    "  if (shExpMatch(url, '*://www.google.com/recaptcha/*')) return P;", // reCAPTCHA mint
-    "  if (shExpMatch(url, '*://www.gstatic.com/recaptcha/*')) return P;",// reCAPTCHA assets
-    "  if (dnsDomainIs(host, 'recaptcha.net')) return P;",               // reCAPTCHA fallback domain
-    "  return 'DIRECT';",                                                // everything else untouched
-    "}"
-  ].join("\n");
+  const pac = FlowSiteConfig.buildPacScript(P, settings.proxyAllHosts === true);
   try {
     await chrome.proxy.settings.set({ value: { mode: "pac_script", pacScript: { data: pac } }, scope: "regular" });
-    await log("SUCCESS", "Per-profile proxy applied (Flow + reCAPTCHA only)", { host: p.host, port: p.port });
+    await log("SUCCESS", settings.proxyAllHosts ? "Per-profile proxy applied (ALL hosts, site.json)" : "Per-profile proxy applied (Flow + reCAPTCHA only)", { host: p.host, port: p.port });
   } catch (e) {
     await log("ERROR", "Failed to apply proxy", { error: e.message });
   }

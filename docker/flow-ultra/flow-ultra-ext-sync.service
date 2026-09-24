@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep the flow-ultra server browser's worker extension on the published version
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/flow-ultra/ext-sync.sh

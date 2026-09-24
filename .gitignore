@@ -68,3 +68,6 @@ config/setting_warp_example.toml
 tests/__pycache__/
 *.har
 Flow2API-Worker.zip
+
+# server-run browser overrides (contain proxy credentials; never commit or publish)
+worker-extension/site.json
