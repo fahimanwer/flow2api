@@ -146,6 +146,10 @@ async def ext_upload(request: Request):
             if not manifests:
                 raise ValueError("no manifest.json in zip")
             manifests.sort(key=lambda n: n.count("/"))
+            # A server-run browser keeps its proxy credentials in a box-only site.json next to
+            # manifest.json; that file must never ride along in the published package.
+            if any(n.rsplit("/", 1)[-1] == "site.json" for n in z.namelist()):
+                raise ValueError("package contains site.json (box-only file); remove it and zip again")
             with z.open(manifests[0]) as m:
                 version = str(json.load(m).get("version") or "").strip()
         if not version:
