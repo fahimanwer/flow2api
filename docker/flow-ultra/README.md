@@ -26,7 +26,7 @@ docker build -t flow-browser:4 /opt/flow-ultra
 docker stop -t 30 flow-ultra-01; docker rm flow-ultra-01
 docker run -d --name flow-ultra-01 --hostname flow-ultra-01 --restart=always --network bridge --shm-size=1g \
   --memory=3g -v /srv/flow-ultra/profile:/profile -v /srv/flow-ultra/releases:/opt/releases:ro flow-browser:4
-# (entrypoint links /opt/ext -> /opt/releases/$(cat current); the extension path stays /opt/ext so its id never changes)
+# (entrypoint copies /opt/releases/$(cat current) to the real dir /opt/ext; the path — hence the extension id — never changes)
 ```
 
 ## Signing in (a human does this)

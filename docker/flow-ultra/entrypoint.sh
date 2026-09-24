@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # flow-ultra container entrypoint: virtual display → window manager → VNC (container IP only) → Chromium with the
 # worker extension. The extension release is picked from the read-only mount /opt/releases/<version> named in
-# /opt/releases/current, and linked to the FIXED path /opt/ext (Chromium derives the extension id from that path;
-# it must never change, or the extension's storage/registration would reset).
+# /opt/releases/current, and COPIED to the fixed real path /opt/ext (Chromium derives the extension id from the
+# resolved path; a symlink would change the id on every release and reset its storage/registration).
 # Shutdown: Chromium is terminated FIRST and waited for (it flushes cookies/profile), then the rest.
 set -euo pipefail
 export DISPLAY=:99
@@ -11,7 +11,9 @@ mkdir -p /profile/browser /profile/logs
 rm -f /profile/browser/SingletonLock /profile/browser/SingletonSocket /profile/browser/SingletonCookie
 ver="$(cat /opt/releases/current 2>/dev/null || true)"
 [ -n "$ver" ] && [ -f "/opt/releases/$ver/manifest.json" ] || { echo "no usable release in /opt/releases (current='$ver')" >&2; exit 1; }
-ln -sfn "/opt/releases/$ver" /opt/ext
+# A real directory, not a symlink: Chromium resolves symlinks when deriving the extension id, so a link would give
+# every release a NEW id (fresh storage, new route key → the account's binding breaks). Copy (≈100 KB) instead.
+rm -rf /opt/ext && cp -a "/opt/releases/$ver" /opt/ext
 echo "extension release $ver"
 
 Xvfb :99 -screen 0 "${WINDOW}x24" -nolisten tcp -ac +extension RANDR >/profile/logs/xvfb.log 2>&1 &
