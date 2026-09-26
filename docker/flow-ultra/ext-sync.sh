@@ -26,7 +26,8 @@ activate() {  # $1 = version dir name: point current at it, restart, verify, cle
   for i in $(seq 1 30); do
     sleep 2
     running=$(docker exec "$CONTAINER" sh -c 'cat /opt/ext/manifest.json 2>/dev/null' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)
-    if [ "$running" = "$v" ] && docker exec "$CONTAINER" pgrep -x chromium >/dev/null 2>&1; then
+    # release folders may carry a -<timestamp> suffix (site.json change / --force): compare the version part
+    if [ "$running" = "${v%%-*}" ] && docker exec "$CONTAINER" test -f /tmp/fu-ready 2>/dev/null; then   # set by entrypoint after the extension registered in this start
       rm -f "$REL/pending"; echo "verified: container runs $v"
       # keep this and the previous release only
       ls -1d "$REL"/*/ 2>/dev/null | sed 's#/$##' | grep -v "/$v$" | sort -V | head -n -1 | xargs -r rm -rf
@@ -45,8 +46,9 @@ latest=$(curl -fsS --max-time 20 -H "Authorization: Bearer $CONNECTION_TOKEN" "$
          | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))')
 [ -n "$latest" ] || { echo "server did not report a version"; exit 1; }
 current=$(cat "$REL/current" 2>/dev/null || echo none)
+current_ver="${current%%-*}"   # folder names may carry a -<timestamp> suffix
 site_same=yes; cmp -s "$SITE" "$REL/$current/site.json" 2>/dev/null || site_same=no
-if [ "$FORCE" != "--force" ] && [ "$latest" = "$current" ] && [ "$site_same" = yes ]; then
+if [ "$FORCE" != "--force" ] && [ "$latest" = "$current_ver" ] && [ "$site_same" = yes ]; then
   echo "up to date: $current"; exit 0
 fi
 
@@ -65,7 +67,9 @@ install -m 0644 "$SITE" "$inner/site.json"
 printf 'globalThis.FlowSite = %s;\n' "$(cat "$SITE")" > "$inner/site.js"
 
 # 2. install as a new release folder (the old one stays until the new one is verified running)
-dest="$REL/$got"; [ "$got" = "$current" ] && dest="$REL/$got-$(date +%s)"   # --force / site.json change: fresh folder
-rm -rf "$dest.new"; cp -a "$inner" "$dest.new"; chown -R 1000:1000 "$dest.new"; mv "$dest.new" "$dest"
+# a release folder is never modified in place: if the name is taken (same version: --force / site.json change),
+# use a fresh -<timestamp> name. `mv` onto an existing directory would nest the new one INSIDE it.
+dest="$REL/$got"; [ -e "$dest" ] && dest="$REL/$got-$(date +%s)"
+rm -rf "$dest.new"; cp -a "$inner" "$dest.new"; chown -R 1000:1000 "$dest.new"; mv -T "$dest.new" "$dest"
 echo "installed $got into $dest (was $current, site.json same=$site_same)"
 activate "$(basename "$dest")"
