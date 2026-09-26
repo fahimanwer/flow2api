@@ -70,6 +70,12 @@ KNOWN_SPECS: Dict[Tuple[int, int], WatermarkSpec] = {
     (1536, 2752): WatermarkSpec(48, 89, 89, "bg_48.png", 0.59),  # 2K portrait (upscaled)
     (1376, 768): WatermarkSpec(48, 73, 73, "bg_48.png", 0.60),   # 1K landscape
     (768, 1376): WatermarkSpec(48, 73, 73, "bg_48.png", 0.60),   # 1K portrait
+    # 3:4 1K (gemini-3.0-pro-image-three-four, e.g. a failed 4K enlarge delivered as 1K): measured
+    # 26 Sep 2026 on 4 Pro images, logo at 76 px in all 4 (NCC 0.41-0.98), strength 0.59-0.62.
+    (896, 1200): WatermarkSpec(48, 76, 76, "bg_48.png", 0.60),
+    # 4:3 1K: same stamp assumed by symmetry with the 1K portrait/landscape pair; NOT yet seen on
+    # a real image — the edge-drop detection leaves it untouched if the logo is not there.
+    (1200, 896): WatermarkSpec(48, 76, 76, "bg_48.png", 0.60),
 }
 
 _MASK_DIR = Path(__file__).resolve().parent.parent / "assets" / "watermark"

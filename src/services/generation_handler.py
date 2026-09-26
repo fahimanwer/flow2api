@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
@@ -18,6 +19,8 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+from .flow_client import classify_upsample_error
+from .token_manager import upsample_quota_key
 from .watermark_remover import clean_image_bytes
 from .characters import (
     MAX_CHARACTERS_IMAGE,
@@ -1220,6 +1223,13 @@ def _resolve_tier_two_model_key(model_key: str) -> str:
     return candidate if candidate in _known_video_model_keys() else model_key
 
 
+
+# 2K/4K enlarge (26 Sep 2026, tmp/upscale_honest_plan.md): "too much traffic" gets one more try after a
+# real pause (before: 5 tries 3 s apart on the same IP, all refused), then this account's enlarge rests.
+UPSAMPLE_TRAFFIC_ATTEMPTS = 2
+UPSAMPLE_TRAFFIC_RETRY_DELAY_S = 10
+UPSAMPLE_TRAFFIC_COOLDOWN_MIN = 15
+
 class GenerationHandler:
     """Unified generation handler"""
 
@@ -2014,20 +2024,38 @@ class GenerationHandler:
             }
             watermark_info: Optional[Dict[str, Any]] = None
 
-            # Check whether upsample is needed
+            # Check whether upsample is needed (2K/4K). Rewritten 26 Sep 2026
+            # (tmp/upscale_honest_plan.md): one layer owns retries, the account's enlarge limit is
+            # remembered, and a failed enlarge is delivered as 1K WITH A NOTE (flow_upscale), never
+            # silently as if it were 2K/4K.
             upsample_resolution = model_config.get("upsample")
-            if upsample_resolution and media_id:
+            upscale_note: Optional[Dict[str, Any]] = None
+            if upsample_resolution:
                 upsample_started_at = time.time()
+                request_id = (perf_trace or {}).get("request_id", "-")
                 resolution_name = "4K" if "4K" in upsample_resolution else "2K"
-                await self._update_request_log_progress(request_log_state, token_id=token.id, status_text=f"upsampling_{resolution_name.lower()}", progress=82)
-                if stream:
-                    yield self._create_stream_chunk(f"Upscaling image to {resolution_name}...\n")
-
-                # 4K/2K image retry logic - uses the configured max retries
-                max_retries = config.flow_max_retries
-                for retry_attempt in range(max_retries):
+                fail_kind: Optional[str] = None
+                fail_msg = ""
+                upsample_attempt = 0
+                upscale_key = upsample_quota_key(resolution_name)
+                if not media_id:
+                    fail_kind = "no_media_id"
+                elif self.token_manager.is_model_quota_exhausted(token.id, upscale_key):
+                    # This account's enlarge is resting (daily limit / refused / busy): no call to
+                    # Google, so the rest is real; the picture is still delivered, as 1K.
+                    fail_kind = "resting"
+                elif resolution_name == "4K" and normalized_tier != PAYGATE_TIER_TWO:
+                    # Google answers MODEL_ACCESS_DENIED to 4K below Ultra (live 26 Sep, tokens 30/88/89).
+                    fail_kind = "needs_ultra"
+                else:
+                    await self._update_request_log_progress(request_log_state, token_id=token.id, status_text=f"upsampling_{resolution_name.lower()}", progress=82)
+                    if stream:
+                        yield self._create_stream_chunk(f"Upscaling image to {resolution_name}...\n")
+                while fail_kind is None:
+                    upsample_attempt += 1
                     try:
-                        # Call the upsample API
+                        # One call = one enlarge attempt; network/5xx retries happen inside it,
+                        # quota/tier/traffic/refusals come straight back here.
                         encoded_image = await self.flow_client.upsample_image(
                             at=token.at,
                             project_id=project_id,
@@ -2037,105 +2065,108 @@ class GenerationHandler:
                             session_id=generation_session_id,
                             token_id=token.id
                         )
-
-                        if encoded_image:
-                            debug_logger.log_info(f"[UPSAMPLE] Image upscaled to {resolution_name}")
-
-                            if stream:
-                                yield self._create_stream_chunk(f"✅ Image upscaled to {resolution_name}\n")
-
-                            if config.remove_watermark:
-                                encoded_image, watermark_info = await self._remove_watermark_base64(
-                                    encoded_image, image_trace
-                                )
-                                if stream and watermark_info.get("applied"):
-                                    yield self._create_stream_chunk("✅ Watermark removed\n")
-
-                            # 2K/4K images are always saved to real files; the log keeps only the link.
-                            response_state["generated_assets"] = {
-                                "type": "image",
-                                "origin_image_url": image_url,
-                                "upscaled_image": {
-                                    "resolution": resolution_name
-                                }
-                            }
-                            if watermark_info is not None:
-                                response_state["generated_assets"]["watermark"] = watermark_info
-
-                            try:
-                                await self._update_request_log_progress(
-                                    request_log_state,
-                                    token_id=token.id,
-                                    status_text="caching_image",
-                                    progress=90,
-                                )
-                                if stream:
-                                    yield self._create_stream_chunk(f"Caching {resolution_name} image...\n")
-                                cached_filename = await self.file_cache.cache_base64_image(encoded_image, resolution_name)
-                                local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
-                                response_state["url"] = local_url
-                                response_state["generated_assets"]["upscaled_image"]["local_url"] = local_url
-                                response_state["generated_assets"]["upscaled_image"]["url"] = local_url
-                                self._mark_generation_succeeded(generation_result)
-                                if stream:
-                                    yield self._create_stream_chunk(f"✅ {resolution_name} image cached successfully\n")
-                                    yield self._create_stream_chunk(
-                                        f"![Generated Image]({local_url})",
-                                        finish_reason="stop"
-                                    )
-                                else:
-                                    yield self._create_completion_response(
-                                        local_url,
-                                        media_type="image"
-                                    )
-                                if image_trace is not None:
-                                    image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
-                                return
-                            except Exception as e:
-                                debug_logger.log_error(f"Failed to cache {resolution_name} image: {str(e)}")
-                                response_state["url"] = image_url
-                                response_state["generated_assets"]["upscaled_image"]["local_url"] = None
-                                response_state["generated_assets"]["upscaled_image"]["url"] = image_url
-                                response_state["generated_assets"]["upscaled_image"]["delivery_mode"] = "inline_base64_fallback"
-                                self._mark_generation_succeeded(generation_result)
-                                base64_url = f"data:image/jpeg;base64,{encoded_image}"
-                                if stream:
-                                    cache_error = self._normalize_error_message(e, max_length=120)
-                                    yield self._create_stream_chunk(f"⚠️ Cache failed: {cache_error}, returning inline image...\n")
-                                    yield self._create_stream_chunk(
-                                        f"![Generated Image]({base64_url})",
-                                        finish_reason="stop"
-                                    )
-                                else:
-                                    yield self._create_completion_response(
-                                        base64_url,
-                                        media_type="image"
-                                    )
-                                if image_trace is not None:
-                                    image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
-                                return
-                        else:
-                            debug_logger.log_warning("[UPSAMPLE] Empty result")
-                            if stream:
-                                yield self._create_stream_chunk(f"⚠️ Upscale failed, returning original image...\n")
-                            break  # Do not retry an empty result
-
                     except Exception as e:
-                        error_str = str(e)
-                        debug_logger.log_error(f"[UPSAMPLE] Upscale failed (attempt {retry_attempt + 1}/{max_retries}): {error_str}")
-                        
-                        # Check for retryable errors (403, reCAPTCHA, timeout, etc.)
-                        retry_reason = self.flow_client._get_retry_reason(error_str)
-                        if retry_reason and retry_attempt < max_retries - 1:
+                        kind = classify_upsample_error(e)
+                        fail_msg = str(e)
+                        if kind == "traffic" and upsample_attempt < UPSAMPLE_TRAFFIC_ATTEMPTS:
+                            # Google says "too much traffic": one more try, after a real pause.
                             if stream:
-                                yield self._create_stream_chunk(f"⚠️ Upscale hit {retry_reason}, retrying ({retry_attempt + 2}/{max_retries})...\n")
-                            # Wait briefly, then retry
-                            await asyncio.sleep(1)
+                                yield self._create_stream_chunk(f"⚠️ Upscale refused (busy), retrying in {UPSAMPLE_TRAFFIC_RETRY_DELAY_S}s...\n")
+                            await asyncio.sleep(UPSAMPLE_TRAFFIC_RETRY_DELAY_S)
                             continue
+                        fail_kind = kind
+                        break
+                    if not encoded_image:
+                        fail_kind = "empty"
+                        break
+                    debug_logger.event(f"[UPSAMPLE] req={request_id} token={token.id} res={resolution_name} outcome=ok attempts={upsample_attempt} ms={int((time.time() - upsample_started_at) * 1000)}")
+
+                    if stream:
+                        yield self._create_stream_chunk(f"✅ Image upscaled to {resolution_name}\n")
+
+                    if config.remove_watermark:
+                        encoded_image, watermark_info = await self._remove_watermark_base64(
+                            encoded_image, image_trace
+                        )
+                        if stream and watermark_info.get("applied"):
+                            yield self._create_stream_chunk("✅ Watermark removed\n")
+
+                    # 2K/4K images are always saved to real files; the log keeps only the link.
+                    response_state["generated_assets"] = {
+                        "type": "image",
+                        "origin_image_url": image_url,
+                        "upscaled_image": {
+                            "resolution": resolution_name
+                        }
+                    }
+                    response_state["flow_upscale"] = {"requested": resolution_name, "delivered": resolution_name}
+                    if watermark_info is not None:
+                        response_state["generated_assets"]["watermark"] = watermark_info
+
+                    try:
+                        await self._update_request_log_progress(
+                            request_log_state,
+                            token_id=token.id,
+                            status_text="caching_image",
+                            progress=90,
+                        )
+                        if stream:
+                            yield self._create_stream_chunk(f"Caching {resolution_name} image...\n")
+                        cached_filename = await self.file_cache.cache_base64_image(encoded_image, resolution_name)
+                        local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                        response_state["url"] = local_url
+                        response_state["generated_assets"]["upscaled_image"]["local_url"] = local_url
+                        response_state["generated_assets"]["upscaled_image"]["url"] = local_url
+                        self._mark_generation_succeeded(generation_result)
+                        if stream:
+                            yield self._create_stream_chunk(f"✅ {resolution_name} image cached successfully\n")
+                            yield self._create_stream_chunk(
+                                f"![Generated Image]({local_url})",
+                                finish_reason="stop",
+                                extra={"flow_upscale": response_state.get("flow_upscale")},
+                            )
                         else:
-                            if stream:
-                                yield self._create_stream_chunk(f"⚠️ Upscale failed: {error_str}, returning original image...\n")
-                            break
+                            yield self._create_completion_response(
+                                local_url,
+                                media_type="image",
+                                upscale=response_state.get("flow_upscale"),
+                            )
+                        if image_trace is not None:
+                            image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
+                        return
+                    except Exception as e:
+                        debug_logger.log_error(f"Failed to cache {resolution_name} image: {str(e)}")
+                        response_state["url"] = image_url
+                        response_state["generated_assets"]["upscaled_image"]["local_url"] = None
+                        response_state["generated_assets"]["upscaled_image"]["url"] = image_url
+                        response_state["generated_assets"]["upscaled_image"]["delivery_mode"] = "inline_base64_fallback"
+                        self._mark_generation_succeeded(generation_result)
+                        base64_url = f"data:image/jpeg;base64,{encoded_image}"
+                        if stream:
+                            cache_error = self._normalize_error_message(e, max_length=120)
+                            yield self._create_stream_chunk(f"⚠️ Cache failed: {cache_error}, returning inline image...\n")
+                            yield self._create_stream_chunk(
+                                f"![Generated Image]({base64_url})",
+                                finish_reason="stop",
+                                extra={"flow_upscale": response_state.get("flow_upscale")},
+                            )
+                        else:
+                            yield self._create_completion_response(
+                                base64_url,
+                                media_type="image",
+                                upscale=response_state.get("flow_upscale"),
+                            )
+                        if image_trace is not None:
+                            image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
+                        return
+                if fail_kind in ("resting", "needs_ultra"):
+                    debug_logger.event(f"[UPSAMPLE] req={request_id} token={token.id} res={resolution_name} outcome={fail_kind} delivered=1K (no call)")
+                else:
+                    await self._record_upscale_failure(token, resolution_name, fail_kind, fail_msg, request_id)
+                upscale_note = {"requested": resolution_name, "delivered": "1K", "reason": fail_kind}
+                response_state["flow_upscale"] = upscale_note
+                if stream:
+                    yield self._create_stream_chunk(f"⚠️ Not enlarged — delivering 1K (reason: {fail_kind})\n")
                 if image_trace is not None:
                     image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
 
@@ -2192,6 +2223,8 @@ class GenerationHandler:
                 "origin_image_url": image_url,
                 "final_image_url": local_url
             }
+            if upscale_note:
+                response_state["generated_assets"]["upscale"] = upscale_note
             if watermark_info is not None:
                 response_state["generated_assets"]["watermark"] = watermark_info
             self._mark_generation_succeeded(generation_result)
@@ -2199,12 +2232,14 @@ class GenerationHandler:
             if stream:
                 yield self._create_stream_chunk(
                     f"![Generated Image]({local_url})",
-                    finish_reason="stop"
+                    finish_reason="stop",
+                    extra={"flow_upscale": upscale_note} if upscale_note else None,
                 )
             else:
                 yield self._create_completion_response(
                     local_url,  # Pass the URL; the method formats it
-                    media_type="image"
+                    media_type="image",
+                    upscale=upscale_note,
                 )
 
         finally:
@@ -2999,7 +3034,7 @@ class GenerationHandler:
 
     # ========== Response formatting ==========
 
-    def _create_stream_chunk(self, content: str, role: str = None, finish_reason: str = None) -> str:
+    def _create_stream_chunk(self, content: str, role: str = None, finish_reason: str = None, extra: Optional[Dict[str, Any]] = None) -> str:
         """Create a streaming response chunk"""
         import json
         import time
@@ -3024,9 +3059,20 @@ class GenerationHandler:
         else:
             chunk["choices"][0]["delta"]["reasoning_content"] = content
 
+        # Additive top-level fields (e.g. flow_upscale on the final image chunk).
+        for key, value in (extra or {}).items():
+            if value is not None:
+                chunk[key] = value
+
         return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-    def _create_completion_response(self, content: str, media_type: str = "image", is_availability_check: bool = False) -> str:
+    def _create_completion_response(
+        self,
+        content: str,
+        media_type: str = "image",
+        is_availability_check: bool = False,
+        upscale: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Create a non-streaming response
 
         Args:
@@ -3064,8 +3110,34 @@ class GenerationHandler:
                 "finish_reason": "stop"
             }]
         }
+        # 2K/4K requests: what was asked vs delivered ({"requested":"2K","delivered":"1K","reason":"quota"}).
+        # The image content stays unchanged so existing URL parsers keep working.
+        if upscale:
+            response["flow_upscale"] = upscale
 
         return json.dumps(response, ensure_ascii=False)
+
+    async def _record_upscale_failure(self, token, resolution_name: str, kind: str, message: str, request_id: str) -> None:
+        """Remember why this account could not enlarge, so the next 2K/4K request prefers another
+        account (load_balancer._can_enlarge). Not a generation failure: no record_error, no
+        account-wide cooldown, the generation model stays available."""
+        until = None
+        if kind in ("quota", "access"):
+            until = self.token_manager._next_pt_daily_reset()
+        elif kind == "traffic":
+            until = datetime.now(timezone.utc) + timedelta(minutes=UPSAMPLE_TRAFFIC_COOLDOWN_MIN)
+        if until is not None:
+            try:
+                await self.token_manager.mark_model_quota_exhausted(
+                    token.id, upsample_quota_key(resolution_name), message, until=until
+                )
+            except Exception as e:
+                debug_logger.op_warning(f"[UPSAMPLE] could not record cooldown: {e}")
+        debug_logger.op_warning(
+            f"[UPSAMPLE] req={request_id} token={token.id} res={resolution_name} outcome={kind} "
+            f"delivered=1K cooldown_until={until.isoformat(timespec='minutes') if until else '-'} "
+            f"reason={(message or '')[:160]}"
+        )
 
     def _create_error_response(self, error_message: str, status_code: int = 500, extra: Optional[Dict[str, Any]] = None) -> str:
         """Create an error response

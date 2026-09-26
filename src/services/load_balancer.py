@@ -5,11 +5,16 @@ from typing import Any, Dict, Optional
 from ..core.models import Token
 from ..core.config import config
 from ..core.account_tiers import (
+    PAYGATE_TIER_TWO,
     get_paygate_tier_label,
     get_required_paygate_tier_for_model,
     normalize_user_paygate_tier,
     supports_model_for_tier,
 )
+
+# 2K/4K preference (26 Sep 2026): with no concurrency cap on an account, it stops being preferred
+# for enlarging once this many requests are already in flight on it.
+UPSCALE_PREFER_MAX_INFLIGHT = 3
 
 # Owner decision 2026-09-22 (tmp/tier_order_plan.md): save Ultra quota for what needs it.
 IMAGE_TIER_RANK = {"PAYGATE_TIER_ONE": 0, "PAYGATE_TIER_NOT_PAID": 1, "PAYGATE_TIER_TWO": 2}
@@ -17,6 +22,7 @@ VIDEO_TIER_RANK = {"PAYGATE_TIER_TWO": 0, "PAYGATE_TIER_ONE": 1, "PAYGATE_TIER_N
 from .concurrency_manager import ConcurrencyManager
 from ..core.client_policy import client_block_reason, no_account_error, token_reserved_for
 from ..core.logger import debug_logger
+from .token_manager import upsample_quota_key, upsample_resolution_for_model
 
 
 def _token_pool(token) -> str:
@@ -365,6 +371,18 @@ class LoadBalancer:
                 key=lambda item: tier_rank.get(normalize_user_paygate_tier(item["token"].user_paygate_tier), 1)
             )
 
+        # 2K/4K images (26 Sep 2026): accounts that can do the enlarge step go first — no
+        # upscale cooldown for that size (daily upscaler quota / refusals) and, for 4K, Ultra
+        # (Google answers MODEL_ACCESS_DENIED to 4K on Pro). A preference, not a filter: when no
+        # account can enlarge, the image is still made and delivered as 1K with a note.
+        upscale_res = upsample_resolution_for_model(model) if for_image_generation else None
+        if upscale_res:
+            # Capacity-aware (Codex review 26 Sep): a capable account that is full drops back into the
+            # normal order, so load still spreads instead of piling every 2K/4K onto it.
+            available_tokens.sort(
+                key=lambda item: 0 if self._can_enlarge(item["token"], upscale_res) and not self._saturated(item) else 1
+            )
+
         # A client's own reserved accounts come first, in BOTH rotation modes (in polling mode the
         # round-robin cursor above would otherwise pick the reserved account only 1/N of the time
         # and spill onto shared accounts). Order inside each group is kept.
@@ -408,6 +426,20 @@ class LoadBalancer:
 
         debug_logger.log_info(f"[LOAD_BALANCER] ❌ No candidate token usable (image={for_image_generation}, video={for_video_generation})")
         return None
+
+    @staticmethod
+    def _saturated(item: Dict[str, Any]) -> bool:
+        remaining = item.get("remaining")
+        if remaining is not None:
+            return remaining <= 0
+        return (item.get("inflight") or 0) >= UPSCALE_PREFER_MAX_INFLIGHT
+
+    def _can_enlarge(self, token: Token, resolution: str) -> bool:
+        if self.token_manager.is_model_quota_exhausted(token.id, upsample_quota_key(resolution)):
+            return False
+        if resolution == "4k" and normalize_user_paygate_tier(token.user_paygate_tier) != PAYGATE_TIER_TWO:
+            return False
+        return True
 
     @staticmethod
     def _tier_rank_for(for_image_generation: bool, for_video_generation: bool) -> Optional[Dict[str, int]]:

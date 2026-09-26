@@ -694,7 +694,7 @@ async def _build_gemini_success_payload(
     response_model: str,
 ) -> Dict[str, Any]:
     output = _extract_openai_message_content(payload)
-    return {
+    result: Dict[str, Any] = {
         "candidates": [
             {
                 "content": {
@@ -707,6 +707,9 @@ async def _build_gemini_success_payload(
         ],
         "modelVersion": response_model,
     }
+    if isinstance(payload.get("flow_upscale"), dict):
+        result["flow_upscale"] = payload["flow_upscale"]
+    return result
 
 
 def _normalize_finish_reason(reason: Optional[str]) -> Optional[str]:
@@ -749,6 +752,8 @@ async def _convert_openai_stream_chunk_to_gemini_event(
         "candidates": [candidate],
         "modelVersion": response_model,
     }
+    if isinstance(payload.get("flow_upscale"), dict):
+        chunk["flow_upscale"] = payload["flow_upscale"]
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 

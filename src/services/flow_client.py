@@ -41,6 +41,29 @@ class FlowAPIError(Exception):
         super().__init__(message)
 
 
+def classify_upsample_error(error: BaseException) -> str:
+    """Sort a failed 2K/4K enlarge call (live evidence 26 Sep 2026):
+    quota   - PER_MODEL_DAILY_QUOTA_REACHED: the account's upscaler quota is spent until the PT reset
+    access  - MODEL_ACCESS_DENIED: the account's tier cannot enlarge to this size (4K on Pro)
+    traffic - UNUSUAL_ACTIVITY(_TOO_MUCH_TRAFFIC) / reCAPTCHA evaluation failed: Google refuses this
+              account/IP right now; hammering it every 3 s only feeds the score
+    refused - the prompt/image was refused (UNSAFE, SEXUAL, MINOR…)
+    other   - network, 5xx, anything else (normal retry budget)"""
+    text = f"{getattr(error, 'reason', '') or ''} {error}".upper()
+    if "PER_MODEL_DAILY_QUOTA" in text or "QUOTA_REACHED" in text:
+        return "quota"
+    if "MODEL_ACCESS_DENIED" in text:
+        return "access"
+    if "UNUSUAL_ACTIVITY" in text or "RECAPTCHA EVALUATION FAILED" in text:
+        return "traffic"
+    if any(k in text for k in ("PUBLIC_ERROR_UNSAFE", "PUBLIC_ERROR_SEXUAL", "PUBLIC_ERROR_MINOR", "PUBLIC_ERROR_PROMINENT")):
+        return "refused"
+    return "other"
+
+
+UPSAMPLE_NO_RETRY_KINDS = ("quota", "access", "traffic", "refused")
+
+
 class FlowClient:
     """VideoFX API client"""
 
@@ -1932,6 +1955,12 @@ class FlowClient:
                 return result.get("encodedImage", "")
             except Exception as e:
                 last_error = e
+                if classify_upsample_error(e) in UPSAMPLE_NO_RETRY_KINDS:
+                    # Quota / tier / "too much traffic" / refusals: never retried here. The caller
+                    # (generation_handler) owns that policy — before 26 Sep both layers retried,
+                    # up to flow_max_retries² calls per request. Keep the server-mint switch.
+                    await self._maybe_switch_to_server_mint(e, "[IMAGE UPSAMPLE] Upscale ")
+                    raise
                 should_retry = await self._handle_retryable_generation_error(
                     error=e,
                     retry_attempt=retry_attempt,
@@ -4311,18 +4340,7 @@ class FlowClient:
 
     # ========== Helpers ==========
 
-    async def _handle_retryable_generation_error(
-        self,
-        error: Exception,
-        retry_attempt: int,
-        max_retries: int,
-        browser_id: Optional[Union[int, str]],
-        project_id: str,
-        log_prefix: str,
-        defer_browser_error_notification: bool = False,
-    ) -> bool:
-        """Shared retry decision for generation, plus captcha self-heal notification."""
-        error_str = str(error)
+    async def _maybe_switch_to_server_mint(self, error: BaseException, log_prefix: str) -> None:
         # 2026-09-23: Google refused a token the worker extension minted (old
         # extension, or a new Google rule). The rest of THIS request mints on the
         # server, if the fallback can serve this account. Never for quota, prompt
@@ -4335,6 +4353,20 @@ class FlowClient:
         ):
             self._mint_override_ctx.set("server")
             debug_logger.event(f"{log_prefix}extension token rejected by Google; remaining mints of this request go to the server fallback")
+
+    async def _handle_retryable_generation_error(
+        self,
+        error: Exception,
+        retry_attempt: int,
+        max_retries: int,
+        browser_id: Optional[Union[int, str]],
+        project_id: str,
+        log_prefix: str,
+        defer_browser_error_notification: bool = False,
+    ) -> bool:
+        """Shared retry decision for generation, plus captcha self-heal notification."""
+        error_str = str(error)
+        await self._maybe_switch_to_server_mint(error, log_prefix)
         retry_reason = self._get_retry_reason(error_str)
         retry_delay = self._get_retry_delay_seconds(error_str, retry_attempt)
 
