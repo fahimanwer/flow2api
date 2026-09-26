@@ -210,6 +210,26 @@ def model_quota_key(model: Optional[str]) -> str:
     return key
 
 
+def upsample_quota_key(resolution: str) -> str:
+    """Cooldown key for the 2K/4K enlarge step ("upsample_image@2k"). Google gives the upscaler
+    its own daily quota per account, separate from the generation model (live 26 Sep 2026: token
+    77 generated all day but every enlarge answered PER_MODEL_DAILY_QUOTA_REACHED). The "@" keeps
+    model_quota_key() from stripping it to a family shared with anything else."""
+    res = (resolution or "").strip().lower()
+    res = "4k" if "4k" in res else "2k"
+    return f"upsample_image@{res}"
+
+
+def upsample_resolution_for_model(model: Optional[str]) -> Optional[str]:
+    """'2k' / '4k' for an image model that is enlarged after generation, else None."""
+    m = (model or "").strip().lower()
+    if m.endswith("-4k") or m.endswith("_4k"):
+        return "4k"
+    if m.endswith("-2k") or m.endswith("_2k"):
+        return "2k"
+    return None
+
+
 class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
@@ -345,7 +365,11 @@ class TokenManager:
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
     async def mark_model_quota_exhausted(
-        self, token_id: int, model: Optional[str], error_message: Optional[str] = None
+        self,
+        token_id: int,
+        model: Optional[str],
+        error_message: Optional[str] = None,
+        until: Optional[datetime] = None,
     ):
         """Pause ONLY this model for this token after a per-model quota error.
 
@@ -357,7 +381,10 @@ class TokenManager:
         key = model_quota_key(model)
         if not key:
             return
-        if _is_daily_quota_error(error_message):
+        if until is not None:
+            hrs = max(0.0, (until - datetime.now(timezone.utc)).total_seconds() / 3600)
+            scope = f"until {until.isoformat(timespec='minutes')} (~{hrs:.1f}h)"
+        elif _is_daily_quota_error(error_message):
             until = self._next_pt_daily_reset()
             hrs = max(0.0, (until - datetime.now(timezone.utc)).total_seconds() / 3600)
             scope = f"until daily reset (~{hrs:.1f}h, midnight PT)"

@@ -56,6 +56,8 @@ class ImageWatermarkDeliveryTests(unittest.IsolatedAsyncioTestCase):
             db=MagicMock(), concurrency_manager=MagicMock(), proxy_manager=None,
         )
         self.handler.file_cache.cache_dir = Path(self._temp_dir.name)
+        # no enlarge cooldowns in these tests (a bare MagicMock would read as "resting")
+        self.handler.token_manager.is_model_quota_exhausted = MagicMock(return_value=False)
         self.handler._update_request_log_progress = AsyncMock()
         self.handler.flow_client.generate_image = AsyncMock(return_value=(
             {"media": [{"image": {"generatedImage": {"fifeUrl": GOOGLE_URL}}, "name": "media-1"}]}, "session", {},
