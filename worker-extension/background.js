@@ -62,6 +62,7 @@ const SESSION_COOKIE = "__Secure-next-auth.session-token";
 
 const ALARM_SESSION = "flow2api_session_refresh";
 const ALARM_KEEPALIVE = "flow2api_keepalive";
+const ALARM_PORT_MIGRATION = "flow2api_port_migration"; // 3.7.4: ask again for a pending IP move
 const ALARM_RELOAD = "flow2api_session_reload";
 
 // Proactive session-cookie roll: reload the persistent Labs tab when the
@@ -119,6 +120,7 @@ const DEFAULT_SETTINGS = {
 
 let ws = null;
 let lastMintAt = 0;       // timestamp of the last reCAPTCHA mint (for pacing)
+let extPortMigration = null; // {id, port} offered by the server in the last pool fetch (3.7.4)
 let mintInFlight = false; // true while handleGetToken holds the persistent tab (in-mem only)
 let lastReloadAt = 0;     // timestamp of last proactive reload (in-mem rate cap)
 let heartbeatInterval = null;
@@ -291,22 +293,39 @@ function activeProxyBase() {
 }
 
 async function fetchProxyPool(settings) {
+  if (!extProxyPool) {
+    try { const { extProxyPool: saved } = await chrome.storage.local.get(["extProxyPool"]); if (saved) extProxyPool = saved; } catch (_) {}
+  }
   try {
     if (!settings.serverBase || !settings.connectionToken) return;
     const base = new URL(settings.serverBase);
     // Send our route_key so the server can assign THIS device a distinct, least-loaded IP.
     const rk = (settings.routeKey || "").trim();
-    const url = `${base.protocol}//${base.host}/api/plugin/proxy-pool`
-      + (rk ? `?route_key=${encodeURIComponent(rk)}` : "");
+    // 3.7.4: our version (the server moves an Ultra to its own IP only for >= 3.7.4, which pushes
+    // right after the switch) and whether a manual proxy is set (such devices are never moved).
+    const q = new URLSearchParams();
+    if (rk) q.set("route_key", rk);
+    q.set("ext_version", extVersion());
+    if ((settings.proxyUrl || "").trim()) q.set("manual", "1");
+    const url = `${base.protocol}//${base.host}/api/plugin/proxy-pool?${q.toString()}`;
     const resp = await fetch(url, { headers: { "Authorization": `Bearer ${settings.connectionToken}` } });
     if (!resp.ok) return;
     const data = await resp.json();
     if (data && data.pool && Array.isArray(data.pool.ports) && data.pool.ports.length && data.pool.host) {
       extProxyPool = data.pool;
+      // 3.7.4: remembered across restarts, so an offline restart keeps the server's ports (the
+      // baked-in list does not have the newer ones an Ultra may have moved to).
+      try { await chrome.storage.local.set({ extProxyPool: data.pool }); } catch (_) {}
+    }
+    if (data && Number.isInteger(data.migration_retry_in) && data.migration_retry_in > 0) {
+      try { chrome.alarms.create(ALARM_PORT_MIGRATION, { delayInMinutes: Math.max(0.5, data.migration_retry_in / 60) }); } catch (_) {}
     }
     if (data && Number.isInteger(data.assigned_port)) {
       extAssignedPort = data.assigned_port;
     }
+    // 3.7.4: a one-time move to this account's own IP, to confirm once applied.
+    extPortMigration = (data && typeof data.migration_id === "string" && Number.isInteger(data.assigned_port))
+      ? { id: data.migration_id, port: data.assigned_port } : null;
   } catch (_) { /* keep the baked-in fallback */ }
 }
 
@@ -372,6 +391,19 @@ function pacProxyToken(p) {
 // profile while still making reCAPTCHA mint from the per-profile residential IP.
 async function applyProxy(settings) {
   await fetchProxyPool(settings);   // #2: pick up any server-managed pool (added IPs)
+  // 3.7.4: never switch IP under a running mint (the server paused new work for this account).
+  let migration = settings.proxyUrl ? null : extPortMigration;
+  let portBefore = null;
+  try { ({ proxyPort: portBefore } = await chrome.storage.local.get(["proxyPort"])); } catch (_) {}
+  if (migration) {
+    for (let i = 0; i < 180 && mintInFlight; i++) await sleep(500);   // up to 90 s (video mints take ~70 s)
+    if (mintInFlight) {
+      // Still minting: do not switch now. Stay on the current port and tell the server (back to pending).
+      extAssignedPort = null;
+      await confirmPortMigration({ ...migration, ok: false });
+      migration = null;
+    }
+  }
   const p = parseProxyUrl(await resolveProxyUrl(settings));
   if (!p) { await clearProxy(); return; }
   proxyCreds = { username: p.username, password: p.password };
@@ -385,9 +417,60 @@ async function applyProxy(settings) {
   try {
     await chrome.proxy.settings.set({ value: { mode: "pac_script", pacScript: { data: pac } }, scope: "regular" });
     await log("SUCCESS", settings.proxyAllHosts ? "Per-profile proxy applied (ALL hosts, site.json)" : "Per-profile proxy applied (Flow + reCAPTCHA only)", { host: p.host, port: p.port });
+    try { await chrome.storage.local.set({ appliedProxyPort: p.port }); } catch (_) {}
+    if (migration && p.port === migration.port) await confirmPortMigration({ ...migration, ok: true });
   } catch (e) {
     await log("ERROR", "Failed to apply proxy", { error: e.message });
+    if (migration) {
+      // Forget the offered port too, so a restart does not apply it without the server knowing.
+      extAssignedPort = null;
+      try { await chrome.storage.local.set({ proxyPort: portBefore || null }); } catch (_) {}
+      await confirmPortMigration({ ...migration, ok: false });
+    }
   }
+}
+
+// 3.7.4 one-time move to this account's own IP: tell the server we applied (or could not apply) the
+// offered port. Only then does the server switch its own side. Kept in storage and retried every
+// minute until the server answers, then the session is pushed so it reports the new IP.
+async function confirmPortMigration(m) {
+  try { await chrome.storage.local.set({ pendingPortAck: m }); } catch (_) {}
+  await log(m.ok ? "INFO" : "ERROR", m.ok ? "Moved to this account's own IP — confirming to the server" : "Could not apply the new IP — telling the server", { port: m.port });
+  await sendPendingPortAck();
+}
+
+async function sendPendingPortAck() {
+  let m;
+  try { ({ pendingPortAck: m } = await chrome.storage.local.get(["pendingPortAck"])); } catch (_) { return; }
+  if (!m) return;
+  const settings = await getSettings();
+  if (!settings.serverBase || !settings.connectionToken) return;
+  // Only report what Chrome is really using now (a restart may have applied something else).
+  let applied = null;
+  try { ({ appliedProxyPort: applied } = await chrome.storage.local.get(["appliedProxyPort"])); } catch (_) {}
+  if (!m.ok && applied === m.port) m = { ...m, ok: true };   // it did end up on the offered port
+  if (m.ok) {
+    if (applied !== m.port) {
+      await chrome.storage.local.remove(["pendingPortAck"]);
+      await log("INFO", "IP move not confirmed: Chrome is not on the offered port; asking the server again", { applied, offered: m.port });
+      applyProxy(settings).catch(() => {});
+      return;
+    }
+  }
+  try {
+    const base = new URL(settings.serverBase);
+    const resp = await fetch(`${base.protocol}//${base.host}/api/plugin/port-migration-ack`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.connectionToken}` },
+      body: JSON.stringify({ route_key: (settings.routeKey || "").trim(), migration_id: m.id, port: m.port, ok: m.ok }),
+    });
+    if (!resp.ok) return;   // retried by the keep-alive alarm
+    const data = await resp.json().catch(() => ({}));
+    await chrome.storage.local.remove(["pendingPortAck"]);
+    await log(data.success ? "SUCCESS" : "INFO", "Server answered the IP move", { state: data.state, reason: data.reason });
+    if (m.ok && data.success) refreshSession().catch(() => {});
+    else if (m.ok && !data.success) applyProxy(settings).catch(() => {});   // rejected: fetch the current offer
+  } catch (_) { /* retried by the keep-alive alarm */ }
 }
 
 async function clearProxy() {
@@ -1760,6 +1843,8 @@ async function refreshSession(token_id = null, opts = {}) {
     if (pushBody.session_token) await clearLoginRequired();
     if (!result || result.credential_verified !== false) await clearGrantExpired();
     await log("SUCCESS", "Session token pushed to Flow2API", { action: result.action, message: result.message });
+    // 3.7.4: the server queued this account's one-time move to its own IP — fetch the port now.
+    if (result && result.proxy_migration_pending && !settings.proxyUrl) applyProxy(settings).catch(() => {});
     return { success: true, message: result.message, action: result.action, reason: "refreshed" };
   } catch (e) {
     await log("ERROR", "Session refresh error", { error: e.message });
@@ -1802,8 +1887,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await refreshSession();
     sunoSync("alarm").catch(() => {});   // no-op unless the Suno switch is ON
     checkForUpdate();   // piggyback the hourly session cycle to refresh the update banner
+  } else if (alarm.name === ALARM_PORT_MIGRATION) {
+    applyProxy(await getSettings()).catch(() => {});
   } else if (alarm.name === ALARM_KEEPALIVE) {
     retryPendingCookieClear().catch(() => {});   // no-op unless an OFF is still unacknowledged
+    sendPendingPortAck().catch(() => {});        // no-op unless an IP-move confirmation is unanswered
     connectWS();
     // Only ensure a tab when we actually have an OPEN socket — never spin up
     // tabs while disconnected. The call itself is login-aware and serialized.

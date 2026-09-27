@@ -237,6 +237,7 @@ class LoadBalancer:
         available_tokens = []
         filtered_reasons = {}
         required_tier = get_required_paygate_tier_for_model(model)
+        ip_move_blocked = await self._ip_move_blocked_ids()
 
         for token in active_tokens:
             # Per-account reCAPTCHA / anti-bot cooldown (whole token, ALL models): a
@@ -254,6 +255,11 @@ class LoadBalancer:
             # Per-caller routing (client_policy.py): a token reserved for another client, or
             # below the tier this client's policy demands, is out. Unidentified callers use
             # the 'default' policy (any tier) so their behaviour is unchanged.
+            # Device being moved to its own IP (port_migrations, durable): no new work until the
+            # browser confirms, so nothing mints on one IP and redeems on the other.
+            if token.id in ip_move_blocked:
+                filtered_reasons[token.id] = "Moving to its own IP (waiting for the browser to confirm)"
+                continue
             client_reason = client_block_reason(token, client, media)
             if client_reason:
                 filtered_reasons[token.id] = client_reason
@@ -411,6 +417,12 @@ class LoadBalancer:
                 debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token_id}: AT invalid or expired")
                 continue
 
+            # Re-check right before handing it out: validation above can take a while, and a device
+            # may have started its move to its own IP meanwhile (port_migrations).
+            if ip_move_blocked is not None and token.id in await self._ip_move_blocked_ids():
+                debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token.id}: moving to its own IP")
+                continue
+
             if reserve and not await self._reserve_slot(token.id, for_image_generation, for_video_generation):
                 debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token.id}: slot reservation failed")
                 continue
@@ -426,6 +438,17 @@ class LoadBalancer:
 
         debug_logger.log_info(f"[LOAD_BALANCER] ❌ No candidate token usable (image={for_image_generation}, video={for_video_generation})")
         return None
+
+    async def _ip_move_blocked_ids(self) -> set:
+        """Read on every pick (no cache): a block must apply to the very next selection."""
+        db = getattr(self.token_manager, "db", None)
+        if db is None or not hasattr(db, "get_ip_move_blocked_token_ids"):
+            return set()
+        try:
+            return await db.get_ip_move_blocked_token_ids()
+        except Exception as e:
+            debug_logger.op_warning(f"[LOAD_BALANCER] could not read IP-move blocks: {e}")
+            return set()
 
     @staticmethod
     def _saturated(item: Dict[str, Any]) -> bool:

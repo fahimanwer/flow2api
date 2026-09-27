@@ -3,13 +3,25 @@ import asyncio
 import aiosqlite
 import anyio
 import json
+import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
 from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, LogCleanupConfig, TokenRefreshConfig
 
+
+
+def proxy_port(url: Optional[str]) -> Optional[int]:
+    """Port of a proxy URL ("http://u:p@host:8003" → 8003), None if absent."""
+    m = re.search(r":(\d{2,5})/?$", (url or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def with_proxy_port(url: str, port: int) -> str:
+    return re.sub(r":\d{2,5}(/?)$", rf":{int(port)}\1", (url or "").strip())
 
 class Database:
     """SQLite database manager"""
@@ -1121,6 +1133,32 @@ class Database:
             # device (route_key) is assigned. Server hands out the least-loaded port so
             # each account gets its own IP while IPs are free, then spreads evenly.
             await db.execute("""
+                CREATE TABLE IF NOT EXISTS device_identity (
+                    route_key TEXT PRIMARY KEY,  -- the worker device (extension route_key)
+                    token_id INTEGER NOT NULL,   -- the account its latest successful session push proved
+                    seen_at TIMESTAMP
+                )
+            """)
+
+            # One-time move of an Ultra account's device to a proxy IP of its own (owner 26/27 Sep
+            # 2026), applied only when that browser runs worker >= 3.7.4: pending → offered (server
+            # hands the port, account paused, redeem unchanged) → done (browser confirmed it applied
+            # the port; assignment + redeem switch in one transaction). to_port stays reserved.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS port_migrations (
+                    route_key TEXT PRIMARY KEY,
+                    token_id INTEGER NOT NULL,
+                    from_port INTEGER,
+                    to_port INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    mig_id TEXT,
+                    created_at TIMESTAMP,
+                    offered_at TIMESTAMP,
+                    done_at TIMESTAMP
+                )
+            """)
+
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS device_port_assignments (
                     route_key TEXT PRIMARY KEY,
                     port INTEGER NOT NULL,
@@ -1517,6 +1555,23 @@ class Database:
             if row and int(row["port"]) in pool:
                 await db.commit()
                 return int(row["port"])  # keep a valid existing assignment (stable IP)
+            # A device whose one-time Ultra move is done gets its own port back (e.g. after pruning).
+            cur = await db.execute(
+                "SELECT to_port FROM port_migrations WHERE route_key = ? AND state = 'done'", (route_key,)
+            )
+            done = await cur.fetchone()
+            if done and int(done["to_port"]) in pool:
+                chosen = int(done["to_port"])
+                await db.execute(
+                    "INSERT INTO device_port_assignments (route_key, port, assigned_at, last_seen) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(route_key) DO UPDATE SET port = excluded.port, assigned_at = excluded.assigned_at, last_seen = excluded.last_seen",
+                    (route_key, chosen, now_iso, now_iso),
+                )
+                await db.commit()
+                return chosen
+            # Ports reserved for Ultra accounts (their one-time move) are never handed to anyone else.
+            cur = await db.execute("SELECT to_port FROM port_migrations WHERE route_key != ?", (route_key,))
+            reserved = {int(r["to_port"]) for r in await cur.fetchall()}
             # Count only RECENTLY-SEEN devices per port, excluding this route_key's own row (so a
             # reassignment doesn't count itself, and dead ghosts don't reserve an IP forever).
             counts = {p: 0 for p in pool}
@@ -1529,7 +1584,8 @@ class Database:
                 p = int(r["port"])
                 if p in counts:
                     counts[p] = int(r["c"])
-            chosen = min(pool, key=lambda p: (counts[p], p))  # least-used, tie → lowest port
+            candidates = [p for p in pool if p not in reserved] or pool
+            chosen = min(candidates, key=lambda p: (counts[p], p))  # least-used, tie → lowest port
             await db.execute(
                 "INSERT INTO device_port_assignments (route_key, port, assigned_at, last_seen) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(route_key) DO UPDATE SET port = excluded.port, assigned_at = excluded.assigned_at, last_seen = excluded.last_seen",
@@ -1537,6 +1593,294 @@ class Database:
             )
             await db.commit()
             return chosen
+
+    # ---------- device identity + one-time Ultra port migration ----------
+
+    async def record_device_identity(self, route_key: str, token_id: int) -> None:
+        if not route_key or not token_id:
+            return
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "INSERT INTO device_identity (route_key, token_id, seen_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(route_key) DO UPDATE SET token_id = excluded.token_id, seen_at = excluded.seen_at",
+                (route_key, int(token_id), datetime.now(timezone.utc).isoformat()),
+            )
+            await db.commit()
+
+    async def get_device_assignment(self, route_key: str) -> Optional[int]:
+        async with self._connect() as db:
+            cur = await db.execute("SELECT port FROM device_port_assignments WHERE route_key = ?", (route_key,))
+            row = await cur.fetchone()
+            return int(row[0]) if row else None
+
+    async def get_port_migration(self, route_key: str) -> Optional[Dict[str, Any]]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM port_migrations WHERE route_key = ?", (route_key,))
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def port_shared_with_other_device(self, route_key: str, port: int, token_id: Optional[int] = None) -> bool:
+        """Another device holds this port (live or dormant — a dormant one keeps its sticky port when it
+        returns), or another active account redeems through it (e.g. away mode, no device row)."""
+        async with self._connect() as db:
+            row = await (await db.execute(
+                "SELECT 1 FROM device_port_assignments WHERE port = ? AND route_key != ? LIMIT 1",
+                (int(port), route_key),
+            )).fetchone()
+            if row is not None:
+                return True
+            for tid, url in await (await db.execute(
+                "SELECT id, redeem_proxy_url FROM tokens WHERE is_active = 1 AND id != ?", (int(token_id or 0),)
+            )).fetchall():
+                if proxy_port(url) == int(port):
+                    return True
+            return False
+
+    async def pick_free_port(self, pool_ports: list) -> Optional[int]:
+        """A pool port that NO device assignment (live or dormant) and no migration uses."""
+        pool = [int(p) for p in pool_ports or []]
+        async with self._connect() as db:
+            used = {int(r[0]) for r in await (await db.execute("SELECT port FROM device_port_assignments")).fetchall()}
+            used |= {int(r[0]) for r in await (await db.execute("SELECT to_port FROM port_migrations")).fetchall()}
+            for (url,) in await (await db.execute("SELECT redeem_proxy_url FROM tokens WHERE is_active = 1")).fetchall():
+                if proxy_port(url) is not None:
+                    used.add(proxy_port(url))  # an account (e.g. away mode) may redeem there without a device row
+        free = [p for p in pool if p not in used]
+        return min(free) if free else None
+
+    async def queue_port_migration(self, route_key: str, token_id: int, to_port: int) -> bool:
+        """Queue a one-time move (no-op if this device already has one, or the port is taken)."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._connect(write=True) as db:
+            cur = await db.execute("SELECT port FROM device_port_assignments WHERE route_key = ?", (route_key,))
+            row = await cur.fetchone()
+            taken = await (await db.execute(
+                "SELECT 1 FROM device_port_assignments WHERE port = ? AND route_key != ? "
+                "UNION SELECT 1 FROM port_migrations WHERE to_port = ? AND route_key != ?",
+                (int(to_port), route_key, int(to_port), route_key),
+            )).fetchone()
+            if taken:
+                return False
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO port_migrations (route_key, token_id, from_port, to_port, state, created_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?)",
+                (route_key, int(token_id), int(row[0]) if row else None, int(to_port), now_iso),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    IP_MOVE_DRAIN_STALE_MIN = 10
+    IP_MOVE_DRAIN_SETTLE_S = 20
+
+    async def count_inflight_requests(self, token_id: int, minutes: int = 15) -> int:
+        """Requests of this account that started and have not finished (request_logs covers the whole
+        life of a request, from selection to the answer)."""
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        async with self._connect() as db:
+            row = await (await db.execute(
+                "SELECT COUNT(*) FROM request_logs WHERE token_id = ? AND created_at > ? "
+                "AND COALESCE(status_text, '') NOT IN ('completed', 'failed')",
+                (int(token_id), cutoff),
+            )).fetchone()
+            return int(row[0]) if row else 0
+
+    async def get_ip_move_blocked_token_ids(self) -> set:
+        """Accounts that must not start new work: their device is being moved to its own IP.
+        'offered' blocks until the browser confirms (it may already be on the new IP); 'draining'
+        (waiting for running work to finish, nothing applied yet) lapses after IP_MOVE_DRAIN_STALE_MIN."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=self.IP_MOVE_DRAIN_STALE_MIN)).isoformat()
+        async with self._connect() as db:
+            rows = await (await db.execute(
+                "SELECT token_id FROM port_migrations WHERE state = 'offered' "
+                "OR (state = 'draining' AND offered_at >= ?)", (cutoff,),
+            )).fetchall()
+            return {int(r[0]) for r in rows}
+
+    async def offer_port_migration(self, route_key: str, inflight: int) -> Optional[Dict[str, Any]]:
+        """pending → draining (running work on the account; new work is blocked) → offered (no running
+        work; the browser gets the port and a migration id to echo back). Refused when the device no
+        longer owns the account or another device's assignment sits on the target."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._connect(write=True) as db:
+            db.row_factory = aiosqlite.Row
+            mig = await (await db.execute(
+                "SELECT * FROM port_migrations WHERE route_key = ? AND state IN ('pending', 'draining', 'offered')",
+                (route_key,),
+            )).fetchone()
+            if not mig:
+                return None
+            owner = await (await db.execute(
+                "SELECT extension_route_key FROM tokens WHERE id = ?", (mig["token_id"],)
+            )).fetchone()
+            clash = await (await db.execute(
+                "SELECT 1 FROM device_port_assignments WHERE port = ? AND route_key != ?", (mig["to_port"], route_key)
+            )).fetchone()
+            if not owner or (owner["extension_route_key"] or "") != route_key or clash:
+                await db.commit()
+                return None
+            # Always block first and let IP_MOVE_DRAIN_SETTLE_S pass: a request picked just before the
+            # block carries this account's id in request_logs within that time, so `inflight` sees it.
+            drain_started = None
+            if mig["state"] == "draining" and mig["offered_at"]:
+                try:
+                    drain_started = datetime.fromisoformat(mig["offered_at"])
+                except ValueError:
+                    drain_started = None
+            stale = drain_started is not None and (datetime.now(timezone.utc) - drain_started) > timedelta(minutes=self.IP_MOVE_DRAIN_STALE_MIN)
+            settled = (drain_started is not None and not stale
+                       and (datetime.now(timezone.utc) - drain_started).total_seconds() >= self.IP_MOVE_DRAIN_SETTLE_S)
+            if mig["state"] != "offered" and (inflight > 0 or not settled):
+                await db.execute(
+                    "UPDATE port_migrations SET state = 'draining', offered_at = ? WHERE route_key = ?",
+                    (mig["offered_at"] if (drain_started is not None and not stale) else now_iso, route_key),
+                )
+                await db.commit()
+                out = dict(mig)
+                out.update(state="draining")
+                return out
+            mig_id = mig["mig_id"] if mig["state"] == "offered" and mig["mig_id"] else uuid.uuid4().hex[:16]
+            await db.execute(
+                "UPDATE port_migrations SET state = 'offered', mig_id = ?, offered_at = ? WHERE route_key = ?",
+                (mig_id, now_iso, route_key),
+            )
+            await db.commit()
+            out = dict(mig)
+            out.update(state="offered", mig_id=mig_id)
+            return out
+
+    async def complete_port_migration(self, route_key: str, mig_id: str, port: int) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """The browser confirmed it applied `port`. In ONE transaction: assignment := to_port, the
+        account's redeem proxy := same endpoint on to_port, state := done."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._connect(write=True) as db:
+            db.row_factory = aiosqlite.Row
+            mig = await (await db.execute("SELECT * FROM port_migrations WHERE route_key = ?", (route_key,))).fetchone()
+            if not mig:
+                return False, "no migration", None
+            if mig["state"] == "done" and int(mig["to_port"]) == int(port):
+                return True, "already done", dict(mig)
+            if mig["state"] != "offered" or mig["mig_id"] != mig_id or int(mig["to_port"]) != int(port):
+                return False, "stale or unknown migration", dict(mig)
+            owner = await (await db.execute("SELECT extension_route_key FROM tokens WHERE id = ?", (mig["token_id"],))).fetchone()
+            if not owner or (owner["extension_route_key"] or "") != route_key:
+                await db.execute("DELETE FROM port_migrations WHERE route_key = ?", (route_key,))
+                await db.commit()
+                return False, "device no longer owns the account (migration dropped)", dict(mig)
+            await db.execute(
+                "INSERT INTO device_port_assignments (route_key, port, assigned_at, last_seen) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(route_key) DO UPDATE SET port = excluded.port, assigned_at = excluded.assigned_at, last_seen = excluded.last_seen",
+                (route_key, int(port), now_iso, now_iso),
+            )
+            tok = await (await db.execute("SELECT redeem_proxy_url FROM tokens WHERE id = ?", (mig["token_id"],))).fetchone()
+            if tok and tok["redeem_proxy_url"] and proxy_port(tok["redeem_proxy_url"]) is not None:
+                await db.execute(
+                    "UPDATE tokens SET redeem_proxy_url = ? WHERE id = ?",
+                    (with_proxy_port(tok["redeem_proxy_url"], int(port)), mig["token_id"]),
+                )
+            await db.execute(
+                "UPDATE port_migrations SET state = 'done', done_at = ? WHERE route_key = ?", (now_iso, route_key)
+            )
+            await db.commit()
+            out = dict(mig)
+            out.update(state="done")
+            return True, "done", out
+
+    async def apply_push_routing(
+        self, token_id: int, route_key: Optional[str], redeem_url: Optional[str], pool_managed: bool
+    ) -> bool:
+        """One transaction for what a session push says about routing: bind the account to this device
+        (only when it has no binding or an automatic one), void unfinished moves of any other device of
+        this account, and store the reported redeem proxy (guarded like write_redeem_proxy). A port
+        migration's completion checks ownership in its own transaction, so the two can never interleave.
+        Returns False when the redeem report was stale (not written)."""
+        wrote = True
+        async with self._connect(write=True) as db:
+            if route_key:
+                row = await (await db.execute("SELECT extension_route_key FROM tokens WHERE id = ?", (int(token_id),))).fetchone()
+                cur_rk = ((row[0] if row else "") or "").strip()
+                if not cur_rk or cur_rk.startswith("auto-"):
+                    await db.execute("UPDATE tokens SET extension_route_key = ? WHERE id = ?", (route_key, int(token_id)))
+                    if cur_rk and cur_rk != route_key:
+                        await db.execute(
+                            "DELETE FROM port_migrations WHERE token_id = ? AND route_key != ? AND state != 'done'",
+                            (int(token_id), route_key),
+                        )
+            if redeem_url:
+                if route_key and pool_managed and proxy_port(redeem_url) is not None:
+                    cur = await db.execute(
+                        "UPDATE tokens SET redeem_proxy_url = ? WHERE id = ? AND NOT EXISTS ("
+                        " SELECT 1 FROM port_migrations m JOIN device_port_assignments a ON a.route_key = m.route_key"
+                        " WHERE m.route_key = ? AND a.port != ?)",
+                        (redeem_url, int(token_id), route_key, proxy_port(redeem_url)),
+                    )
+                    wrote = cur.rowcount > 0
+                else:
+                    await db.execute("UPDATE tokens SET redeem_proxy_url = ? WHERE id = ?", (redeem_url, int(token_id)))
+            await db.commit()
+        return wrote
+
+    async def write_redeem_proxy(self, token_id: int, url: str, route_key: Optional[str], pool_managed: bool) -> bool:
+        """Store the redeem proxy a session push reported. For a device with a port migration and a
+        pool endpoint, the write only happens when the reported port equals the device's CURRENT
+        assignment — checked in the same statement, so a push sent before a confirmed switch can
+        never overwrite it afterwards. Returns False when the report was stale."""
+        async with self._connect(write=True) as db:
+            if route_key and pool_managed and proxy_port(url) is not None:
+                cur = await db.execute(
+                    "UPDATE tokens SET redeem_proxy_url = ? WHERE id = ? AND NOT EXISTS ("
+                    " SELECT 1 FROM port_migrations m JOIN device_port_assignments a ON a.route_key = m.route_key"
+                    " WHERE m.route_key = ? AND a.port != ?)",
+                    (url, int(token_id), route_key, proxy_port(url)),
+                )
+            else:
+                cur = await db.execute("UPDATE tokens SET redeem_proxy_url = ? WHERE id = ?", (url, int(token_id)))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def drop_foreign_migrations(self, token_id: int, route_key: str) -> int:
+        """The account now reports from another device: an unfinished move of its old device is void."""
+        async with self._connect(write=True) as db:
+            cur = await db.execute(
+                "DELETE FROM port_migrations WHERE token_id = ? AND route_key != ? AND state != 'done'",
+                (int(token_id), route_key),
+            )
+            await db.commit()
+            return cur.rowcount
+
+    async def reserve_current_port(self, route_key: str, token_id: int, port: int) -> bool:
+        """An Ultra already alone on its IP: record that port as its own (state done, from = to)."""
+        async with self._connect(write=True) as db:
+            taken = await (await db.execute(
+                "SELECT 1 FROM port_migrations WHERE to_port = ? AND route_key != ? "
+                "UNION SELECT 1 FROM device_port_assignments WHERE port = ? AND route_key != ?",
+                (int(port), route_key, int(port), route_key),
+            )).fetchone()
+            if taken:
+                return False
+            for (url,) in await (await db.execute(
+                "SELECT redeem_proxy_url FROM tokens WHERE is_active = 1 AND id != ?", (int(token_id),)
+            )).fetchall():
+                if proxy_port(url) == int(port):
+                    return False
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO port_migrations (route_key, token_id, from_port, to_port, state, created_at, done_at) "
+                "VALUES (?, ?, ?, ?, 'done', ?, ?)",
+                (route_key, int(token_id), int(port), int(port), now_iso, now_iso),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def reset_port_migration(self, route_key: str, mig_id: str) -> bool:
+        """The browser could not apply the offered port: back to pending, nothing else changed."""
+        async with self._connect(write=True) as db:
+            cur = await db.execute(
+                "UPDATE port_migrations SET state = 'pending', mig_id = NULL WHERE route_key = ? AND state = 'offered' AND mig_id = ?",
+                (route_key, mig_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
     async def touch_device_seen(self, route_key: str) -> None:
         """Mark a device alive right now (called on WS register). Keeps a connected-but-idle
