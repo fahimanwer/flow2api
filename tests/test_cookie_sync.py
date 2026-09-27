@@ -49,6 +49,20 @@ class _FakeDB:
             for k, v in fields.items():
                 setattr(self.token, k, v)
 
+    async def apply_push_routing(self, token_id, route_key, redeem_url, pool_managed):
+        fields = {}
+        if redeem_url:
+            fields["redeem_proxy_url"] = redeem_url
+        if route_key:
+            fields["extension_route_key"] = route_key
+        if fields:
+            await self.update_token(token_id, **fields)
+        return True
+
+    async def write_redeem_proxy(self, token_id, url, route_key, pool_managed):
+        await self.update_token(token_id, redeem_proxy_url=url)
+        return True
+
     async def update_token_cookie_sync(self, token_id, seq, **fields):
         if not self.token or self.token.id != token_id or int(self.token.google_cookies_seq or 0) >= seq:
             return 0

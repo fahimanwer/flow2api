@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import secrets
 import time
 import re
@@ -16,7 +16,8 @@ import urllib.request
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
-from ..core.database import Database
+from ..core.database import Database, proxy_port, with_proxy_port
+from ..core.account_tiers import normalize_user_paygate_tier
 from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha_task_type
 from ..core.models import Token
 from ..core.client_policy import (
@@ -2873,7 +2874,10 @@ async def update_plugin_config(
 
 @router.get("/api/plugin/proxy-pool")
 async def plugin_proxy_pool(
-    route_key: Optional[str] = None, authorization: Optional[str] = Header(None)
+    route_key: Optional[str] = None,
+    ext_version: Optional[str] = None,
+    manual: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
 ):
     """The worker extension fetches its residential proxy pool from here (connection-token
     authed, like /update-token). Returns {host,user,pass,ports:[...]} or {} if unset, so
@@ -2888,16 +2892,164 @@ async def plugin_proxy_pool(
         raise HTTPException(status_code=401, detail="Invalid connection token")
     pool = _parse_ext_proxy_pool(plugin_config.ext_proxy_pool)
     assigned_port = None
+    migration = None
     if pool and route_key:
+        rk = (route_key or "").strip()
         try:
-            assigned_port = await db.assign_device_port((route_key or "").strip(), pool.get("ports") or [])
+            assigned_port = await db.assign_device_port(rk, pool.get("ports") or [])
         except Exception as e:
             debug_logger.op_warning(f"[PROXY_POOL] could not assign port for route_key: {e}")
-    return {"success": True, "pool": pool or {}, "assigned_port": assigned_port}
+        try:
+            migration = await _offer_port_migration(rk, pool.get("ports") or [], ext_version, manual)
+        except Exception as e:
+            debug_logger.op_warning(f"[PORT_MIGRATE] offer failed for {rk}: {e}")
+        if migration and migration["state"] == "offered":
+            assigned_port = migration["to_port"]
+    out = {"success": True, "pool": pool or {}, "assigned_port": assigned_port}
+    if migration and migration["state"] == "offered":
+        out["migration_id"] = migration["mig_id"]
+    elif migration and migration["state"] == "draining":
+        out["migration_retry_in"] = PORT_MIGRATION_RETRY_SECONDS  # running work: ask again shortly
+    return out
+
+
+PORT_MIGRATION_MIN_VERSION = "3.7.4"
+PORT_MIGRATION_RETRY_SECONDS = 30
+
+
+def _version_at_least(version: Optional[str], minimum: str) -> bool:
+    def parts(v):
+        return [int(x) if x.isdigit() else 0 for x in str(v or "").split(".")]
+    a, b = parts(version), parts(minimum)
+    n = max(len(a), len(b))
+    return (a + [0] * (n - len(a))) >= (b + [0] * (n - len(b)))
+
+
+async def _offer_port_migration(route_key: str, ports: list, ext_version: Optional[str], manual: Optional[str]):
+    """One-time Ultra move (owner 27 Sep 2026): only a worker >= 3.7.4 on the shared pool gets it; older
+    versions keep their port. The server's redeem side is NOT switched here — only when the browser
+    confirms (plugin_port_migration_ack). The account rests meanwhile."""
+    if manual or not _version_at_least(ext_version, PORT_MIGRATION_MIN_VERSION):
+        return None
+    mig = await db.get_port_migration(route_key)
+    if not mig or mig["state"] not in ("pending", "draining", "offered") or int(mig["to_port"]) not in [int(p) for p in ports]:
+        return None
+    inflight = await db.count_inflight_requests(int(mig["token_id"]))
+    offered = await db.offer_port_migration(route_key, inflight)
+    if not offered:
+        return None
+    if offered["state"] == "draining":
+        debug_logger.op_warning(
+            f"[PORT_MIGRATE] draining route_key={route_key} token={offered['token_id']}: {inflight} request(s) still running; "
+            f"no new work until the move (browser asks again in {PORT_MIGRATION_RETRY_SECONDS}s)"
+        )
+    else:
+        debug_logger.op_warning(
+            f"[PORT_MIGRATE] offered route_key={route_key} token={offered['token_id']} "
+            f"{offered.get('from_port')}→{offered['to_port']} mig={offered['mig_id']} (no new work until the browser confirms)"
+        )
+    return offered
+
+
+@router.post("/api/plugin/port-migration-ack")
+async def plugin_port_migration_ack(request: dict, authorization: Optional[str] = Header(None)):
+    """Worker 3.7.4 applied (ok) or could not apply (not ok) the offered port. Idempotent; the
+    worker retries until it gets an answer."""
+    await _verify_plugin_connection_token(authorization)
+    route_key = str(request.get("route_key") or "").strip()
+    mig_id = str(request.get("migration_id") or "").strip()
+    try:
+        port = int(request.get("port"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="port required")
+    if not route_key or not mig_id:
+        raise HTTPException(status_code=400, detail="route_key and migration_id required")
+    if request.get("ok") is False:
+        reset = await db.reset_port_migration(route_key, mig_id)
+        debug_logger.op_warning(f"[PORT_MIGRATE] browser could not apply port {port} route_key={route_key}; back to pending={reset}")
+        return {"success": reset, "state": "pending" if reset else None}
+    ok, reason, row = await db.complete_port_migration(route_key, mig_id, port)
+    debug_logger.op_warning(f"[PORT_MIGRATE] ack route_key={route_key} port={port}: {reason}")
+    if not ok:
+        return {"success": False, "state": (row or {}).get("state"), "reason": reason}
+    return {"success": True, "state": "done"}
 
 
 @router.post("/api/plugin/update-token")
 async def plugin_update_token(request: dict, authorization: Optional[str] = Header(None)):
+    """Session push. After the push itself: remember which account this device proved, and for an
+    Ultra on a shared IP queue its one-time move; `proxy_migration_pending` tells a 3.7.4 worker to
+    fetch its port again now (owner 27 Sep 2026)."""
+    result = await _plugin_update_token_impl(request, authorization)
+    route_key = str(request.get("route_key") or "").strip()
+    try:
+        if isinstance(result, dict) and result.get("success") and result.get("token_id") and route_key:
+            await db.record_device_identity(route_key, int(result["token_id"]))
+            if await _ultra_migration_pending(route_key, int(result["token_id"]), request):
+                result["proxy_migration_pending"] = True
+    except Exception as e:
+        debug_logger.op_warning(f"[PORT_MIGRATE] post-push step failed for {route_key}: {e}")
+    return result
+
+
+def _pool_ports_and_host(plugin_config) -> Tuple[List[int], str]:
+    pool = _parse_ext_proxy_pool(getattr(plugin_config, "ext_proxy_pool", None)) or {}
+    return [int(p) for p in pool.get("ports") or []], str(pool.get("host") or "")
+
+
+def _is_pool_endpoint(url: Optional[str], ports: List[int], host: str) -> bool:
+    """True when `url` is the shared residential pool (same host, a pool port) — not a manual/private proxy."""
+    url = (url or "").strip()
+    if not url or not host or proxy_port(url) not in ports:
+        return False
+    return f"@{host}:" in url or f"//{host}:" in url
+
+
+async def _ultra_migration_pending(route_key: str, token_id: int, request: dict) -> bool:
+    mig = await db.get_port_migration(route_key)
+    if mig:
+        return mig["state"] in ("pending", "draining", "offered")
+    token = await db.get_token(token_id)
+    if not token or not token.is_active or normalize_user_paygate_tier(token.user_paygate_tier) != "PAYGATE_TIER_TWO":
+        return False
+    ext_version = request.get("ext_version") if isinstance(request.get("ext_version"), str) else None
+    if not _version_at_least(ext_version, PORT_MIGRATION_MIN_VERSION):
+        return False
+    ports, host = _pool_ports_and_host(await db.get_plugin_config())
+    if not _is_pool_endpoint(request.get("proxy_url"), ports, host):
+        return False  # manual / private proxy (e.g. the cloud box): never moved
+    assigned = await db.get_device_assignment(route_key)
+    if assigned is None:
+        return False
+    if not await db.port_shared_with_other_device(route_key, assigned, token_id):
+        if await db.reserve_current_port(route_key, token_id, assigned):
+            debug_logger.op_warning(f"[PORT_MIGRATE] Ultra token={token_id} already alone on {assigned}: port reserved for it")
+        return False
+    to_port = await db.pick_free_port(ports)
+    if to_port is None:
+        debug_logger.op_warning(f"[PORT_MIGRATE] Ultra token={token_id} shares port {assigned} but no free port is left")
+        return False
+    queued = await db.queue_port_migration(route_key, token_id, to_port)
+    if queued:
+        debug_logger.op_warning(f"[PORT_MIGRATE] queued Ultra token={token_id} route_key={route_key} {assigned}→{to_port}")
+    return queued
+
+
+async def _write_reported_redeem(token_id: int, route_key: Optional[str], reported_proxy_url: str) -> bool:
+    """Store a pushed redeem proxy. For a device with a port migration, a pool port other than its
+    current assignment is stale and is not written (check + write in one statement)."""
+    ports, host = _pool_ports_and_host(await db.get_plugin_config())
+    return await db.write_redeem_proxy(token_id, reported_proxy_url, route_key, _is_pool_endpoint(reported_proxy_url, ports, host))
+
+
+async def _write_push_routing(token_id: int, route_key: Optional[str], reported_proxy_url: Optional[str]) -> bool:
+    ports, host = _pool_ports_and_host(await db.get_plugin_config())
+    return await db.apply_push_routing(
+        token_id, route_key, reported_proxy_url, _is_pool_endpoint(reported_proxy_url, ports, host)
+    )
+
+
+async def _plugin_update_token_impl(request: dict, authorization: Optional[str] = Header(None)):
     """Receive token update from Chrome extension (no admin auth required, uses connection_token)"""
     await _verify_plugin_connection_token(authorization)
     plugin_config = await db.get_plugin_config()
@@ -3138,14 +3290,13 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             # generate (redeem) request aligns with the reCAPTCHA mint. Written via the DB
             # layer directly (token_manager.update_token has an explicit signature).
             _redeem_updates = {}
-            if reported_proxy_url is not None:
-                _redeem_updates["redeem_proxy_url"] = reported_proxy_url
+            if reported_proxy_url is not None or reported_route_key:
+                # Binding + reported redeem proxy in one transaction (port migrations, 27 Sep 2026).
+                if not await _write_push_routing(existing_token.id, reported_route_key, reported_proxy_url):
+                    debug_logger.event(f"[REDEEM_REPORT] stale port ignored token={existing_token.id} proxy={mask_proxy_url(reported_proxy_url)}")
             if reported_user_agent is not None:
                 _redeem_updates["browser_user_agent"] = reported_user_agent
-            if reported_route_key:
-                _cur_rk = (existing_token.extension_route_key or "").strip()
-                if not _cur_rk or _cur_rk.startswith("auto-"):
-                    _redeem_updates["extension_route_key"] = reported_route_key
+            # (the device binding is written by _write_push_routing above)
             if reported_pool_mode is not None:
                 _redeem_updates["pool_mode"] = reported_pool_mode
             if reported_ext_version is not None:
@@ -3258,12 +3409,12 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             # Slice B + #1: persist the reported residential proxy, real browser UA, and
             # bind the account to this device via its route key.
             _redeem_updates = {}
-            if reported_proxy_url is not None:
-                _redeem_updates["redeem_proxy_url"] = reported_proxy_url
+            if reported_proxy_url is not None or reported_route_key:
+                if not await _write_push_routing(new_token.id, reported_route_key, reported_proxy_url):
+                    debug_logger.event(f"[REDEEM_REPORT] stale port ignored token={new_token.id} proxy={mask_proxy_url(reported_proxy_url)}")
             if reported_user_agent is not None:
                 _redeem_updates["browser_user_agent"] = reported_user_agent
-            if reported_route_key:
-                _redeem_updates["extension_route_key"] = reported_route_key
+            # (the device binding is written by _write_push_routing above)
             if reported_pool_mode is not None:
                 _redeem_updates["pool_mode"] = reported_pool_mode
             if reported_ext_version is not None:
