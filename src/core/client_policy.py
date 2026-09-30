@@ -9,6 +9,11 @@ other config tables).
 
 A token may additionally be RESERVED for one client (`tokens.reserved_client`): then
 only that client can generate with it, and that client prefers it over shared tokens.
+
+Each policy also has a CEILING (`max_tier`: ultra | pro | free), the highest account tier the
+caller may use. Owner 2026-09-30: every Ultra, current and future, is for NAMED callers only,
+so the `default` row is seeded with `max_tier='pro'`; a named caller with no row of its own
+inherits `default`'s minimum tiers but has no ceiling.
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ from .account_tiers import get_paygate_tier_label, get_paygate_tier_rank, normal
 DEFAULT_CLIENT = "default"
 CLIENT_HEADERS = ("x-flow-client", "x-client")
 TIER_RULES = ("any", "paid", "ultra", "off")
+MAX_TIERS = ("ultra", "pro", "free")
 NO_ACCOUNT_CODE = "client_policy_no_account"
 _CLIENT_MAX_LEN = 40
 _CLIENT_ALLOWED = re.compile(r"^[a-z0-9._-]+$")
@@ -28,6 +34,9 @@ _CLIENT_ALLOWED = re.compile(r"^[a-z0-9._-]+$")
 # rule -> minimum paygate rank (None = this media type is switched off for the client)
 _RULE_RANK: Dict[str, Optional[int]] = {"any": 0, "paid": 1, "ultra": 2, "off": None}
 _RANK_LABEL = {0: "any", 1: "Pro", 2: "Ult"}
+_MAX_RANK = {"ultra": 2, "pro": 1, "free": 0}
+_MAX_LABEL = {2: "Ultra", 1: "Pro", 0: "Free"}
+NAMED_ONLY_REASON = "reserved for named clients (send X-Flow-Client)"
 
 
 def normalize_client(raw: Optional[str]) -> str:
@@ -52,12 +61,18 @@ def normalize_rule(rule: Optional[str]) -> str:
     return value if value in TIER_RULES else "any"
 
 
+def normalize_max_tier(value: Optional[str]) -> str:
+    value = (value or "").strip().lower()
+    return value if value in MAX_TIERS else "ultra"
+
+
 @dataclass
 class ClientPolicy:
     client: str
     image_tier: str = "any"
     video_tier: str = "any"
     note: str = ""
+    max_tier: str = "ultra"
 
     def rule_for(self, media: str) -> str:
         return self.video_tier if media == "video" else self.image_tier
@@ -66,12 +81,17 @@ class ClientPolicy:
         """Minimum paygate rank for this media type, or None when switched off."""
         return _RULE_RANK[normalize_rule(self.rule_for(media))]
 
+    def max_rank(self) -> int:
+        """Highest paygate rank this caller may use (2 = Ultra = no ceiling)."""
+        return _MAX_RANK[normalize_max_tier(self.max_tier)]
+
     def as_dict(self) -> dict:
         return {
             "client": self.client,
             "image_tier": normalize_rule(self.image_tier),
             "video_tier": normalize_rule(self.video_tier),
             "note": self.note or "",
+            "max_tier": normalize_max_tier(self.max_tier),
         }
 
 
@@ -92,6 +112,7 @@ class ClientPolicyStore:
                 image_tier=normalize_rule(row.get("image_tier")),
                 video_tier=normalize_rule(row.get("video_tier")),
                 note=row.get("note") or "",
+                max_tier=normalize_max_tier(row.get("max_tier")),
             )
         policies.setdefault(DEFAULT_CLIENT, ClientPolicy(DEFAULT_CLIENT))
         self._policies = policies
@@ -100,8 +121,14 @@ class ClientPolicyStore:
         self.replace(await db.get_client_policies())
 
     def get(self, client: str) -> ClientPolicy:
-        """The client's own policy, else `default` (= any account, today's behaviour)."""
-        return self._policies.get(client or DEFAULT_CLIENT) or self._policies[DEFAULT_CLIENT]
+        """The client's own policy; a named client with no row gets `default`'s minimum tiers
+        under its own name and NO ceiling; an unidentified caller gets `default` itself."""
+        own = self._policies.get(client or DEFAULT_CLIENT)
+        if own is not None:
+            return own
+        base = self._policies[DEFAULT_CLIENT]
+        return ClientPolicy(client=client, image_tier=base.image_tier, video_tier=base.video_tier,
+                            note="", max_tier="ultra")
 
     def all(self) -> List[ClientPolicy]:
         return sorted(self._policies.values(), key=lambda p: (p.client != DEFAULT_CLIENT, p.client))
@@ -124,6 +151,9 @@ def client_block_reason(token, client: str, media: str, store: ClientPolicyStore
     if reserved and reserved != client:
         return f"reserved for {reserved}"
     policy = store.get(client)
+    cap = tier_cap_reason(policy, getattr(token, "user_paygate_tier", None))
+    if cap:
+        return cap
     need = policy.required_rank(media)
     if need is None:
         return f"client policy: {media} generation is off for {policy.client}"
@@ -137,6 +167,21 @@ def client_block_reason(token, client: str, media: str, store: ClientPolicyStore
     return None
 
 
+def tier_cap_reason(policy: ClientPolicy, paygate_tier: Optional[str]) -> Optional[str]:
+    """Why this account's tier is above the caller's ceiling, or None."""
+    rank = get_paygate_tier_rank(normalize_user_paygate_tier(paygate_tier))
+    if rank <= policy.max_rank():
+        return None
+    if policy.client == DEFAULT_CLIENT:
+        return NAMED_ONLY_REASON
+    return f"client policy: {policy.client} is capped at {_MAX_LABEL[policy.max_rank()]} accounts"
+
+
+def default_cap_reason(paygate_tier: Optional[str], store: ClientPolicyStore = client_policy_store) -> Optional[str]:
+    """Admin diagnostics: is this account's tier kept away from unidentified callers?"""
+    return tier_cap_reason(store.get(DEFAULT_CLIENT), paygate_tier)
+
+
 def no_account_error(client: str, media: str, store: ClientPolicyStore = client_policy_store) -> dict:
     """Machine-readable extra fields for the 503 when the client policy leaves no account."""
     policy = store.get(client)
@@ -146,4 +191,5 @@ def no_account_error(client: str, media: str, store: ClientPolicyStore = client_
         "client": client or DEFAULT_CLIENT,
         "media": media,
         "need": "off" if need is None else normalize_rule(policy.rule_for(media)),
+        "max": normalize_max_tier(policy.max_tier),
     }

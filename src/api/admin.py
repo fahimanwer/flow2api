@@ -22,9 +22,11 @@ from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha
 from ..core.models import Token
 from ..core.client_policy import (
     DEFAULT_CLIENT,
+    MAX_TIERS,
     TIER_RULES,
     client_block_reason,
     client_policy_store,
+    default_cap_reason,
     normalize_client,
     normalize_rule,
 )
@@ -650,6 +652,7 @@ class ClientPolicyRequest(BaseModel):
     image_tier: str = "any"
     video_tier: str = "any"
     note: Optional[str] = ""
+    max_tier: Optional[str] = None  # ultra | pro | free; None keeps the current ceiling
 
 
 class GenerationConfigRequest(BaseModel):
@@ -949,6 +952,9 @@ async def _compute_skip_reasons(token_rows, now) -> Dict[int, Dict[str, Any]]:
             if reserved:
                 # Same rule as client_policy.client_block_reason: everyone else skips it.
                 parts.append(f"reserved for {reserved} (only that client may use it)")
+            elif default_cap_reason(row.get("user_paygate_tier")):
+                # Same rule as client_policy.client_block_reason: the `default` ceiling.
+                parts.append("reserved for named clients (callers with no X-Flow-Client / X-Client header can't use it)")
             exhausted = [f for f in _QUOTA_FAMILIES if token_manager.is_model_quota_exhausted(tid, f)]
             if service is not None:
                 ok, route_key = await service.has_connection_for_token(tid)
@@ -1793,7 +1799,8 @@ async def _client_policy_view() -> List[Dict[str, Any]]:
 
 @router.get("/api/client-policies")
 async def get_client_policies(token: str = Depends(verify_admin_token)):
-    return {"success": True, "policies": await _client_policy_view(), "rules": list(TIER_RULES)}
+    return {"success": True, "policies": await _client_policy_view(), "rules": list(TIER_RULES),
+            "max_tiers": list(MAX_TIERS)}
 
 
 @router.post("/api/client-policies")
@@ -1804,10 +1811,15 @@ async def upsert_client_policy(request: ClientPolicyRequest, token: str = Depend
     image_tier, video_tier = normalize_rule(request.image_tier), normalize_rule(request.video_tier)
     if (request.image_tier or "any").strip().lower() not in TIER_RULES or (request.video_tier or "any").strip().lower() not in TIER_RULES:
         raise HTTPException(status_code=400, detail=f"tiers must be one of {', '.join(TIER_RULES)}")
-    await db.upsert_client_policy(client, image_tier, video_tier, (request.note or "").strip()[:200])
+    max_tier = None
+    if request.max_tier is not None:
+        max_tier = request.max_tier.strip().lower()
+        if max_tier not in MAX_TIERS:
+            raise HTTPException(status_code=400, detail=f"max_tier must be one of {', '.join(MAX_TIERS)}")
+    await db.upsert_client_policy(client, image_tier, video_tier, (request.note or "").strip()[:200], max_tier)
     await client_policy_store.load(db)  # hot reload, same idea as reload_config_to_memory
     from ..core.logger import debug_logger
-    debug_logger.op_warning(f"[CLIENT_POLICY] {client}: image={image_tier} video={video_tier}")
+    debug_logger.op_warning(f"[CLIENT_POLICY] {client}: image={image_tier} video={video_tier} max={max_tier or 'unchanged'}")
     return {"success": True, "policies": await _client_policy_view()}
 
 

@@ -923,6 +923,13 @@ class Database:
                 "INSERT OR IGNORE INTO client_policies (client, image_tier, video_tier, note) VALUES (?, ?, ?, ?)",
                 ("pinterest-factory", "ultra", "ultra", "Pin images must be watermark-free: Ultra accounts only."),
             )
+            # 2026-09-30 (owner): Ultra accounts are for NAMED callers only. `max_tier` is the
+            # highest account tier a caller may use; the `default` row (no X-Flow-Client) is
+            # capped at Pro exactly once, when the column is added, so a later admin edit of
+            # `default` survives restarts. Fresh databases take the same path.
+            if not await self._column_exists(db, "client_policies", "max_tier"):
+                await db.execute("ALTER TABLE client_policies ADD COLUMN max_tier TEXT NOT NULL DEFAULT 'ultra'")
+                await db.execute("UPDATE client_policies SET max_tier = 'pro' WHERE client = 'default'")
 
             # Admin config table
             await db.execute("""
@@ -2371,19 +2378,22 @@ class Database:
             cursor = await db.execute("SELECT * FROM client_policies ORDER BY client")
             return [dict(row) for row in await cursor.fetchall()]
 
-    async def upsert_client_policy(self, client: str, image_tier: str, video_tier: str, note: str = "") -> None:
+    async def upsert_client_policy(self, client: str, image_tier: str, video_tier: str, note: str = "",
+                                   max_tier: Optional[str] = None) -> None:
+        """`max_tier=None` keeps the row's current ceiling ('ultra' for a new row)."""
         async with self._connect(write=True) as db:
             await db.execute(
                 """
-                INSERT INTO client_policies (client, image_tier, video_tier, note, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO client_policies (client, image_tier, video_tier, note, max_tier, updated_at)
+                VALUES (?, ?, ?, ?, COALESCE(?, 'ultra'), CURRENT_TIMESTAMP)
                 ON CONFLICT(client) DO UPDATE SET
                     image_tier = excluded.image_tier,
                     video_tier = excluded.video_tier,
                     note = excluded.note,
+                    max_tier = COALESCE(?, client_policies.max_tier),
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (client, image_tier, video_tier, note or ""),
+                (client, image_tier, video_tier, note or "", max_tier, max_tier),
             )
             await db.commit()
 
