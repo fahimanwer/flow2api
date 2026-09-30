@@ -253,8 +253,9 @@ class LoadBalancer:
                 filtered_reasons[token.id] = self.token_manager.health_cooldown_reason(token.id) or "Account health cooldown"
                 continue
             # Per-caller routing (client_policy.py): a token reserved for another client, or
-            # below the tier this client's policy demands, is out. Unidentified callers use
-            # the 'default' policy (any tier) so their behaviour is unchanged.
+            # outside the tiers this client's policy allows, is out. Unidentified callers use
+            # the 'default' policy: any tier up to its ceiling (Pro since 2026-09-30, so every
+            # Ultra is kept for named clients).
             # Device being moved to its own IP (port_migrations, durable): no new work until the
             # browser confirms, so nothing mints on one IP and redeems on the other.
             if token.id in ip_move_blocked:
@@ -423,6 +424,13 @@ class LoadBalancer:
                 debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token.id}: moving to its own IP")
                 continue
 
+            # Validation can refresh the account's tier (e.g. Pro -> Ultra): re-apply the client
+            # policy to what it returned, so an unnamed caller can never be handed an Ultra.
+            client_reason = client_block_reason(token, client, media)
+            if client_reason:
+                debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token.id} after validation: {client_reason}")
+                continue
+
             if reserve and not await self._reserve_slot(token.id, for_image_generation, for_video_generation):
                 debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token.id}: slot reservation failed")
                 continue
@@ -529,6 +537,12 @@ class LoadBalancer:
                     f"No {extra['need']} account is available for client {extra['client']} ({media}): "
                     f"{len(active_tokens)} active account(s), none reserved for it or at the required tier"
                 )
+                if extra["max"] != "ultra":
+                    message += (
+                        f"; accounts above {extra['max'].capitalize()} are for named clients only "
+                        "(send X-Flow-Client)" if extra["client"] == "default"
+                        else f"; this client's policy caps it at {extra['max'].capitalize()} accounts"
+                    )
             return {"message": message, "extra": extra}
         active_tokens = allowed_tokens
 
