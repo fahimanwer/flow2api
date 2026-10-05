@@ -2003,6 +2003,23 @@ async function googleSignedIn() {
   return false;
 }
 
+// Ultra server browsers (3.7.5): the host agent calls this through CDP Runtime.evaluate on this service worker
+// (debug port on the container loopback only) to point a FRESH profile at Flow2API before the first sign-in:
+// server, connection token and a fixed route key the server already expects. Then the proxy, alarms and the
+// captcha socket are re-applied, like the options page's settingsChanged. Returns the route key now in effect,
+// never the token. Not reachable from web pages or other extensions.
+globalThis.flowBootstrap = async function flowBootstrap(raw) {
+  const cfg = FlowSiteConfig.sanitizeBootstrapConfig(raw);
+  if (!cfg) return { ok: false, error: "invalid bootstrap config" };
+  await chrome.storage.local.set(cfg);
+  const settings = await getSettings();
+  await applyProxy(settings);
+  await setupAlarms();
+  closeSocket(); connectWS();
+  await log("INFO", "Server browser bootstrap applied", { serverBase: settings.serverBase, routeKey: settings.routeKey });
+  return { ok: true, routeKey: settings.routeKey, serverBase: settings.serverBase, version: extVersion() };
+};
+
 chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   if (req.action === "testCaptchaConnection") {
     closeSocket(); connectWS();

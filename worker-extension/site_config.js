@@ -35,8 +35,22 @@ function buildPacScript(proxyToken, allHosts) {
   return lines.join("\n");
 }
 
+/** Server-browser bootstrap (3.7.5, Ultra browsers): the host agent sets the server, the plugin connection
+ *  token and a fixed route key through CDP on this service worker before the first sign-in. Only these three
+ *  keys, only sane values; anything else is refused (returns null). Staff browsers never receive this call. */
+function sanitizeBootstrapConfig(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const serverBase = typeof raw.serverBase === "string" ? raw.serverBase.trim().replace(/\/+$/, "") : "";
+  const connectionToken = typeof raw.connectionToken === "string" ? raw.connectionToken.trim() : "";
+  const routeKey = typeof raw.routeKey === "string" ? raw.routeKey.trim() : "";
+  if (!/^https:\/\/[A-Za-z0-9.-]+(:\d+)?$/.test(serverBase)) return null;
+  if (!connectionToken || connectionToken.length > 200 || /\s/.test(connectionToken)) return null;
+  if (!/^[A-Za-z0-9._:-]{4,120}$/.test(routeKey)) return null;
+  return { serverBase, connectionToken, routeKey };
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { sanitizeSiteConfig, buildPacScript };
+  module.exports = { sanitizeSiteConfig, buildPacScript, sanitizeBootstrapConfig };
 } else {
-  globalThis.FlowSiteConfig = { sanitizeSiteConfig, buildPacScript };
+  globalThis.FlowSiteConfig = { sanitizeSiteConfig, buildPacScript, sanitizeBootstrapConfig };
 }

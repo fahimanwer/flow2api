@@ -204,6 +204,16 @@ async function noteCookieSyncResult(sent, result) {
   }
 }
 
+// Body of the clear call. 3.7.5: carries this profile's route key, so a server that keeps an
+// account for one server browser (Ultra browsers) can refuse a clear from any other profile;
+// accounts not kept that way are cleared exactly as before.
+function buildCookieClearBody(tokenId, seq, routeKey, version) {
+  const body = { action: "clear", token_id: tokenId, cookie_sync_seq: seq, ext_version: version };
+  const rk = String(routeKey || "").trim();
+  if (rk) body.route_key = rk;
+  return body;
+}
+
 // OFF must delete the server copy even when the Labs login is broken or Google is down:
 // a dedicated clear call that needs no Google round-trip, retried every minute until
 // the server acknowledges it.
@@ -218,7 +228,7 @@ async function clearCookiesOnServer(seq) {
     const resp = await fetch(`${settings.serverBase}/api/plugin/cookie-sync`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.connectionToken}` },
-      body: JSON.stringify({ action: "clear", token_id: tokenId, cookie_sync_seq: seq, ext_version: extVersion() }),
+      body: JSON.stringify(buildCookieClearBody(tokenId, seq, settings.routeKey, extVersion())),
       signal: abort.signal,
     });
     if (!resp.ok) return { ok: false, reason: `server ${resp.status}` };
@@ -291,5 +301,6 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     googleHostMatches, serializeGoogleCookies, isGoogleLoginCookieChange, cookieSyncPushAllowed,
     describeCookieSyncState, nextCookieSyncSeq, GOOGLE_COOKIE_TRIGGER_NAMES, COOKIE_SYNC_MAX_COOKIES, COOKIE_SYNC_MAX_BYTES,
+    buildCookieClearBody,
   };
 }

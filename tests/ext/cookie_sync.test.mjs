@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const {
   googleHostMatches, serializeGoogleCookies, isGoogleLoginCookieChange, cookieSyncPushAllowed,
-  describeCookieSyncState, nextCookieSyncSeq, COOKIE_SYNC_MAX_COOKIES,
+  describeCookieSyncState, nextCookieSyncSeq, COOKIE_SYNC_MAX_COOKIES, buildCookieClearBody,
 } = require("../../worker-extension/cookie_sync.js");
 
 test("googleHostMatches accepts google.com and subdomains only", () => {
@@ -66,4 +66,11 @@ test("nextCookieSyncSeq is strictly increasing even within one millisecond", () 
   const a = nextCookieSyncSeq(), b = nextCookieSyncSeq(), c = nextCookieSyncSeq();
   assert.ok(a < b && b < c);
   assert.ok(a >= Date.now() - 5000);
+});
+
+test("buildCookieClearBody carries the route key when the profile has one (3.7.5), unchanged otherwise", () => {
+  assert.deepEqual(buildCookieClearBody(55, 9, " ultra-flow-ultra-03-ab ", "3.7.5"),
+    { action: "clear", token_id: 55, cookie_sync_seq: 9, ext_version: "3.7.5", route_key: "ultra-flow-ultra-03-ab" });
+  assert.deepEqual(buildCookieClearBody(55, 9, "", "3.7.5"), { action: "clear", token_id: 55, cookie_sync_seq: 9, ext_version: "3.7.5" });
+  assert.deepEqual(buildCookieClearBody(55, 9, undefined, "3.7.5"), { action: "clear", token_id: 55, cookie_sync_seq: 9, ext_version: "3.7.5" });
 });
