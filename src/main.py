@@ -20,8 +20,9 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
-from .api import routes, admin, ext_update, suno
+from .api import routes, admin, ext_update, suno, ultra
 from .services.suno_service import SunoService
+from .services.ultra_browsers import UltraService
 
 
 _LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -273,6 +274,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠ Suno provider failed to start: {e}")
 
+    # Ultra browsers: coordinator (leases, drains, health, onboarding release) + Telegram outbox sender.
+    try:
+        ultra_service.start()
+        print("✓ Ultra browsers coordinator started"
+              f" (management {'ON' if os.environ.get('ULTRA_BROWSERS_ENABLED', '').strip().lower() in ('1', 'true', 'yes', 'on') else 'off'})")
+    except Exception as e:
+        print(f"⚠ Ultra browsers coordinator failed to start: {e}")
+
     # Server-side reCAPTCHA fallback: idle/over-cap/disabled browser sweeper (2026-09-23).
     fallback_sweeper_handle = None
     try:
@@ -286,6 +295,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await ultra_service.stop()
         await suno_service.close()
         if fallback_sweeper_handle is not None:
             fallback_sweeper_handle.cancel()
@@ -351,6 +361,20 @@ routes.set_generation_handler(generation_handler)
 admin.set_dependencies(token_manager, proxy_manager, db, concurrency_manager)
 ext_update.set_dependencies(db, admin.verify_admin_token)
 
+
+def _ultra_ext_connected(route_key: str):
+    """Is a worker extension with this route key connected right now (server side, R3/A4)?"""
+    from .services.browser_captcha_extension import ExtensionCaptchaService
+    svc = ExtensionCaptchaService._instance
+    if svc is None:
+        return None
+    return any((c.route_key or "") == route_key for c in svc.active_connections)
+
+
+ultra_service = UltraService(db, ext_connected=_ultra_ext_connected, published_version=ext_update._read_zip_version)
+admin.set_ultra_service(ultra_service)
+ultra.set_dependencies(ultra_service, admin.verify_admin_token)
+
 # Create FastAPI app
 app = FastAPI(
     title="Flow2API",
@@ -381,6 +405,7 @@ app.include_router(routes.router)
 app.include_router(admin.router)
 app.include_router(ext_update.router)
 app.include_router(suno.router)
+app.include_router(ultra.router)
 
 # Static files - serve tmp directory for cached files
 tmp_dir = Path(__file__).parent.parent / "tmp"
