@@ -15,6 +15,7 @@ RUN apt-get update \
         x11-utils \
         xauth \
         xvfb \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-install Playwright Chromium at build time (used by the personal/browser captcha modes and the server fallback)
@@ -36,4 +37,9 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=8).close()"
 
+# tini is PID 1 and reaps orphans. Chromium's crashpad handler and a closed browser's children are
+# re-parented to PID 1; with python as PID 1 nothing reaped them and the zombies filled the
+# container's pid limit (2026-10-05: ~30k). Coolify runs this Dockerfile without --init, so the
+# compose file's `init: true` never applied. -s keeps reaping if an outer init is ever added.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["/usr/local/bin/entrypoint.headed.sh"]
