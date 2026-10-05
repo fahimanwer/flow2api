@@ -42,6 +42,9 @@ AUTH_BAD_S = 1800
 LEASE_S = {"login": 180, "create": 300, "update": 300, "bootstrap": 120, "start": 150, "restart": 150,
            "stop": 90, "status": 90, "screenshot": 60}
 CODE_TTL_S = 600
+LOGIN_MAX_S = 1500          # agent's own attempt cap is 20 min; this is the server's backstop
+OBS_FRESH_S = 120           # an observation older than this is unknown
+SLOW_OBS_FRESH_S = 1800     # egress IP / cookie reads run every 10 min
 NUMBER_TTL_S = 300
 ALERT_MAX_TRIES = 20
 SCREENSHOT_TTL_S = 300
@@ -121,12 +124,20 @@ def derive_health(browser: Dict[str, Any], token: Optional[Dict[str, Any]], obs:
     (state, detail, marks) where marks are the updated cookies_absent_since / auth_bad_since.
     Network, CDP or proxy trouble is 'degraded' (unknown), never 'logged_out'; cookies alone never make 'ok'."""
     marks = {"cookies_absent_since": browser.get("cookies_absent_since"), "auth_bad_since": browser.get("auth_bad_since")}
+
+    def fresh(key, limit):
+        ts = _parse(obs.get(key))
+        return ts is not None and (now - ts).total_seconds() <= limit
+
+    if not fresh("at", OBS_FRESH_S):
+        return "degraded", "no fresh observation from the host agent", marks
     if obs.get("container_up") is False:
         return "degraded", "container is not running", marks
     expected_ip = (browser.get("expected_egress_ip") or "").strip()
-    egress = (obs.get("egress_ip") or "").strip()
+    egress = (obs.get("egress_ip") or "").strip() if fresh("egress_at", SLOW_OBS_FRESH_S) else ""
     egress_ok = bool(egress) and (not expected_ip or egress == expected_ip)
-    cookies = obs.get("google_cookies")  # True / False / None (unknown)
+    # True / False / None (unknown); an old read is unknown, never evidence either way
+    cookies = obs.get("google_cookies") if fresh("cookies_at", SLOW_OBS_FRESH_S) else None
     cookies_at = _parse(obs.get("cookies_at"))
 
     # Google cookies absent on two reads >= 10 min apart, egress healthy → logged out.
@@ -156,8 +167,8 @@ def derive_health(browser: Dict[str, Any], token: Optional[Dict[str, Any]], obs:
         return "degraded", ("egress IP unknown" if not egress else f"egress {egress} is not the expected {expected_ip}"), marks
     if not token:
         return "degraded", "no account bound yet", marks
-    if ext_connected is False:
-        return "degraded", "extension not connected", marks
+    if ext_connected is not True:
+        return "degraded", "extension not connected" if ext_connected is False else "extension connection unknown", marks
     if not token.get("is_active"):
         return "degraded", f"account disabled ({token.get('ban_reason') or 'manual'})", marks
     if cookies is None:
@@ -646,9 +657,12 @@ class UltraService:
         now = _iso(self.now())
         n = 0
         async with self.db.connect(write=True) as conn:
+            # a sign-in also ends LOGIN_MAX_S after it was leased, however often its lease was renewed
+            login_cutoff = _iso(self.now() - timedelta(seconds=LOGIN_MAX_S))
             rows = await (await conn.execute(
-                "SELECT id, browser, kind, mutating, attempt_id FROM ultra_jobs WHERE state = 'leased' AND lease_until < ?",
-                (now,))).fetchall()
+                "SELECT id, browser, kind, mutating, attempt_id FROM ultra_jobs WHERE state = 'leased' "
+                "AND (lease_until < ? OR (kind = 'login' AND leased_at < ?))",
+                (now, login_cutoff))).fetchall()
             for job_id, browser, kind, mutating, attempt_id in rows:
                 n += 1
                 if not mutating:
@@ -928,18 +942,6 @@ class UltraService:
                                (int(token_id), _iso(self.now()), name))
             await conn.commit()
 
-    async def adopt_token(self, name: str, token_id: int) -> None:
-        """The managed browser pushed an account that already had a row (created after the browser was added):
-        bind it and put it on the onboarding hold with the browser's caller restriction, in one transaction."""
-        async with self.db.connect(write=True) as conn:
-            cur = await conn.execute("UPDATE ultra_browsers SET token_id = ?, updated_at = ? WHERE name = ? AND token_id IS NULL "
-                                     "AND onboarding_hold = 1", (int(token_id), _iso(self.now()), name))
-            if cur.rowcount:
-                await conn.execute(
-                    "UPDATE tokens SET ultra_hold = 'onboarding', reserved_client = "
-                    "(SELECT reserved_client FROM ultra_browsers WHERE name = ?) WHERE id = ?", (name, int(token_id)))
-            await conn.commit()
-
     async def note_verified(self, token_id: int) -> None:
         """A push for this account was verified by Google's API just now (release condition, R3-3)."""
         async with self.db.connect(write=True) as conn:
@@ -965,6 +967,15 @@ class UltraService:
                 await conn.commit()
                 return False, ["not onboarding"]
             missing = []
+            # Lifecycle comes first (Codex code review #2): never released while stopped, failing, being
+            # (re)started, updated or drained — only from the onboarding state a verified start/sign-in left.
+            if b["desired_state"] != "running" or b["state"] != "onboarding":
+                missing.append(f"browser is {b['state']} (wanted {b['desired_state']})")
+            busy = await (await conn.execute(
+                "SELECT kind FROM ultra_jobs WHERE browser = ? AND mutating = 1 AND state IN ('draining', 'queued', 'leased')",
+                (name,))).fetchone()
+            if busy:
+                missing.append(f"{busy[0]} in progress")
             t = None
             if b.get("token_id") is not None:
                 cur = await conn.execute(
@@ -1117,6 +1128,11 @@ class UltraService:
         latest = self._published_version()
         if not latest:
             return
+        # one browser at a time across the host (Codex code review): nothing new while any update is open
+        async with self.db.connect() as c:
+            if await (await c.execute(
+                    "SELECT 1 FROM ultra_jobs WHERE kind = 'update' AND state IN ('draining', 'queued', 'leased')")).fetchone():
+                return
         for b in await self.list_browsers():
             if b["mode"] != "managed" or b["desired_state"] != "running" or b["state"] not in ("ok", "degraded"):
                 continue
@@ -1136,6 +1152,7 @@ class UltraService:
             try:
                 await self.request_job(b["name"], "update", by="updater")
                 debug_logger.op_warning(f"[ULTRA] {b['name']}: extension {seen} → {latest} update requested")
+                return   # the next browser waits until this update has finished
             except UltraError:
                 pass
 

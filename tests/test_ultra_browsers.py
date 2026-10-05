@@ -10,6 +10,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -197,7 +198,7 @@ class PushTests(Base):
                     current_project_id=kw.get("project_id"), is_active=kw.get("is_active", True),
                     ban_reason=kw.get("ban_reason"), reserved_client=kw.get("reserved_client", ""),
                     ultra_hold=kw.get("ultra_hold", ""))
-        tok.id = await self.db.add_token(tok)
+        tok.id = await self.db.add_token(tok, push_route_key=kw.get("push_route_key"))
         return tok
 
     def _push(self, st, email, route_key, port=8011, **extra):
@@ -249,6 +250,7 @@ class PushTests(Base):
         self.assertFalse(ok)
         self.assertIn("route key", missing)
         await self._sql("UPDATE ultra_browsers SET route_acked = 1, state = 'onboarding' WHERE name = ?", (name,))
+        await self._sql("UPDATE ultra_jobs SET state = 'done'")
         await self.svc.note_verified(tid)
         t = await self.db.get_token(tid)
         self.assertEqual((t.is_active, t.ban_reason, t.ultra_hold), (True, None, ""))
@@ -265,14 +267,42 @@ class PushTests(Base):
         self.tm.validate_and_promote.assert_awaited()
         self.assertEqual(self.tm.validate_and_promote.await_args.kwargs["push_route_key"], out["route_key"])
 
-    async def test_account_created_after_the_browser_is_adopted_on_hold(self):
-        out = await self._managed()
-        tid = await self._token("new@x.com", port=8003)   # appeared later, e.g. from a laptop push before the guard
-        r = await asyncio.to_thread(self._push, "st-1", "new@x.com", out["route_key"])
-        self.assertEqual(r.status_code, 200, r.text)
+    async def test_promotion_decides_ownership_in_its_own_transaction(self):
+        """REGRESSION (code review #1): a laptop push that passed every earlier check, then the account became
+        managed before its credential write — the write itself refuses it."""
+        tid = await self._token("Late@X.com ", port=8003, route_key="auto-mac")
+        out = await self._managed(email="late@x.com")
+        await self._sql("UPDATE ultra_browsers SET token_id = NULL")   # as if management landed after the pre-check
+        await self._sql("UPDATE tokens SET ultra_hold = '', reserved_client = ''")
+        self.assertFalse(await self.db.promote_credential_guarded(tid, "auto-mac", st="st-laptop"))
+        self.assertEqual((await self.db.get_token(tid)).st, "st-Late@X.com ")
+        # the browser's own route binds the row and holds + restricts it in the same write
+        self.assertTrue(await self.db.promote_credential_guarded(tid, out["route_key"], st="st-browser"))
         t = await self.db.get_token(tid)
-        self.assertEqual((t.ultra_hold, t.reserved_client), ("onboarding", "pinterest-factory"))
+        self.assertEqual((t.st, t.ultra_hold, t.reserved_client), ("st-browser", "onboarding", "pinterest-factory"))
         self.assertEqual((await self.svc.get_browser(out["name"]))["token_id"], tid)
+        # an unmanaged account is written as before
+        other = await self._token("plain@x", port=8002)
+        self.assertTrue(await self.db.promote_credential_guarded(other, "", st="st-new"))
+
+    async def test_new_account_insert_decides_ownership_in_its_own_transaction(self):
+        """REGRESSION (code review #1): management registered after push_guard, before the INSERT."""
+        out = await self._managed()
+        with self.assertRaises(Exception) as e:
+            await self.db.add_token(Token(st="st-laptop", at="at", email="NEW@x.com", is_active=True), push_route_key="auto-mac")
+        self.assertEqual(type(e.exception).__name__, "UltraOwnershipError")
+        self.assertEqual(await self._sql("SELECT COUNT(*) FROM tokens"), [(0,)])
+        with self.assertRaises(Exception):
+            await self.db.add_token(Token(st="st-x", at="at", email="other@x.com"), push_route_key=out["route_key"])
+        tid = await self.db.add_token(Token(st="st-ok", at="at", email="new@x.com", is_active=True), push_route_key=out["route_key"])
+        t = await self.db.get_token(tid)
+        self.assertEqual((t.is_active, t.ban_reason, t.ultra_hold, t.reserved_client),
+                         (False, "ultra_onboarding", "onboarding", "pinterest-factory"))
+        self.assertEqual((await self.svc.get_browser(out["name"]))["token_id"], tid)
+        # and the HTTP path turns the race into a 409 with nothing written
+        with patch.object(self.svc, "push_guard", AsyncMock(return_value=(None, None))):
+            r = await asyncio.to_thread(self._push, "st-race", "second@x.com", out["route_key"])
+        self.assertEqual(r.status_code, 409, r.text)
 
     async def test_cookie_clear_requires_the_managed_route(self):
         """REGRESSION (R3-1): cookie clear carries route_key; managed accounts require it."""
@@ -563,6 +593,91 @@ class DrainTests(Base):
         await self.svc.request_job(name, "screenshot")  # read-only may run beside it
 
 
+class LifecycleReleaseTests(Base):
+    async def test_late_push_never_releases_a_stopped_onboarding_browser(self):
+        """REGRESSION (code review #2): stop during onboarding, then a verified push arrives."""
+        out = await self._managed()
+        name = out["name"]
+        tid = await self._token("new@x.com", port=8011, route_key=out["route_key"], active=False,
+                                ban_reason="ultra_onboarding", ultra_hold="onboarding", reserved_client="pinterest-factory",
+                                current_project_id="p1")
+        await self.svc.bind_token(name, tid)
+        await self._sql("UPDATE ultra_browsers SET route_acked = 1, state = 'onboarding' WHERE name = ?", (name,))
+        await self._sql("UPDATE ultra_jobs SET state = 'done'")
+        await self.svc.request_job(name, "stop")
+        ok, missing = await self.svc.finalize_onboarding(name)       # stop requested, not done yet
+        self.assertFalse(ok)
+        job = await self.svc.lease("h1")
+        await self.svc.handle_result("h1", job["id"], "done", {})
+        await self.svc.note_verified(tid)                             # the late push
+        t = await self.db.get_token(tid)
+        self.assertEqual((t.is_active, t.ultra_hold), (False, "onboarding"))
+        b = await self.svc.get_browser(name)
+        self.assertEqual((b["state"], b["desired_state"]), ("stopped", "stopped"))
+        await self.svc.request_job(name, "start")                     # desired running, start not verified yet
+        await self.svc.note_verified(tid)
+        self.assertEqual((await self.db.get_token(tid)).ultra_hold, "onboarding")
+        job = await self.svc.lease("h1")
+        await self.svc.handle_result("h1", job["id"], "done", {"ready": True})
+        self.assertEqual((await self.svc.get_browser(name))["state"], "onboarding")
+        await self.svc.note_verified(tid)
+        t = await self.db.get_token(tid)
+        self.assertEqual((t.is_active, t.ultra_hold), (True, ""))
+
+    async def test_login_ends_at_the_server_backstop_even_with_renewals(self):
+        out = await self._managed()
+        await self._sql("UPDATE ultra_browsers SET route_acked = 1 WHERE name = ?", (out["name"],))
+        await self._sql("UPDATE ultra_jobs SET state = 'done'")
+        await self.svc.request_job(out["name"], "login")
+        login = await self.svc.lease("h1")
+        for _ in range(ub.LOGIN_MAX_S // 60 + 1):
+            self.clock.advance(60)
+            await self.svc.renew([login["id"]])
+            await self.svc.expire_leases()
+        self.assertEqual((await self._job(out["name"], "login"))[1], "uncertain")
+
+    async def test_updates_run_one_browser_at_a_time(self):
+        names = []
+        for i, port in enumerate((8011, 8002)):
+            await self._sql("UPDATE plugin_config SET ext_proxy_pool = ?", (json.dumps(dict(POOL, ports=[8001, 8003])),))
+            out = await self._managed(email=f"u{i}@x.com", port=port)
+            names.append(out["name"])
+        obs = json.dumps({"ext_version": "3.7.4"})
+        await self._sql("UPDATE ultra_browsers SET state = 'ok', onboarding_hold = 0, obs = ?", (obs,))
+        await self._sql("UPDATE ultra_jobs SET state = 'done', updated_at = '2000-01-01'")
+        self.svc._published_version = lambda: "3.7.5"
+        await self.svc.schedule_updates()
+        await self.svc.schedule_updates()
+        rows = await self._sql("SELECT browser FROM ultra_jobs WHERE kind = 'update' AND state IN ('draining', 'queued')")
+        self.assertEqual(len(rows), 1)
+        await self._sql("UPDATE ultra_jobs SET state = 'done' WHERE kind = 'update'")
+        await self.svc.schedule_updates()
+        rows = await self._sql("SELECT browser FROM ultra_jobs WHERE kind = 'update' AND state IN ('draining', 'queued')")
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(rows[0][0], (await self._sql("SELECT browser FROM ultra_jobs WHERE kind = 'update' AND state = 'done'"))[0][0])
+
+
+class DownloadAuthTests(Base):
+    async def test_header_auth_download_and_old_query_form(self):
+        """REGRESSION (code review #4): the agent authenticates the zip download with a header."""
+        from src.api import ext_update
+        tmp = Path(self._tmp.name)
+        z = tmp / "worker-latest.zip"
+        z.write_bytes(b"PK\x05\x06" + b"\0" * 18)
+        ext_update.set_dependencies(self.db, admin_module.verify_admin_token)
+        app = FastAPI()
+        app.include_router(ext_update.router)
+        client = TestClient(app)
+        with patch.object(ext_update, "EXT_ZIP", z):
+            r = await asyncio.to_thread(client.get, "/download/worker-latest.zip", headers={"Authorization": f"Bearer {CONN}"})
+            self.assertEqual(r.status_code, 200)
+            r = await asyncio.to_thread(client.get, f"/download/worker-latest.zip?token={CONN}")
+            self.assertEqual(r.status_code, 200)
+            for bad in ({"Authorization": "Bearer nope"}, {}):
+                r = await asyncio.to_thread(client.get, "/download/worker-latest.zip", headers=bad)
+                self.assertEqual(r.status_code, 401)
+
+
 class AlertTests(Base):
     async def test_alert_rows_follow_state_changes_once(self):
         await self.svc.register_observed(name="flow-ultra-02", container="flow-ultra-02", port=8019, token_id=None)
@@ -604,7 +719,8 @@ class HealthTests(unittest.TestCase):
     NOW = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 
     def _obs(self, **kw):
-        base = {"container_up": True, "egress_ip": "1.2.3.4", "google_cookies": True, "cookies_at": self.NOW.isoformat()}
+        base = {"at": self.NOW.isoformat(), "container_up": True, "egress_ip": "1.2.3.4", "egress_at": self.NOW.isoformat(),
+                "google_cookies": True, "cookies_at": self.NOW.isoformat()}
         base.update(kw)
         return base
 
@@ -624,9 +740,9 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(st, "degraded")
         b.update(marks)
         later = self.NOW + timedelta(minutes=5)
-        self.assertEqual(derive_health(b, tok, self._obs(google_cookies=False, cookies_at=later.isoformat()), True, later)[0], "degraded")
+        self.assertEqual(derive_health(b, tok, self._obs(google_cookies=False, cookies_at=later.isoformat(), at=later.isoformat()), True, later)[0], "degraded")
         later = self.NOW + timedelta(minutes=11)
-        self.assertEqual(derive_health(b, tok, self._obs(google_cookies=False, cookies_at=later.isoformat()), True, later)[0], "logged_out")
+        self.assertEqual(derive_health(b, tok, self._obs(google_cookies=False, cookies_at=later.isoformat(), at=later.isoformat()), True, later)[0], "logged_out")
 
     def test_cookies_alone_never_make_ok_and_dead_labs_is_separate(self):
         b = {"expected_egress_ip": ""}
@@ -635,7 +751,22 @@ class HealthTests(unittest.TestCase):
         st, _, marks = derive_health(b, tok, self._obs(), True, self.NOW)
         b.update(marks)
         later = self.NOW + timedelta(minutes=31)
-        self.assertEqual(derive_health(b, tok, self._obs(cookies_at=later.isoformat()), True, later)[0], "labs_dead")
+        self.assertEqual(derive_health(b, tok, self._obs(cookies_at=later.isoformat(), at=later.isoformat()), True, later)[0], "labs_dead")
+
+    def test_stale_or_unknown_observations_are_degraded(self):
+        """Code review (non-blocking): expired/unknown observations never give ok."""
+        b = {"expected_egress_ip": ""}
+        tok = {"is_active": True, "ban_reason": None}
+        old = (self.NOW - timedelta(minutes=5)).isoformat()
+        self.assertEqual(derive_health(b, tok, self._obs(at=old), True, self.NOW)[0], "degraded")
+        self.assertEqual(derive_health(b, tok, self._obs(at=None), True, self.NOW)[0], "degraded")
+        very_old = (self.NOW - timedelta(hours=2)).isoformat()
+        self.assertEqual(derive_health(b, tok, self._obs(egress_at=very_old), True, self.NOW)[0], "degraded")
+        self.assertEqual(derive_health(b, tok, self._obs(cookies_at=very_old), True, self.NOW)[0], "degraded")
+        self.assertEqual(derive_health(b, tok, self._obs(), None, self.NOW)[0], "degraded")
+        # an old "cookies absent" read is not evidence of a logout
+        st, _, marks = derive_health(b, tok, self._obs(google_cookies=False, cookies_at=very_old), True, self.NOW)
+        self.assertEqual((st, marks["cookies_absent_since"]), ("degraded", None))
 
 
 class VaultTests(unittest.TestCase):

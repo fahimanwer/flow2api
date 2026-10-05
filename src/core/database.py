@@ -23,6 +23,10 @@ def proxy_port(url: Optional[str]) -> Optional[int]:
 def with_proxy_port(url: str, port: int) -> str:
     return re.sub(r":\d{2,5}(/?)$", rf":{int(port)}\1", (url or "").strip())
 
+class UltraOwnershipError(ValueError):
+    """A push-created credential for an account owned by a managed Ultra browser, from another route."""
+
+
 class Database:
     """SQLite database manager"""
 
@@ -1373,6 +1377,66 @@ class Database:
                     return True, False
         return True, True
 
+    async def _ultra_claim_for_insert(self, db, email: str, route_key: str):
+        """(name, reserved_client) of the managed browser that owns a NEW account row, None when unmanaged.
+        Raises UltraOwnershipError for a foreign route or a managed route carrying another email."""
+        email_n = (email or "").strip().lower()
+        rk = (route_key or "").strip()
+        by_email = await (await db.execute(
+            "SELECT name, reserved_client, route_key, token_id, onboarding_hold FROM ultra_browsers "
+            "WHERE email_norm = ? AND mode = 'managed'", (email_n,))).fetchone()
+        by_route = await (await db.execute(
+            "SELECT name, email_norm FROM ultra_browsers WHERE route_key = ? AND mode = 'managed'", (rk,))).fetchone() if rk else None
+        if by_route is not None and (by_email is None or by_route[0] != by_email[0]):
+            raise UltraOwnershipError(f"route key belongs to Ultra browser {by_route[0]} ({by_route[1]}), not {email_n}")
+        if by_email is None:
+            return None
+        if rk != (by_email[2] or "") or by_email[3] is not None or not by_email[4]:
+            raise UltraOwnershipError(f"{email_n} is owned by Ultra browser {by_email[0]}")
+        return by_email[0], by_email[1]
+
+    async def promote_credential_guarded(self, token_id: int, push_route_key: Optional[str], **fields) -> bool:
+        """Credential write of a device push, with Ultra ownership decided in the SAME write transaction
+        (by the token's normalized email, the route and the bound token). A managed browser's own route on a
+        still-unbound onboarding row binds it and puts the account on the onboarding hold atomically. Returns
+        False (nothing written) for a foreign route."""
+        rk = (push_route_key or "").strip()
+        async with self._connect(write=True) as db:
+            row = await (await db.execute("SELECT email FROM tokens WHERE id = ?", (int(token_id),))).fetchone()
+            if row is None:
+                await db.commit()
+                return False
+            email_n = (row[0] or "").strip().lower()
+            owners = await (await db.execute(
+                "SELECT name, route_key, token_id, reserved_client, onboarding_hold FROM ultra_browsers "
+                "WHERE mode = 'managed' AND (token_id = ? OR email_norm = ? OR (route_key = ? AND ? != ''))",
+                (int(token_id), email_n, rk, rk))).fetchall()
+            if len({o[0] for o in owners}) > 1:
+                await db.commit()
+                return False
+            if owners:
+                name, b_rk, b_tid, client, onboarding = owners[0]
+                if rk != (b_rk or "") or (b_tid is not None and int(b_tid) != int(token_id)):
+                    await db.commit()
+                    return False
+                same_email = await (await db.execute("SELECT 1 FROM ultra_browsers WHERE name = ? AND email_norm = ?",
+                                                      (name, email_n))).fetchone()
+                if same_email is None:
+                    await db.commit()
+                    return False
+                if b_tid is None:
+                    if not onboarding:
+                        await db.commit()
+                        return False
+                    await db.execute("UPDATE ultra_browsers SET token_id = ? WHERE name = ? AND token_id IS NULL", (int(token_id), name))
+                    await db.execute("UPDATE tokens SET ultra_hold = 'onboarding', reserved_client = ? WHERE id = ?",
+                                     (client or "", int(token_id)))
+            if fields:
+                sets = ", ".join(f"{k} = ?" for k in fields)
+                await db.execute(f"UPDATE tokens SET {sets} WHERE id = ?", [*fields.values(), int(token_id)])
+            await db.commit()
+        return True
+
     async def ultra_route_allows(self, token_id: int, route_key: Optional[str]) -> bool:
         """Credential writes from a push: a managed account accepts only its own browser's route key."""
         async with self._connect() as db:
@@ -1464,9 +1528,20 @@ class Database:
             # Continue even if migration fails
 
     # Token operations
-    async def add_token(self, token: Token) -> int:
-        """Add a new token"""
+    async def add_token(self, token: Token, push_route_key: Optional[str] = None) -> int:
+        """Add a new token. `push_route_key` (a device push): ownership by a managed Ultra browser is decided
+        in THIS write transaction — the browser's own route creates the row held, restricted and bound to the
+        browser; any other route is refused (UltraOwnershipError). Nothing can register management between
+        the check and the INSERT (R3-1, Codex code review #1)."""
         async with self._connect(write=True) as db:
+            browser = None
+            if push_route_key is not None:
+                browser = await self._ultra_claim_for_insert(db, token.email, push_route_key)
+                if browser is not None:
+                    token = token.model_copy(update={
+                        "is_active": False, "ban_reason": "ultra_onboarding", "banned_at": datetime.now(timezone.utc),
+                        "ultra_hold": "onboarding", "reserved_client": browser[1] or "",
+                    })
             cursor = await db.execute("""
                 INSERT INTO tokens (st, at, at_expires, email, name, remark, is_active,
                                    credits, user_paygate_tier, current_project_id, current_project_name,
@@ -1489,8 +1564,11 @@ class Database:
                   token.last_st_refresh_result,
                   token.ban_reason, token.banned_at,
                   token.reserved_client or "", token.ultra_hold or ""))
-            await db.commit()
             token_id = cursor.lastrowid
+            if browser is not None:
+                await db.execute("UPDATE ultra_browsers SET token_id = ?, updated_at = ? WHERE name = ? AND token_id IS NULL",
+                                 (token_id, datetime.now(timezone.utc).isoformat(), browser[0]))
+            await db.commit()
 
             # Create stats entry
             await db.execute("""

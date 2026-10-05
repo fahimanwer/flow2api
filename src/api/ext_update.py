@@ -92,11 +92,15 @@ async def ext_version(authorization: Optional[str] = Header(None)):
 
 
 @router.get("/download/worker-latest.zip")
-async def ext_download(token: str = Query(...)):
+async def ext_download(token: Optional[str] = Query(None), authorization: Optional[str] = Header(None)):
     """Serve the current package. Query-token authed (not a header) because this
-    is opened as a plain browser download from the popup's Download button."""
+    is opened as a plain browser download from the popup's Download button.
+    Programs (the Ultra host agent) send `Authorization: Bearer <token>` instead, so the
+    token never lands in the access log's request line."""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
     plugin_config = await db.get_plugin_config()
-    if not plugin_config.connection_token or token != plugin_config.connection_token:
+    if not token or not plugin_config.connection_token or token != plugin_config.connection_token:
         raise HTTPException(status_code=401, detail="Invalid token")
     if not EXT_ZIP.exists():
         raise HTTPException(status_code=404, detail="No extension package has been published yet")

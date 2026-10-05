@@ -1,5 +1,6 @@
 """Token manager for Flow2API with AT auto-refresh"""
 import asyncio
+import inspect
 import hashlib
 import re
 from dataclasses import dataclass
@@ -921,6 +922,7 @@ class TokenManager:
         session_result: Optional[dict] = None,
         reserved_client: str = "",
         ultra_hold: str = "",
+        push_route_key: Optional[str] = None,
     ) -> Token:
         """Add a new token and prepare its pooled projects. is_active=False creates the
         row disabled from the start (caller verified the credential is dead) so a dead
@@ -1023,7 +1025,10 @@ class TokenManager:
             ultra_hold=ultra_hold or "",
         )
 
-        token_id = await self.db.add_token(token)
+        # A device push passes its route key: Ultra ownership is decided inside the INSERT transaction
+        # (UltraOwnershipError propagates; the DB may hold/restrict/bind the row itself).
+        token_id = await (self.db.add_token(token, push_route_key=push_route_key) if push_route_key is not None
+                          else self.db.add_token(token))
         token.id = token_id
 
         pooled_projects[0].token_id = token_id
@@ -1571,21 +1576,23 @@ class TokenManager:
                 verified = False
                 debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: non-auth error while verifying AT: {str(verify_err)}")
 
-            # Ultra ownership at write time (R3-1): a push for an account owned by a managed Ultra
-            # browser stores nothing unless it came from that browser's route key.
-            if push_route_key is not None and hasattr(self.db, "ultra_route_allows"):
-                if not await self.db.ultra_route_allows(token_id, push_route_key):
+            # Promote: ST + AT + expiry (+ credits when verified) in one write. A device push goes through
+            # the guarded write: Ultra ownership is decided in the same transaction as the credential
+            # (R3-1) — a push for an account owned by a managed Ultra browser stores nothing unless it
+            # came from that browser's route key.
+            guarded = getattr(self.db, "promote_credential_guarded", None)
+            if push_route_key is not None and inspect.iscoroutinefunction(guarded):
+                if not await guarded(token_id, push_route_key, st=st, at=new_at, at_expires=new_at_expires, **credits_fields):
                     debug_logger.op_warning(f"[ULTRA_GUARD] token={token_id} credential write refused: push from another route key")
                     return RefreshOutcome(False, "ultra_guard", verified=False)
-
-            # Promote: ST + AT + expiry (+ credits when verified) in one write.
-            await self.db.update_token(
-                token_id,
-                st=st,
-                at=new_at,
-                at_expires=new_at_expires,
-                **credits_fields,
-            )
+            else:
+                await self.db.update_token(
+                    token_id,
+                    st=st,
+                    at=new_at,
+                    at_expires=new_at_expires,
+                    **credits_fields,
+                )
             if verified:
                 self._mark_at_valid(token_id)
                 await self._note_verified_at(token_id, new_at)

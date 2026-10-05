@@ -17,7 +17,7 @@ import urllib.request
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
-from ..core.database import Database, proxy_port, with_proxy_port
+from ..core.database import Database, UltraOwnershipError, proxy_port, with_proxy_port
 from ..core.account_tiers import normalize_user_paygate_tier
 from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha_task_type
 from ..core.models import Token
@@ -3258,8 +3258,6 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
             raise HTTPException(status_code=409, detail=f"refused: {ultra_refusal}")
         if ultra_row and ultra_row.get("token_id") is not None and existing_token is None:
             existing_token = await db.get_token(int(ultra_row["token_id"]))
-        elif ultra_row and ultra_row.get("token_id") is None and existing_token is not None:
-            await ultra_service.adopt_token(ultra_row["name"], existing_token.id)
 
     # Legacy extensions (< 3.3.5) ignore `action` and clear their login state on any 2xx,
     # so they must keep receiving the old "updated" action; only newer builds understand
@@ -3453,6 +3451,8 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                 ban_reason=("ultra_onboarding" if onboarding else ("auto_at_stale" if dead_grant else None)),
                 reserved_client=(ultra_row.get("reserved_client") or "") if onboarding else "",
                 ultra_hold=("onboarding" if onboarding else ""),
+                # ownership re-decided inside the INSERT transaction (the browser may have been added since)
+                push_route_key=reported_route_key or "",
                 # The AT we probed above is the one stored (no second, unprobed mint).
                 session_result=result,
                 protocol_mode=("protocol" if google_cookies else "session"),
@@ -3464,9 +3464,6 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                 refresh_interval_minutes=request.get("refresh_interval_minutes", 120),
             )
 
-            if onboarding:
-                # bind before routing: the routing write accepts this route key only for the browser's token
-                await ultra_service.bind_token(ultra_row["name"], new_token.id)
             # Slice B + #1: persist the reported residential proxy, real browser UA, and
             # bind the account to this device via its route key.
             _redeem_updates = {}
@@ -3517,6 +3514,9 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
             }
         except HTTPException:
             raise
+        except UltraOwnershipError as e:
+            debug_logger.op_warning(f"[ULTRA_GUARD] new account refused at insert for {email}: {e}")
+            raise HTTPException(status_code=409, detail=f"refused: {e}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to add token: {str(e)}")
 
