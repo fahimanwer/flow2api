@@ -1,0 +1,26 @@
+# Ultra host agent (docker/flow-ultra/agent/ultra_agent.py). Install on the browser host (cf-worker-01):
+#   install -d -m 0755 /opt/flow-ultra-agent && install -m 0644 ultra_agent.py fu_cdp.py /opt/flow-ultra-agent/
+#   install -m 0600 flow-ultra-agent.env.example /etc/flow-ultra-agent.env   # then fill it in
+#   install -m 0644 flow-ultra-agent.service /etc/systemd/system/ && systemctl daemon-reload
+#   /usr/bin/python3 /opt/flow-ultra-agent/ultra_agent.py --dry-run --once   # first: observe only, print what it sees
+#   systemctl enable --now flow-ultra-agent
+[Unit]
+Description=Flow2API Ultra browsers host agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/flow-ultra-agent.env
+ExecStart=/usr/bin/python3 /opt/flow-ultra-agent/ultra_agent.py
+Restart=always
+RestartSec=10
+# Jobs run `docker` and write /srv/flow-ultra-browsers + /etc/flow-ultra-browsers: root, like ext-sync.sh.
+User=root
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

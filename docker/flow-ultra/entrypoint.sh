@@ -38,6 +38,20 @@ if gone:
 PRUNE
 echo "extension release $ver"
 
+# Managed Ultra browsers (FU_REQUIRE_PROXY=1, set by the host agent): never start without a valid fixed proxy —
+# a missing or broken site.json would otherwise send Chrome and the Google sign-in out from the box's own IP.
+# Unset (flow-ultra-01/02, hand-made) keeps the old behaviour.
+if [ "${FU_REQUIRE_PROXY:-0}" = "1" ]; then
+  python3 - <<'SITE' || { echo "FU_REQUIRE_PROXY=1 but /opt/ext/site.json is missing or has no valid proxyUrl — refusing to start" >&2; exit 1; }
+import json, re, sys
+try:
+    d = json.load(open("/opt/ext/site.json"))
+except Exception:
+    sys.exit(1)
+ok = isinstance(d, dict) and isinstance(d.get("proxyUrl"), str) and re.match(r"^https?://[^\s@/]+@[^\s@/:]+:\d{2,5}/?$", d["proxyUrl"].strip())
+sys.exit(0 if ok and d.get("proxyAllHosts") is True else 1)
+SITE
+fi
 rm -f /tmp/fu-ready   # set only after the extension is registered in THIS start (ext-sync.sh checks it)
 # Every byte through the box's fixed upstream proxy from the first request (proxy-forward.py). No site.json = no
 # forwarder (then Chrome goes direct, like a staff laptop).

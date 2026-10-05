@@ -46,3 +46,31 @@ On the box: `systemd-run --unit flow-ultra-novnc /usr/bin/websockify --web /usr/
 On the Mac: `ssh -N -L 6081:127.0.0.1:6081 root@178.63.65.20`, open http://localhost:6081/vnc.html → Connect.
 Sign in to Google, then Labs' own "Sign in with Google" on labs.google/fx; open flow.google.com once.
 Stop the screen afterwards: `systemctl stop flow-ultra-novnc`.
+
+## Ultra browsers managed from the dashboard (host agent, 2026-10-05)
+Plan and reviews: flow2api `tmp/ultra_browsers_plan.md` (rev 3). Code: `agent/ultra_agent.py` (host, stdlib only),
+`agent/fu_cdp.py` (runs INSIDE a container through `docker exec -i … python3 -c <loader>`, source and parameters on
+stdin), `agent/flow-ultra-agent.service`, `agent/flow-ultra-agent.env.example`.
+
+- **Pull only.** The agent polls `POST {FLOW_BASE}/api/ultra/agent/poll` every 5 s (Bearer `ULTRA_AGENT_TOKEN`, a
+  secret of its own, not the plugin connection token) with each browser's observations, and gets the browser list,
+  at most one job and any challenge replies. Results go to `/api/ultra/agent/result`. No inbound port.
+- **Observations**, each with its own time: container up (every poll), `/tmp/fu-ready` + extension version (every
+  minute), egress IP through 127.0.0.1:3128 and Google cookie NAMES via CDP (every 10 min). Network/CDP trouble is
+  reported as unknown, never as "signed out".
+- **Jobs:** `status`, `screenshot` (any browser); `create`, `bootstrap`, `login`, `start`, `stop`, `restart`,
+  `update` (managed browsers only, one at a time per browser, in a worker thread so polling never stops).
+- **Managed layout:** `/srv/flow-ultra-browsers/<name>/{profile,releases}` (profile uid 1000),
+  `/etc/flow-ultra-browsers/<name>/site.json` (root 0600); each release holds `site.json` + `site.js` owned
+  1000:1000 mode 0400. `docker run --restart=unless-stopped -e FU_REQUIRE_PROXY=1 -e TZ=<port's timezone>`: the
+  entrypoint exits if `site.json` is missing or has no valid proxy. Never `docker rm`, never a reused profile.
+- **Bootstrap** sets the extension's server, connection token and the route key flow2api chose, through CDP on the
+  extension's service worker (`flowBootstrap`, worker ≥ 3.7.5), and reads the route key back; flow2api starts the
+  sign-in only after that read-back matches.
+- **Sign-in** (`login`): email → password (typed once, per character) → number tap / code / Chrome "Continue as" →
+  flow.google.com (ULTRA badge) → the newest project opened in a tab that stays open. Anything else (wrong password,
+  CAPTCHA, unknown page, a second ask) stops with "needs you" and a screenshot button on the dashboard. The password
+  is in memory for that one run only.
+- **observe_only** browsers (flow-ultra-01, flow-ultra-02 until Slice D) get status and screenshots only; their own
+  `flow-ultra-ext-sync` timers stay in charge of updates.
+- `--dry-run --once`: one observe-and-report round, prints what it sees, takes no job.
