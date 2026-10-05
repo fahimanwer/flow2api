@@ -51,6 +51,7 @@
                 <button onclick="switchTab('tokens')" id="tabTokens" class="tab-btn border-b-2 border-primary text-sm font-medium py-3 px-1">Token Management</button>
                 <button onclick="switchTab('settings')" id="tabSettings" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">System Settings</button>
                 <button onclick="switchTab('logs')" id="tabLogs" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">Request Logs</button>
+                <button onclick="switchTab('ultra')" id="tabUltra" class="tab-btn border-b-2 border-transparent text-sm font-medium py-3 px-1">Ultra browsers</button>
                 <a href="/test" id="tabTestPage" class="tab-btn inline-flex items-center border-b-2 border-transparent text-sm font-medium py-3 px-1">Test Page</a>
             </nav>
         </div>
@@ -712,6 +713,56 @@
         <footer class="mt-12 pt-6 border-t border-border text-center text-xs text-muted-foreground">
             <p>© 2025 <a href="https://linux.do/u/thesmallhancat/summary" target="_blank" class="no-underline hover:underline" style="color: inherit;">TheSmallHanCat</a> && <a href="https://linux.do/u/tibbar/summary" target="_blank" class="no-underline hover:underline" style="color: inherit;">Tibbar</a>. All rights reserved.</p>
         </footer>
+        <!-- Ultra browsers panel (src/services/ultra_browsers.py) -->
+        <div id="panelUltra" class="hidden">
+            <div id="ultraBanner" class="text-sm text-muted-foreground mb-4"></div>
+            <div class="rounded-lg border border-border bg-background mb-6">
+                <div class="flex items-center justify-between gap-4 p-4 border-b border-border">
+                    <h3 class="text-lg font-semibold">Ultra browsers</h3>
+                    <div class="flex gap-2">
+                        <button onclick="loadUltra()" class="inline-flex items-center rounded-md border border-border h-8 px-3 text-sm hover:bg-accent">Refresh</button>
+                        <button id="ultraAddBtn" onclick="$('ultraAddForm').classList.toggle('hidden')" class="inline-flex items-center rounded-md bg-primary text-primary-foreground h-8 px-3 text-sm">Add Ultra account</button>
+                    </div>
+                </div>
+                <div id="ultraAddForm" class="hidden p-4 border-b border-border grid gap-3 md:grid-cols-5 items-end">
+                    <label class="text-sm">Email<input id="uaEmail" type="email" autocomplete="off" class="mt-1 w-full rounded-md border border-input px-2 h-8"></label>
+                    <label class="text-sm">Password<input id="uaPassword" type="password" autocomplete="new-password" class="mt-1 w-full rounded-md border border-input px-2 h-8"></label>
+                    <label class="text-sm">IP (Ultra port)<select id="uaPort" class="mt-1 w-full rounded-md border border-input px-2 h-8"></select></label>
+                    <label class="text-sm">Only for app (blank = any named caller)<input id="uaClient" placeholder="e.g. pinterest-factory" class="mt-1 w-full rounded-md border border-input px-2 h-8"></label>
+                    <button onclick="ultraAdd()" class="rounded-md bg-primary text-primary-foreground h-8 px-3 text-sm">Create browser and sign in</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead><tr class="border-b border-border text-left text-muted-foreground">
+                            <th class="p-3">Browser</th><th class="p-3">Account</th><th class="p-3">IP</th><th class="p-3">State</th>
+                            <th class="p-3">Seen</th><th class="p-3">Token / today</th><th class="p-3">Actions</th>
+                        </tr></thead>
+                        <tbody id="ultraRows"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div id="ultraShot" class="hidden rounded-lg border border-border bg-background p-4 mb-6">
+                <div class="flex justify-between mb-2"><span id="ultraShotTitle" class="text-sm font-medium"></span>
+                    <button onclick="$('ultraShot').classList.add('hidden')" class="text-sm underline">close</button></div>
+                <img id="ultraShotImg" class="max-w-full border border-border" alt="browser screen">
+            </div>
+            <div class="rounded-lg border border-border bg-background">
+                <div class="p-4 border-b border-border flex items-center justify-between gap-4">
+                    <h3 class="text-lg font-semibold">Ultra IPs</h3>
+                    <div class="flex gap-2 items-center text-sm">
+                        <input id="upPort" placeholder="port, e.g. 8011" class="rounded-md border border-input px-2 h-8 w-28">
+                        <input id="upCity" placeholder="city" class="rounded-md border border-input px-2 h-8 w-28">
+                        <input id="upTz" placeholder="timezone, e.g. America/New_York" class="rounded-md border border-input px-2 h-8 w-56">
+                        <input id="upIp" placeholder="expected IP (optional)" class="rounded-md border border-input px-2 h-8 w-40">
+                        <button onclick="ultraReservePort()" class="rounded-md border border-border h-8 px-3 hover:bg-accent">Keep for Ultra</button>
+                    </div>
+                </div>
+                <p class="px-4 pt-3 text-xs text-muted-foreground">Keeping a port for Ultra takes it out of the shared extension pool in the same step. It is refused while any device, port move or account still uses it (the reasons are listed).</p>
+                <div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="border-b border-border text-left text-muted-foreground">
+                    <th class="p-3">Port</th><th class="p-3">State</th><th class="p-3">Browser</th><th class="p-3">City / timezone</th><th class="p-3">Expected IP</th>
+                </tr></thead><tbody id="ultraPorts"></tbody></table></div>
+            </div>
+        </div>
     </main>
 
     <!-- Add Token modal -->
@@ -1035,7 +1086,7 @@
         closeLogDetailModal=()=>{window.activeLogDetailId=null;resetLogMediaCache();$('logDetailModal').classList.add('hidden')},
         showToast=(m,t='info')=>{const d=document.createElement('div'),bc={success:'bg-green-600',error:'bg-destructive',info:'bg-primary'};d.className=`fixed bottom-4 right-4 ${bc[t]||bc.info} text-white px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium z-50 animate-slide-up`;d.textContent=m;document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},2000)},
         logout=async()=>{if(!confirm('Are you sure you want to log out?'))return;try{await fetch('/api/logout',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'}})}catch(e){console.error('Failed to log out on server:',e)}finally{localStorage.removeItem('adminToken');location.href='/login'}},
-        switchTab=t=>{const cap=n=>n.charAt(0).toUpperCase()+n.slice(1);['tokens','settings','logs'].forEach(n=>{const active=n===t;$(`panel${cap(n)}`).classList.toggle('hidden',!active);$(`tab${cap(n)}`).classList.toggle('border-primary',active);$(`tab${cap(n)}`).classList.toggle('text-primary',active);$(`tab${cap(n)}`).classList.toggle('border-transparent',!active);$(`tab${cap(n)}`).classList.toggle('text-muted-foreground',!active)});if(t==='settings'){stopLogsAutoRefresh();loadAdminConfig();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadClientPolicies();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig()}else if(t==='logs'){startLogsAutoRefresh();loadLogs()}else{stopLogsAutoRefresh()}};
+        switchTab=t=>{const cap=n=>n.charAt(0).toUpperCase()+n.slice(1);if(t!=='ultra')stopUltraRefresh();else startUltraRefresh();['tokens','settings','logs','ultra'].forEach(n=>{const active=n===t;$(`panel${cap(n)}`).classList.toggle('hidden',!active);$(`tab${cap(n)}`).classList.toggle('border-primary',active);$(`tab${cap(n)}`).classList.toggle('text-primary',active);$(`tab${cap(n)}`).classList.toggle('border-transparent',!active);$(`tab${cap(n)}`).classList.toggle('text-muted-foreground',!active)});if(t==='settings'){stopLogsAutoRefresh();loadAdminConfig();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadClientPolicies();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig()}else if(t==='logs'){startLogsAutoRefresh();loadLogs()}else{stopLogsAutoRefresh()}};
 
         function escapeLogHtml(text){
             if(text===null||text===undefined) return '';
@@ -1306,6 +1357,99 @@
         }
 
         window.addEventListener('DOMContentLoaded',()=>{checkAuth();refreshTokens();loadATAutoRefreshConfig()});
+    </script>
+    <script>
+        // Ultra browsers tab (tmp/ultra_browsers_plan.md). Passwords are only ever sent, never shown or read back.
+        let ultraTimer = null, ultraData = null;
+        const ue = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+        const ultraAgo = (ts) => { if (!ts) return '-'; const s = Math.round((Date.now() - new Date(ts).getTime()) / 1000); return s < 90 ? s + 's ago' : s < 5400 ? Math.round(s / 60) + 'm ago' : Math.round(s / 3600) + 'h ago'; };
+        const ultraStateColor = {ok: 'text-green-600', degraded: 'text-amber-600', needs_you: 'text-red-600 font-semibold', error: 'text-red-600', logged_out: 'text-red-600', labs_dead: 'text-amber-700'};
+        function startUltraRefresh() { loadUltra(); if (!ultraTimer) ultraTimer = setInterval(loadUltra, 8000); }
+        function stopUltraRefresh() { if (ultraTimer) { clearInterval(ultraTimer); ultraTimer = null; } }
+        async function ultraPost(url, body) {
+            const r = await apiRequest(url, {method: 'POST', body: JSON.stringify(body || {})});
+            if (!r) return null;
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok || d.success === false) {
+                showToast((d.detail || 'Failed') + (d.blockers && d.blockers.length ? ': ' + d.blockers.join('; ') : ''), 'error');
+                return null;
+            }
+            return d;
+        }
+        async function loadUltra() {
+            const r = await apiRequest('/api/ultra/status'); if (!r) return;
+            const d = await r.json(); ultraData = d;
+            const host = (d.hosts || [])[0];
+            $('ultraBanner').innerHTML = [
+                'Management: <b>' + (d.slice_b_enabled ? 'ON' : 'off (status only)') + '</b>',
+                'vault: ' + (d.vault_ready ? 'ready' : '<span class="text-red-600">no key</span>'),
+                'agent: ' + (host ? ue(host.host_id) + ' ' + ue(host.state) + ', last poll ' + ultraAgo(host.last_poll_at) : (d.agent_token_set ? 'never polled' : 'no token set')),
+                'Telegram: ' + (d.telegram_set ? 'on' : 'off') + (d.unsent_alerts ? ' (' + d.unsent_alerts + ' unsent)' : ''),
+            ].join(' · ');
+            $('ultraAddBtn').disabled = !d.slice_b_enabled;
+            $('ultraAddBtn').classList.toggle('opacity-50', !d.slice_b_enabled);
+            const free = (d.ports || []).filter((p) => p.state === 'free' && !p.browser_name);
+            $('uaPort').innerHTML = free.map((p) => `<option value="${p.port}">${p.port} ${ue(p.city || '')}</option>`).join('') || '<option value="">no free Ultra port</option>';
+            $('ultraPorts').innerHTML = (d.ports || []).map((p) => `<tr class="border-b border-border"><td class="p-3">${p.port}</td><td class="p-3">${ue(p.state)}</td><td class="p-3">${ue(p.browser_name || '-')}</td><td class="p-3">${ue(p.city || '-')} / ${ue(p.timezone || '-')}</td><td class="p-3">${ue(p.expected_egress_ip || '-')}</td></tr>`).join('') || '<tr><td class="p-3 text-muted-foreground" colspan="5">No Ultra ports yet</td></tr>';
+            $('ultraRows').innerHTML = (d.browsers || []).map(ultraRow).join('') || '<tr><td class="p-3 text-muted-foreground" colspan="7">No Ultra browsers yet</td></tr>';
+        }
+        function ultraRow(b) {
+            const o = b.obs || {}, t = b.token, a = b.attempt, managed = b.mode === 'managed', on = ultraData && ultraData.slice_b_enabled;
+            const obs = [o.container_up === false ? 'container down' : o.container_up ? 'up' : '?', o.fu_ready ? 'ready' : '', o.egress_ip ? 'IP ' + o.egress_ip : 'IP ?',
+                o.google_cookies === true ? 'Google ✓' : o.google_cookies === false ? 'Google ✗' : 'Google ?', o.ext_version ? 'ext ' + o.ext_version : ''].filter(Boolean).join(' · ');
+            let ask = '';
+            if (b.state === 'needs_you' && a && a.state === 'challenge') {
+                const id = ue(b.name);
+                ask = `<div class="mt-2 p-2 rounded bg-red-50 text-red-800">${ue(a.challenge_text)}` +
+                    (a.challenge_kind === 'code' ? ` <input id="uc_${id}" class="border border-input rounded px-1 h-7 w-28 ml-1" placeholder="code"> <button class="underline" onclick="ultraReply('${id}','code')">Send code</button>`
+                        : ` <button class="underline ml-1" onclick="ultraReply('${id}','tapped')">I tapped it</button> <button class="underline ml-1" onclick="ultraReply('${id}','resend')">Resend</button>`) + '</div>';
+            }
+            const btn = (label, action, enabled) => enabled ? `<button class="underline mr-2" onclick="ultraAction('${ue(b.name)}','${action}')">${label}</button>` : '';
+            const actions = btn('Screenshot', 'screenshot', true) + btn('Check now', 'status', true) +
+                btn('Retry sign-in', 'retry_login', managed && on && ['needs_you', 'error', 'logged_out'].includes(b.state)) +
+                btn('Restart', 'restart', managed && on) + (b.desired_state === 'stopped' ? btn('Start', 'start', managed && on) : btn('Stop', 'stop', managed && on));
+            const tok = t ? `#${b.token_id} ${t.is_active ? 'active' : 'off'}${t.hold ? ' · hold ' + ue(t.hold) : ''}${t.reserved_client ? ' · only ' + ue(t.reserved_client) : ''}<br>${t.today_images} img · ${t.today_errors} err` : '-';
+            return `<tr class="border-b border-border align-top"><td class="p-3"><b>${ue(b.name)}</b><br><span class="text-xs text-muted-foreground">${managed ? 'managed' : 'observe only'}</span></td>` +
+                `<td class="p-3">${ue(b.email || '-')}</td><td class="p-3">${b.port} ${ue(b.city || '')}</td>` +
+                `<td class="p-3"><span class="${ultraStateColor[b.state] || ''}">${ue(b.state)}</span><br><span class="text-xs text-muted-foreground">${ue(b.state_detail || '')}</span><br><span class="text-xs">${ue(obs)}</span>${ask}</td>` +
+                `<td class="p-3">${ultraAgo(b.last_seen)}</td><td class="p-3">${tok}</td><td class="p-3">${actions}</td></tr>`;
+        }
+        async function ultraAction(name, action) {
+            const d = await ultraPost(`/api/ultra/browsers/${encodeURIComponent(name)}/action`, {action});
+            if (!d) return;
+            showToast(`${action} requested (${d.state})`, 'success');
+            if (action === 'screenshot') ultraWaitShot(name, d.job_id, 0);
+            loadUltra();
+        }
+        async function ultraWaitShot(name, jobId, n) {
+            const r = await apiRequest(`/api/ultra/screenshots/${jobId}`);
+            if (r && r.ok) {
+                $('ultraShotImg').src = URL.createObjectURL(await r.blob());
+                $('ultraShotTitle').textContent = `${name} — ${new Date().toLocaleTimeString()}`;
+                $('ultraShot').classList.remove('hidden');
+                return;
+            }
+            if (n < 15) setTimeout(() => ultraWaitShot(name, jobId, n + 1), 2000); else showToast('No screenshot arrived (is the agent running?)', 'error');
+        }
+        async function ultraReply(name, kind) {
+            const b = (ultraData.browsers || []).find((x) => x.name === name); if (!b || !b.attempt) return;
+            const body = {attempt_id: b.attempt.attempt_id, challenge_id: b.attempt.challenge_id, kind};
+            if (kind === 'code') { body.code = ($('uc_' + name) || {}).value || ''; }
+            if (await ultraPost(`/api/ultra/browsers/${encodeURIComponent(name)}/challenge`, body)) showToast('Sent to the browser', 'success');
+            loadUltra();
+        }
+        async function ultraAdd() {
+            const body = {email: $('uaEmail').value.trim(), password: $('uaPassword').value, port: parseInt($('uaPort').value, 10), reserved_client: $('uaClient').value.trim()};
+            if (!body.email || !body.password || !body.port) { showToast('Email, password and a free Ultra port are needed', 'error'); return; }
+            const d = await ultraPost('/api/ultra/browsers', body);
+            $('uaPassword').value = '';
+            if (d) { showToast(`${d.name} is being created`, 'success'); $('ultraAddForm').classList.add('hidden'); loadUltra(); }
+        }
+        async function ultraReservePort() {
+            const port = parseInt($('upPort').value, 10); if (!port) { showToast('Port?', 'error'); return; }
+            const d = await ultraPost('/api/ultra/ports', {port, city: $('upCity').value.trim(), timezone: $('upTz').value.trim(), expected_egress_ip: $('upIp').value.trim()});
+            if (d) { showToast(`Port ${port} kept for Ultra${d.removed_from_pool ? ' (removed from the pool)' : ''}`, 'success'); loadUltra(); }
+        }
     </script>
 </body>
 </html>
