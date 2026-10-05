@@ -249,6 +249,8 @@ class LoginDriver:
     """One assisted sign-in, bounded: each step has a deadline and a budget; the password and a code are each
     typed once; anything unexpected stops with needs_you (never a retry loop)."""
     MAX_ACTIONS = 30
+    MAX_CHALLENGES = 3          # challenge pages per attempt (a new number page = a new challenge)
+    ATTEMPT_MAX_S = 1200        # the whole sign-in, every wait included; nothing extends it
     NUMBER_WAIT_S = 300
     CODE_WAIT_S = 600
     STEP_DEADLINE_S = 90
@@ -268,7 +270,9 @@ class LoginDriver:
         self.tab = None
         self.typed_email = self.typed_password = False
         self.challenge_id = None
+        self.challenges = 0
         self.handled = set()
+        self.attempt_deadline = None
 
     def report(self, progress):
         reply = self._report(progress) or {}
@@ -299,11 +303,18 @@ class LoginDriver:
         finally:
             self._password = None
 
+    def _until(self, seconds):
+        """A wait's end: never past the attempt-wide deadline."""
+        return min(self.clock() + seconds, self.attempt_deadline)
+
     def _run(self):
+        self.attempt_deadline = self.clock() + self.ATTEMPT_MAX_S
         self.tab = self._h("open_tab", url=self.START_URL, background=False)["target_id"]
         self.sleep(4)
         last_url, same_since = None, self.clock()
         while True:
+            if self.clock() >= self.attempt_deadline:
+                raise StopSignIn("needs_you", f"sign-in did not finish within {self.ATTEMPT_MAX_S // 60} min", step="attempt_timeout")
             it = self._intercept_target()
             if it:
                 self._act()
@@ -373,6 +384,10 @@ class LoginDriver:
         self.sleep(4)
 
     def _challenge(self, c):
+        self.challenges += 1
+        if self.challenges > self.MAX_CHALLENGES:
+            raise StopSignIn("needs_you", f"Google asked {self.challenges} challenges in a row; stopped", step="too_many_challenges")
+        self._act()
         reply = self.report({"step": "challenge", "challenge": {k: c.get(k) for k in ("kind", "number", "device", "hint")}}) or {}
         self.challenge_id = reply.get("challenge_id")
 
@@ -389,7 +404,7 @@ class LoginDriver:
     def _wait_number(self, c):
         self._challenge(c)
         start_url = self._read().get("url")
-        deadline = self.clock() + self.NUMBER_WAIT_S
+        deadline = self._until(self.NUMBER_WAIT_S)
         resends = 0
         while self.clock() < deadline:
             m = self._message(3)
@@ -400,7 +415,7 @@ class LoginDriver:
                     self._h("click", target_id=self.tab, text="resend")
                 except RuntimeError:
                     pass
-                deadline = self.clock() + self.NUMBER_WAIT_S
+                deadline = self._until(self.NUMBER_WAIT_S)   # bounded: 2 resends, attempt deadline
             if self._intercept_target() or self._read().get("url") != start_url:
                 return  # the page moved on ("I tapped it" only makes us look again sooner)
         raise StopSignIn("needs_you", "nobody tapped the number in time; press Retry sign-in", step="challenge_timeout")
@@ -409,7 +424,7 @@ class LoginDriver:
         if "code" in self.handled:
             raise StopSignIn("needs_you", "Google asked for a code again (wrong code?)")
         self._challenge(c)
-        deadline = self.clock() + self.CODE_WAIT_S
+        deadline = self._until(self.CODE_WAIT_S)
         while self.clock() < deadline:
             m = self._message(5)
             if m and m["kind"] == "code" and m.get("code"):
@@ -494,7 +509,8 @@ class Jobs:
         latest = json.loads(self.http.get_bytes(self.cfg.flow_base + "/api/plugin/ext-version", headers=hdr, timeout=20)).get("version")
         if not latest:
             raise RuntimeError("server did not report an extension version")
-        raw = self.http.get_bytes(self.cfg.flow_base + "/download/worker-latest.zip?token=" + urllib.parse.quote(conn_token), timeout=60)
+        # header auth only: a ?token= query would be written into the server's access log
+        raw = self.http.get_bytes(self.cfg.flow_base + "/download/worker-latest.zip", headers=hdr, timeout=60)
         z = zipfile.ZipFile(io.BytesIO(raw))
         names = z.namelist()
         manifests = sorted([n for n in names if n.rsplit("/", 1)[-1] == "manifest.json"], key=lambda n: n.count("/"))
@@ -530,7 +546,13 @@ class Jobs:
         for fn, body in (("site.json", site_json), ("site.js", f"globalThis.FlowSite = {site_json};\n")):
             with open(os.path.join(tmp, fn), "w") as f:
                 f.write(body)
-        # Chrome runs as uid 1000 and must read site.json/site.js; nobody else is a user on the box (0400).
+        # The service runs with UMask=0077, so every mode is set explicitly: the container (uid 1000) must
+        # traverse and read the release. Code is 0755/0644; site.json/site.js hold the proxy password: 0400,
+        # owned by uid 1000 (nobody else is a user on the box).
+        for dirpath, dirnames, filenames in os.walk(tmp):
+            os.chmod(dirpath, 0o755)
+            for fn in filenames:
+                os.chmod(os.path.join(dirpath, fn), 0o644)
         self._must(["chown", "-R", "1000:1000", tmp])
         for fn in ("site.json", "site.js"):
             os.chmod(os.path.join(tmp, fn), 0o400)
@@ -542,6 +564,7 @@ class Jobs:
         cur = os.path.join(p["releases"], "current")
         with open(cur + ".tmp", "w") as f:
             f.write(version)
+        os.chmod(cur + ".tmp", 0o644)   # the entrypoint (uid 1000) reads it first thing; UMask=0077 would hide it
         os.replace(cur + ".tmp", cur)
 
     def _write_site(self, name, site):
@@ -566,6 +589,8 @@ class Jobs:
             raise RuntimeError(f"{p['profile']} already holds a profile; refusing to reuse it")
         for d in (p["profile"], p["releases"]):
             os.makedirs(d, exist_ok=True)
+        os.chmod(p["releases"], 0o755)   # mounted read-only at /opt/releases; uid 1000 lists and reads it
+        os.chmod(p["profile"], 0o700)
         self._must(["chown", "1000:1000", p["profile"]])
         site = secrets["site"]
         self._write_site(name, site)

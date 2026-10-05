@@ -74,3 +74,16 @@ stdin), `agent/flow-ultra-agent.service`, `agent/flow-ultra-agent.env.example`.
 - **observe_only** browsers (flow-ultra-01, flow-ultra-02 until Slice D) get status and screenshots only; their own
   `flow-ultra-ext-sync` timers stay in charge of updates.
 - `--dry-run --once`: one observe-and-report round, prints what it sees, takes no job.
+
+### Recovery: a crashed request blocks every restart/update of an account
+A stop/restart/update first drains the account and needs ZERO unfinished requests (no age cutoff, by design). A
+request whose row stayed `started` after a crash or redeploy makes that drain "deferred: N request(s) still
+running" every time. Never force the restart and never add a cutoff; instead a person clears the dead rows:
+1. List them (flow2api DB): `SELECT id, created_at, operation, status_text FROM request_logs WHERE token_id = <id>
+   AND COALESCE(status_text, '') NOT IN ('completed', 'failed');`
+2. Prove each one is dead: created BEFORE the current flow2api process started (container start time), or older than
+   the generation timeout + 10 min, and nothing for it in the live logs. A row that may still be running stays.
+3. Back up the DB, then mark only the proven-dead rows: `UPDATE request_logs SET status_text = 'failed',
+   updated_at = CURRENT_TIMESTAMP WHERE id IN (...) AND COALESCE(status_text, '') NOT IN ('completed', 'failed');`
+   Record who/when/which ids in WORK.md.
+4. Press the operation again in the dashboard; the drain completes on its next check (every 10 s).

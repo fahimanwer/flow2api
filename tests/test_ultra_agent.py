@@ -165,6 +165,42 @@ class LoginDriverTests(unittest.TestCase):
             drv.run()
         self.assertEqual(e.exception.step, "challenge_timeout")
 
+    def test_alternating_challenges_are_bounded(self):
+        """REGRESSION (code review #5): a new number page after every look must not wait forever."""
+        dp2 = dict(DP, url=DP["url"] + "&again=1")
+
+        class Flipper(FakeDocker):
+            def helper(self, container, cmd, params=None, timeout=60):
+                if cmd == "read" and self.i >= 2:
+                    self.n = getattr(self, "n", 0) + 1
+                    return DP if self.n % 2 else dp2
+                return super().helper(container, cmd, params, timeout)
+        drv, reports = self._driver(Flipper([IDENT, PWD], lambda d, c, p: setattr(d, "i", d.i + (c in ("click", "key")))))
+        start = drv.clock()
+        with self.assertRaises(ua.StopSignIn) as e:
+            drv.run()
+        self.assertEqual(e.exception.step, "too_many_challenges")
+        self.assertLessEqual(sum(1 for r in reports if r["step"] == "challenge"), ua.LoginDriver.MAX_CHALLENGES)
+        self.assertLess(drv.clock() - start, ua.LoginDriver.ATTEMPT_MAX_S)
+
+    def test_attempt_deadline_caps_resends(self):
+        msgs = queue.Queue()
+        drv, reports = self._driver(FakeDocker([IDENT, PWD, DP], lambda d, c, p: setattr(d, "i", d.i + (c in ("click", "key")))), msgs)
+        drv.ATTEMPT_MAX_S = 400
+        orig_report = drv._report
+
+        def report(r):
+            out = orig_report(r)
+            if r.get("step") == "challenge":
+                for _ in range(2):
+                    msgs.put({"challenge_id": "C1", "kind": "resend"})
+            return out
+        drv._report = report
+        start = drv.clock()
+        with self.assertRaises(ua.StopSignIn):
+            drv.run()
+        self.assertLessEqual(drv.clock() - start, 400 + 10)
+
     def test_flow2api_giving_up_stops_the_driver(self):
         drv, _ = self._driver(FakeDocker([IDENT, PWD], lambda d, c, p: setattr(d, "i", d.i + (c in ("click", "key")))))
         drv._report = lambda r: {"ok": False, "stop": True}
@@ -274,6 +310,60 @@ class JobsTests(unittest.TestCase):
             self.assertIn(flag, run)
         self.assertFalse(any("p@disp" in " ".join(a) for a, _ in r.calls), "proxy credentials on a command line")
         self.assertTrue(any(a[:2] == ["chown", "-R"] for a, _ in r.calls))
+
+    def test_container_user_can_read_its_release_under_the_service_umask(self):
+        """REGRESSION (code review #3): the unit runs with UMask=0077 as root; the container runs as uid 1000.
+        Real files, real modes; ownership is what the agent's chown calls give (a non-root test cannot chown)."""
+        r = FakeRunner({
+            "docker ps --format": (0, "", ""),
+            "docker exec flow-ultra-03": lambda argv, _: (0, json.dumps({"version": "3.7.5"}), "") if "cat" in argv else (0, "", ""),
+        })
+        site = {"proxyUrl": "http://u:p@disp.oxylabs.io:8011", "clientLabel": "flow-ultra-03", "proxyAllHosts": True}
+        old = os.umask(0o077)
+        try:
+            self._jobs(r).create({"name": "flow-ultra-03", "container": "flow-ultra-03"}, {"site": site, "connection_token": "conn"})
+        finally:
+            os.umask(old)
+        chowned = [Path(a[-1]) for a, _ in r.calls if a[0] == "chown"]
+        recursive = [Path(a[-1]) for a, _ in r.calls if a[:2] == ["chown", "-R"]]
+
+        def owner_is_1000(path):
+            return any(path == c for c in chowned) or any(c in path.parents or c == path for c in recursive) \
+                or any(str(path).startswith(str(c).replace(".new", "")) for c in recursive)
+
+        def uid1000_can(path, need_x=False):
+            mode = stat.S_IMODE(path.stat().st_mode)
+            bits = (0o500 if need_x else 0o400) if owner_is_1000(path) else (0o005 if need_x else 0o004)
+            return mode & bits == bits
+
+        rel = Path(self.cfg.root) / "flow-ultra-03" / "releases"
+        self.assertTrue(uid1000_can(rel, need_x=True), oct(rel.stat().st_mode))
+        self.assertTrue(uid1000_can(rel / "current"), oct((rel / "current").stat().st_mode))
+        release = rel / (rel / "current").read_text()
+        for path in [release, *release.rglob("*")]:
+            self.assertTrue(uid1000_can(path, need_x=path.is_dir()), f"{path} {oct(path.stat().st_mode)}")
+        for secret in ("site.json", "site.js"):   # readable by uid 1000 ONLY
+            self.assertEqual(stat.S_IMODE((release / secret).stat().st_mode), 0o400)
+        self.assertEqual(stat.S_IMODE((Path(self.cfg.etc) / "flow-ultra-03" / "site.json").stat().st_mode), 0o600)
+
+    def test_download_sends_the_connection_token_only_in_a_header(self):
+        """REGRESSION (code review #4): no ?token= in any URL (the server's access log keeps the query)."""
+        http = FakeHttp()
+        seen = []
+        orig = http.get_bytes
+
+        def get_bytes(url, headers=None, timeout=60):
+            seen.append((url, dict(headers or {})))
+            return orig(url, headers, timeout)
+        http.get_bytes = get_bytes
+        d = ua.Docker(FakeRunner(), helper_src="")
+        jobs = ua.Jobs(self.cfg, d, http, FakeRunner(), ua.Observer(d), clock=self.clock, sleep=self.clock.sleep)
+        jobs._download_release("conn-secret")
+        self.assertTrue(seen)
+        for url, hdr in seen:
+            self.assertNotIn("conn-secret", url)
+            self.assertNotIn("token=", url)
+            self.assertEqual(hdr.get("Authorization"), "Bearer conn-secret")
 
     def test_create_refuses_an_existing_container(self):
         r = FakeRunner({"docker ps --format": (0, "flow-ultra-03\n", "")})
