@@ -919,6 +919,8 @@ class TokenManager:
         is_active: bool = True,
         ban_reason: Optional[str] = None,
         session_result: Optional[dict] = None,
+        reserved_client: str = "",
+        ultra_hold: str = "",
     ) -> Token:
         """Add a new token and prepare its pooled projects. is_active=False creates the
         row disabled from the start (caller verified the credential is dead) so a dead
@@ -1015,6 +1017,10 @@ class TokenManager:
             proxy_url=self._normalize_token_proxy_url(proxy_url),
             auto_refresh_enabled=bool(auto_refresh_enabled),
             refresh_interval_minutes=self._normalize_refresh_interval(refresh_interval_minutes),
+            # Ultra onboarding (2026-10-05): the caller restriction and the serving hold are in the
+            # INSERT itself, so the row never exists unrestricted or servable.
+            reserved_client=reserved_client or "",
+            ultra_hold=ultra_hold or "",
         )
 
         token_id = await self.db.add_token(token)
@@ -1460,20 +1466,24 @@ class TokenManager:
             return "st_expired"
         return "unknown"
 
-    async def validate_and_promote(self, token_id: int, st: str, source: str = "push") -> RefreshOutcome:
+    async def validate_and_promote(self, token_id: int, st: str, source: str = "push",
+                                   push_route_key: Optional[str] = None) -> RefreshOutcome:
         """Public entry for credential PUSHES (worker extension / admin import): verify the
         session's access token against the API and only then commit st/at. Serialized
         with the refresh path via the per-token lock. ``at_stale`` ⇒ nothing stored —
-        the caller must not re-enable and should tell the device to re-login."""
+        the caller must not re-enable and should tell the device to re-login.
+        ``push_route_key``: a device push — an account owned by a managed Ultra browser is
+        re-checked against it right before the write (``ultra_guard`` = nothing stored)."""
         refresh_lock = await self._get_token_lock(self._refresh_locks, self._refresh_lock_guard, token_id)
         async with refresh_lock:
             token = await self.db.get_token(token_id)
-            outcome = await self._do_refresh_at(token_id, st, token)
+            outcome = await self._do_refresh_at(token_id, st, token, push_route_key=push_route_key)
             if outcome.success:
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: credential promoted via {source}")
             return outcome
 
-    async def _do_refresh_at(self, token_id: int, st: str, token: Optional[Token] = None) -> RefreshOutcome:
+    async def _do_refresh_at(self, token_id: int, st: str, token: Optional[Token] = None,
+                             push_route_key: Optional[str] = None) -> RefreshOutcome:
         """Core AT refresh logic
 
         Args:
@@ -1560,6 +1570,13 @@ class TokenManager:
                 # Keep long-standing behavior — promote it — but report it UNVERIFIED.
                 verified = False
                 debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: non-auth error while verifying AT: {str(verify_err)}")
+
+            # Ultra ownership at write time (R3-1): a push for an account owned by a managed Ultra
+            # browser stores nothing unless it came from that browser's route key.
+            if push_route_key is not None and hasattr(self.db, "ultra_route_allows"):
+                if not await self.db.ultra_route_allows(token_id, push_route_key):
+                    debug_logger.op_warning(f"[ULTRA_GUARD] token={token_id} credential write refused: push from another route key")
+                    return RefreshOutcome(False, "ultra_guard", verified=False)
 
             # Promote: ST + AT + expiry (+ credits when verified) in one write.
             await self.db.update_token(

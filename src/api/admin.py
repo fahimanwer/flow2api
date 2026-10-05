@@ -1,6 +1,7 @@
 """Admin API routes"""
 import asyncio
 import importlib
+import inspect
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -577,6 +578,15 @@ def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database, cm:
     proxy_manager = pm
     db = database
     concurrency_manager = cm
+
+
+# Ultra browsers (src/services/ultra_browsers.py): the session push asks it who owns an account.
+ultra_service = None
+
+
+def set_ultra_service(service) -> None:
+    global ultra_service
+    ultra_service = service
 
 
 # ========== Request Models ==========
@@ -2869,11 +2879,15 @@ async def update_plugin_config(
         elif isinstance(_pp, str):
             ext_proxy_pool = _pp.strip()
 
-    await db.update_plugin_config(
-        connection_token=connection_token,
-        auto_enable_on_update=auto_enable_on_update,
-        ext_proxy_pool=ext_proxy_pool,
-    )
+    try:
+        await db.update_plugin_config(
+            connection_token=connection_token,
+            auto_enable_on_update=auto_enable_on_update,
+            ext_proxy_pool=ext_proxy_pool,
+        )
+    except ValueError as e:
+        # an Ultra port in the pool (tmp/ultra_browsers_plan.md A2): refused, nothing written
+        raise HTTPException(status_code=409, detail=str(e))
 
     return {
         "success": True,
@@ -2994,6 +3008,12 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     fetch its port again now (owner 27 Sep 2026)."""
     result = await _plugin_update_token_impl(request, authorization)
     route_key = str(request.get("route_key") or "").strip()
+    try:
+        if isinstance(result, dict) and result.get("success") and result.get("token_id") and result.get("credential_verified") and ultra_service is not None:
+            # a verified credential for a managed Ultra account is one of its onboarding release conditions
+            await ultra_service.note_verified(int(result["token_id"]))
+    except Exception as e:
+        debug_logger.op_warning(f"[ULTRA] post-push step failed for token {(result or {}).get('token_id')}: {e}")
     try:
         if isinstance(result, dict) and result.get("success") and result.get("token_id") and route_key:
             await db.record_device_identity(route_key, int(result["token_id"]))
@@ -3226,6 +3246,21 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
     else:
         existing_token = await db.get_token_by_email(email)
 
+    # Ultra browsers (tmp/ultra_browsers_plan.md R3-1): an account owned by a managed server browser takes
+    # pushes only from that browser (route key + its own proxy port), and that browser's route key only
+    # carries its own account. Checked here, after the identity is verified and BEFORE any write.
+    ultra_row = None
+    if ultra_service is not None:
+        ultra_row, ultra_refusal = await ultra_service.push_guard(
+            email, reported_route_key, reported_proxy_url, existing_token.id if existing_token else None)
+        if ultra_refusal:
+            debug_logger.op_warning(f"[ULTRA_GUARD] push refused for {email} route_key={reported_route_key or '-'}: {ultra_refusal}")
+            raise HTTPException(status_code=409, detail=f"refused: {ultra_refusal}")
+        if ultra_row and ultra_row.get("token_id") is not None and existing_token is None:
+            existing_token = await db.get_token(int(ultra_row["token_id"]))
+        elif ultra_row and ultra_row.get("token_id") is None and existing_token is not None:
+            await ultra_service.adopt_token(ultra_row["name"], existing_token.id)
+
     # Legacy extensions (< 3.3.5) ignore `action` and clear their login state on any 2xx,
     # so they must keep receiving the old "updated" action; only newer builds understand
     # relogin_required (persisted grant_expired state + red badge + notification).
@@ -3239,7 +3274,7 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
             # alive, API 401 = at_stale) must never overwrite working credentials nor
             # re-enable the account — that loop is what kept 30 accounts flapping hourly.
             outcome = await token_manager.validate_and_promote(
-                existing_token.id, session_token, source="plugin_push"
+                existing_token.id, session_token, source="plugin_push", push_route_key=reported_route_key or ""
             )
             if not outcome.success and outcome.reason in ("st_expired", "at_stale") and google_cookies and not derived_from_cookies:
                 # The pushed session is dead, or Google stopped renewing its grant: a fresh
@@ -3252,7 +3287,8 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                     reused_outcome = None
                     if latest_row and (latest_row.st or "").strip() and latest_row.st != session_token:
                         reused_outcome = await token_manager.validate_and_promote(
-                            existing_token.id, latest_row.st, source="plugin_push_stored"
+                            existing_token.id, latest_row.st, source="plugin_push_stored",
+                            push_route_key=reported_route_key or "",
                         )
                     if reused_outcome is not None and reused_outcome.success and reused_outcome.verified:
                         debug_logger.log_info(f"[COOKIE_SYNC] token={existing_token.id} stored session still valid; no Google login needed")
@@ -3268,12 +3304,15 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                             debug_logger.log_info(f"[COOKIE_SYNC] token={existing_token.id} at_stale and the cookie login failed now; cookies kept for the healer")
                         else:
                             outcome = await token_manager.validate_and_promote(
-                                existing_token.id, session_token, source="plugin_push_cookies"
+                                existing_token.id, session_token, source="plugin_push_cookies",
+                                push_route_key=reported_route_key or "",
                             )
             if not outcome.success and outcome.reason == "st_expired":
                 raise HTTPException(status_code=400, detail="Invalid session token (expired)")
             if not outcome.success and outcome.reason == "account_mismatch":
                 raise HTTPException(status_code=409, detail=f"account mismatch: session is not {existing_token.email}")
+            if not outcome.success and outcome.reason == "ultra_guard":
+                raise HTTPException(status_code=409, detail="refused: this account is owned by an Ultra server browser")
             if not outcome.success and outcome.reason not in ("at_stale",):
                 # Transport/unknown failure talking to Google: nothing stored; let the
                 # device retry next cycle (non-400 ⇒ extension treats it as network).
@@ -3287,7 +3326,8 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
             # Cookie sync: store / clear the Google login now that the push proved the
             # account (email). Independent of the AT outcome: an at_stale row needs its
             # cookie backup most. Stale (older-seq) writes are ignored.
-            cookie_sync = await _apply_cookie_sync(existing_token, google_cookies, cookie_seq, email)
+            cookie_sync = await _apply_cookie_sync(existing_token, google_cookies, cookie_seq, email,
+                                                   route_key=reported_route_key)
             cookie_sync["derived_from_cookies"] = derived_from_cookies
             # NOTE: request["proxy_url"] is the worker extension's residential REDEEM
             # proxy (persisted as redeem_proxy_url below) — it must never overwrite the
@@ -3399,14 +3439,20 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
             if token_manager._is_auth_error(probe_err):
                 dead_grant = True
             # transport blip: proceed as before (AT likely fine) but report UNVERIFIED
+        # Ultra onboarding (R3-3): a managed browser's first account row is created held — inactive,
+        # ban_reason ultra_onboarding (no auto-enable or healer touches it), ultra_hold set (Enable cannot
+        # release it) and the caller restriction already in the INSERT. Only the finalizer releases it.
+        onboarding = ultra_row is not None
         try:
             new_token = await token_manager.add_token(
                 st=session_token,
                 project_id=reported_project_id,
                 project_name=reported_project_name,
-                remark="Added by Chrome Extension",
-                is_active=not dead_grant,
-                ban_reason=("auto_at_stale" if dead_grant else None),
+                remark=("Ultra browser " + ultra_row["name"]) if onboarding else "Added by Chrome Extension",
+                is_active=(False if onboarding else not dead_grant),
+                ban_reason=("ultra_onboarding" if onboarding else ("auto_at_stale" if dead_grant else None)),
+                reserved_client=(ultra_row.get("reserved_client") or "") if onboarding else "",
+                ultra_hold=("onboarding" if onboarding else ""),
                 # The AT we probed above is the one stored (no second, unprobed mint).
                 session_result=result,
                 protocol_mode=("protocol" if google_cookies else "session"),
@@ -3418,6 +3464,9 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                 refresh_interval_minutes=request.get("refresh_interval_minutes", 120),
             )
 
+            if onboarding:
+                # bind before routing: the routing write accepts this route key only for the browser's token
+                await ultra_service.bind_token(ultra_row["name"], new_token.id)
             # Slice B + #1: persist the reported residential proxy, real browser UA, and
             # bind the account to this device via its route key.
             _redeem_updates = {}
@@ -3531,7 +3580,8 @@ def _parse_cookie_sync_seq(value) -> int:
     return max(0, seq)
 
 
-async def _apply_cookie_sync(token_row, google_cookies: Optional[str], cookie_seq: int, email: str) -> dict:
+async def _apply_cookie_sync(token_row, google_cookies: Optional[str], cookie_seq: int, email: str,
+                             route_key: Optional[str] = None) -> dict:
     """Store (non-empty) or clear ("") the Google login for a token row. Returns the
     `cookie_sync` object the worker shows in its popup. Never logs a cookie value."""
     out = {"stored": False, "cleared": False, "stale": False, "cookies": 0}
@@ -3549,7 +3599,7 @@ async def _apply_cookie_sync(token_row, google_cookies: Optional[str], cookie_se
     else:
         fields = dict(google_cookies=google_cookies, protocol_mode="protocol", login_account=(email or "").strip(), google_cookies_updated_at=now)
     # One conditional statement: applies only if the stored sequence is lower.
-    changed = await db.update_token_cookie_sync(token_row.id, cookie_seq, **fields)
+    changed = await db.update_token_cookie_sync(token_row.id, cookie_seq, route_key=route_key, **fields)
     if not changed:
         latest = await db.get_token(token_row.id)
         stored_seq = int(getattr(latest, "google_cookies_seq", 0) or 0) if latest else 0
@@ -3589,7 +3639,15 @@ async def plugin_cookie_sync(request: dict, authorization: Optional[str] = Heade
     row = await db.get_token(token_id)
     if not row:
         raise HTTPException(status_code=404, detail=f"Token {token_id} not found")
-    cookie_sync = await _apply_cookie_sync(row, "", _parse_cookie_sync_seq(request.get("cookie_sync_seq")), row.email or "")
+    # Worker 3.7.5 sends its route key: an account owned by a managed Ultra browser is cleared only by that
+    # browser (R3-1). Unmanaged accounts behave as before, with or without it.
+    route_key = str(request.get("route_key") or "").strip() or None
+    allows = getattr(db, "ultra_route_allows", None)
+    if inspect.iscoroutinefunction(allows) and not await allows(token_id, route_key):
+        debug_logger.op_warning(f"[ULTRA_GUARD] cookie clear refused for token {token_id} route_key={route_key or '-'}")
+        raise HTTPException(status_code=409, detail="refused: this account is owned by an Ultra server browser")
+    cookie_sync = await _apply_cookie_sync(row, "", _parse_cookie_sync_seq(request.get("cookie_sync_seq")), row.email or "",
+                                           route_key=route_key)
     return {"success": True, "token_id": token_id, "cookie_sync": cookie_sync}
 
 

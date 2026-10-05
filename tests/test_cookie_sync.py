@@ -63,7 +63,7 @@ class _FakeDB:
         await self.update_token(token_id, redeem_proxy_url=url)
         return True
 
-    async def update_token_cookie_sync(self, token_id, seq, **fields):
+    async def update_token_cookie_sync(self, token_id, seq, route_key=None, **fields):
         if not self.token or self.token.id != token_id or int(self.token.google_cookies_seq or 0) >= seq:
             return 0
         fields = dict(fields, google_cookies_seq=seq)
@@ -166,7 +166,7 @@ class PluginPushTests(unittest.TestCase):
         kw = self.tm.cookie_login.await_args.kwargs
         self.assertEqual(kw["google_cookies"], COOKIES)
         self.assertEqual(kw["proxy"], "http://u:p@disp.example:8004")
-        self.tm.validate_and_promote.assert_awaited_with(55, "st-derived", source="plugin_push")
+        self.tm.validate_and_promote.assert_awaited_with(55, "st-derived", source="plugin_push", push_route_key="")
         self.assertEqual(self._stored()["google_cookies"], COOKIES)
 
     def test_no_session_token_but_cookies_derives_one(self):

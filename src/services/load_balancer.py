@@ -1,5 +1,6 @@
 """Load balancing module for Flow2API"""
 import asyncio
+import inspect
 import random
 from typing import Any, Dict, Optional
 from ..core.models import Token
@@ -261,6 +262,11 @@ class LoadBalancer:
             if token.id in ip_move_blocked:
                 filtered_reasons[token.id] = "Moving to its own IP (waiting for the browser to confirm)"
                 continue
+            # Ultra browser hold (onboarding / stop / restart / update; tmp/ultra_browsers_plan.md R3-3/R3-5):
+            # its own exclusion, independent of is_active, so Enable can never put a held account to work.
+            if (getattr(token, "ultra_hold", "") or "").strip():
+                filtered_reasons[token.id] = f"Ultra browser hold: {token.ultra_hold}"
+                continue
             client_reason = client_block_reason(token, client, media)
             if client_reason:
                 filtered_reasons[token.id] = client_reason
@@ -424,6 +430,12 @@ class LoadBalancer:
                 debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token.id}: moving to its own IP")
                 continue
 
+            # Same for an Ultra browser hold set meanwhile (a restart drain): read fresh, and a failed
+            # read refuses the account (fails CLOSED, unlike the IP-move check).
+            if not await self._ultra_hold_clear(token.id):
+                debug_logger.log_info(f"[LOAD_BALANCER] Skipping token {token.id}: Ultra browser hold")
+                continue
+
             # Validation can refresh the account's tier (e.g. Pro -> Ultra): re-apply the client
             # policy to what it returned, so an unnamed caller can never be handed an Ultra.
             client_reason = client_block_reason(token, client, media)
@@ -457,6 +469,17 @@ class LoadBalancer:
         except Exception as e:
             debug_logger.op_warning(f"[LOAD_BALANCER] could not read IP-move blocks: {e}")
             return set()
+
+    async def _ultra_hold_clear(self, token_id: int) -> bool:
+        # A store without the Ultra tables (test doubles) has no holds; a real read error fails closed.
+        reader = getattr(getattr(self.token_manager, "db", None), "get_ultra_hold", None)
+        if not inspect.iscoroutinefunction(reader):
+            return True
+        try:
+            return not await reader(token_id)
+        except Exception as e:
+            debug_logger.op_warning(f"[LOAD_BALANCER] could not read the Ultra hold of token {token_id}: {e}; skipping it")
+            return False
 
     @staticmethod
     def _saturated(item: Dict[str, Any]) -> bool:

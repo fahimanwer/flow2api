@@ -604,6 +604,9 @@ class Database:
                     # client-side sequence of that write (a stale push can never undo a newer clear).
                     ("google_cookies_updated_at", "TIMESTAMP"),
                     ("google_cookies_seq", "INTEGER DEFAULT 0"),
+                    # Ultra browsers (2026-10-05): a serving exclusion set by the Ultra coordinator
+                    # ('onboarding' | 'stopped' | 'restart' | 'update' | 'start'). Enable never clears it.
+                    ("ultra_hold", "TEXT DEFAULT ''"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -815,7 +818,8 @@ class Database:
                     ext_version TEXT,
                     reserved_client TEXT DEFAULT '',
                     google_cookies_updated_at TIMESTAMP,
-                    google_cookies_seq INTEGER DEFAULT 0
+                    google_cookies_seq INTEGER DEFAULT 0,
+                    ultra_hold TEXT DEFAULT ''
                 )
             """)
 
@@ -1174,7 +1178,225 @@ class Database:
                 )
             """)
 
+            await self._create_ultra_tables(db)
+
             await db.commit()
+
+    async def _create_ultra_tables(self, db):
+        """Ultra browsers managed from the dashboard (plan tmp/ultra_browsers_plan.md, Slices A+B).
+        Additive only: CREATE ... IF NOT EXISTS, so a live database is migrated on start."""
+        # One row per host agent (cf-worker-01); last_poll_at drives the host-silent alert.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ultra_hosts (
+                host_id TEXT PRIMARY KEY,
+                agent_version TEXT,
+                state TEXT NOT NULL DEFAULT 'ok',   -- ok | silent
+                last_poll_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
+        # The Oxylabs ports kept for Ultra browsers, never in the shared extension pool:
+        # free (kept, no browser yet) | reserved (a browser owns it) | retiring (browser removed, kept).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ultra_ports (
+                port INTEGER PRIMARY KEY,
+                proxy_host TEXT NOT NULL DEFAULT '',
+                expected_egress_ip TEXT,
+                city TEXT,
+                timezone TEXT,
+                state TEXT NOT NULL DEFAULT 'free',
+                browser_name TEXT,
+                note TEXT,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
+        # mode: 'managed' (created here; ownership guard, holds, updater) or 'observe_only'
+        # (flow-ultra-01/02 until Slice D: status and screenshots only).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ultra_browsers (
+                name TEXT PRIMARY KEY,
+                host_id TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'managed',
+                container TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                email TEXT NOT NULL DEFAULT '',
+                email_norm TEXT NOT NULL DEFAULT '',
+                sealed_password TEXT,
+                reserved_client TEXT NOT NULL DEFAULT '',
+                token_id INTEGER,
+                route_key TEXT,
+                route_acked INTEGER NOT NULL DEFAULT 0,
+                desired_state TEXT NOT NULL DEFAULT 'running',
+                state TEXT NOT NULL DEFAULT 'creating',
+                state_detail TEXT,
+                onboarding_hold INTEGER NOT NULL DEFAULT 0,
+                obs TEXT,
+                last_seen TIMESTAMP,
+                last_verified_at TIMESTAMP,
+                cookies_absent_since TIMESTAMP,
+                auth_bad_since TIMESTAMP,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
+        for stmt in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_ultra_browsers_email ON ultra_browsers(email_norm) WHERE email_norm != ''",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_ultra_browsers_route ON ultra_browsers(route_key) WHERE route_key IS NOT NULL AND route_key != ''",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_ultra_browsers_token ON ultra_browsers(token_id) WHERE token_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_ultra_browsers_port ON ultra_browsers(port)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_ultra_browsers_container ON ultra_browsers(host_id, container)",
+        ):
+            await db.execute(stmt)
+        # Work for the host agent. args/result never hold a secret (a password or a connection token
+        # travels only in the poll answer for a leased job, once). At most one unfinished mutating job
+        # per browser (partial unique index).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ultra_jobs (
+                id TEXT PRIMARY KEY,
+                browser TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                mutating INTEGER NOT NULL DEFAULT 1,
+                args TEXT,
+                state TEXT NOT NULL DEFAULT 'queued',  -- draining|queued|leased|done|failed|uncertain|deferred|cancelled
+                attempt_id TEXT,
+                hold_started_at TIMESTAMP,
+                lease_until TIMESTAMP,
+                leased_at TIMESTAMP,
+                secret_delivered INTEGER NOT NULL DEFAULT 0,
+                result TEXT,
+                error TEXT,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_ultra_jobs_one_mutating ON ultra_jobs(browser) "
+            "WHERE mutating = 1 AND state IN ('draining', 'queued', 'leased')"
+        )
+        # One assisted sign-in try. Reserved BEFORE the password can be typed; a lost agent after the
+        # password went out makes it 'uncertain' (needs a person), never a replay.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ultra_login_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                browser TEXT NOT NULL,
+                job_id TEXT,
+                state TEXT NOT NULL DEFAULT 'reserved',  -- reserved|running|challenge|signed_in|needs_you|uncertain|failed
+                step TEXT,
+                password_sent INTEGER NOT NULL DEFAULT 0,
+                challenge_id TEXT,
+                challenge_kind TEXT,
+                challenge_text TEXT,
+                challenge_expires_at TIMESTAMP,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
+        # Replies to a running sign-in (a code, "I tapped it", "Resend"): messages to that attempt, not
+        # jobs. Single use; a code is sealed at rest and blanked once delivered.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ultra_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                browser TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                challenge_id TEXT NOT NULL,
+                kind TEXT NOT NULL,          -- code | tapped | resend
+                payload TEXT,
+                state TEXT NOT NULL DEFAULT 'pending',  -- pending | delivered | expired
+                expires_at TIMESTAMP,
+                created_at TIMESTAMP,
+                delivered_at TIMESTAMP
+            )
+        """)
+        # Durable alert outbox (Telegram): written in the same transaction as the state change.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ultra_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                browser TEXT,
+                kind TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMP,
+                sent_at TIMESTAMP,
+                tries INTEGER NOT NULL DEFAULT 0,
+                next_try_at TIMESTAMP,
+                last_error TEXT
+            )
+        """)
+
+    # ---------- Ultra browser ownership (plan rev 3, R3-1/R3-2), used inside write transactions ----------
+
+    @staticmethod
+    def _endpoint_matches(url: Optional[str], host: str, port: int) -> bool:
+        url = (url or "").strip()
+        if proxy_port(url) != int(port):
+            return False
+        return not host or f"@{host}:" in url or f"//{host}:" in url
+
+    async def _ultra_port_map(self, db) -> Dict[int, str]:
+        """Every Ultra inventory port (free, reserved or retiring) → its proxy host."""
+        rows = await (await db.execute("SELECT port, proxy_host FROM ultra_ports")).fetchall()
+        return {int(r[0]): str(r[1] or "") for r in rows}
+
+    async def _ultra_write_verdict(self, db, token_id: int, route_key: Optional[str], redeem_url: Optional[str]) -> Tuple[bool, bool]:
+        """(routing_ok, redeem_ok) for a push-driven write on `token_id`, read in the caller's transaction.
+        A MANAGED browser's account takes routing only from its own route key and a redeem proxy only on its
+        own endpoint; a managed route key never binds another account; an Ultra port is never written as the
+        redeem proxy of an account that does not own it."""
+        rk = (route_key or "").strip()
+        own = await (await db.execute(
+            "SELECT b.route_key, b.port, COALESCE(p.proxy_host, '') FROM ultra_browsers b "
+            "LEFT JOIN ultra_ports p ON p.port = b.port WHERE b.token_id = ? AND b.mode = 'managed'",
+            (int(token_id),),
+        )).fetchone()
+        if own is not None:
+            if not rk or rk != (own[0] or ""):
+                return False, False
+            if redeem_url and not self._endpoint_matches(redeem_url, own[2], int(own[1])):
+                return True, False
+            return True, True
+        if rk:
+            other = await (await db.execute(
+                "SELECT token_id FROM ultra_browsers WHERE route_key = ? AND mode = 'managed'", (rk,)
+            )).fetchone()
+            if other is not None and other[0] is not None and int(other[0]) != int(token_id):
+                return False, False
+            if other is not None and other[0] is None:
+                return False, False  # onboarding browser: its route binds only the account it creates
+        if redeem_url:
+            port = proxy_port(redeem_url)
+            ports = await self._ultra_port_map(db)
+            if port in ports and (not ports[port] or self._endpoint_matches(redeem_url, ports[port], port)):
+                owner = await (await db.execute(
+                    "SELECT 1 FROM ultra_browsers WHERE port = ? AND token_id = ?", (port, int(token_id))
+                )).fetchone()
+                if owner is None:
+                    return True, False
+        return True, True
+
+    async def ultra_route_allows(self, token_id: int, route_key: Optional[str]) -> bool:
+        """Credential writes from a push: a managed account accepts only its own browser's route key."""
+        async with self._connect() as db:
+            row = await (await db.execute(
+                "SELECT route_key FROM ultra_browsers WHERE token_id = ? AND mode = 'managed'", (int(token_id),)
+            )).fetchone()
+        return row is None or ((route_key or "").strip() != "" and (route_key or "").strip() == (row[0] or ""))
+
+    async def get_ultra_hold(self, token_id: int) -> str:
+        """The token's Ultra serving exclusion ('' = none). Raises on a DB error: callers fail CLOSED."""
+        async with self._connect() as db:
+            row = await (await db.execute("SELECT COALESCE(ultra_hold, '') FROM tokens WHERE id = ?", (int(token_id),))).fetchone()
+        return str(row[0] or "") if row else ""
+
+    async def count_outstanding_requests(self, token_id: int) -> int:
+        """Like count_inflight_requests but with NO age cutoff: a drain for a restart must see every
+        request that has not finished, however old (R3-5)."""
+        async with self._connect() as db:
+            row = await (await db.execute(
+                "SELECT COUNT(*) FROM request_logs WHERE token_id = ? "
+                "AND COALESCE(status_text, '') NOT IN ('completed', 'failed')",
+                (int(token_id),),
+            )).fetchone()
+            return int(row[0]) if row else 0
 
     async def _migrate_request_logs(self, db):
         """Migrate request_logs table from old schema to new schema"""
@@ -1253,8 +1475,8 @@ class Database:
                                    protocol_mode, google_cookies, login_account, login_password,
                                    proxy_url, auto_refresh_enabled, refresh_interval_minutes,
                                    last_st_refresh_at, last_st_refresh_result,
-                                   ban_reason, banned_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   ban_reason, banned_at, reserved_client, ultra_hold)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.st, token.at, token.at_expires, token.email, token.name, token.remark,
                   token.is_active, token.credits, token.user_paygate_tier,
                   token.current_project_id, token.current_project_name,
@@ -1265,7 +1487,8 @@ class Database:
                   token.login_password, token.proxy_url, token.auto_refresh_enabled,
                   token.refresh_interval_minutes, token.last_st_refresh_at,
                   token.last_st_refresh_result,
-                  token.ban_reason, token.banned_at))
+                  token.ban_reason, token.banned_at,
+                  token.reserved_client or "", token.ultra_hold or ""))
             await db.commit()
             token_id = cursor.lastrowid
 
@@ -1421,15 +1644,19 @@ class Database:
                 await db.execute(query, params)
                 await db.commit()
 
-    async def update_token_cookie_sync(self, token_id: int, seq: int, **fields) -> int:
+    async def update_token_cookie_sync(self, token_id: int, seq: int, route_key: Optional[str] = None, **fields) -> int:
         """Cookie-sync write guarded by the client sequence IN ONE statement: applies only
         when the stored sequence is lower (a stale ON can never undo a newer OFF, and two
-        concurrent writes cannot both pass a read-then-write check). Returns rows changed."""
+        concurrent writes cannot both pass a read-then-write check). Returns rows changed.
+        An account owned by a managed Ultra browser is written only from that browser's route
+        key — checked in the same statement (R3-1)."""
         async with self._connect(write=True) as db:
             sets = ", ".join(f"{k} = ?" for k in fields)
             cur = await db.execute(
-                f"UPDATE tokens SET {sets}, google_cookies_seq = ? WHERE id = ? AND COALESCE(google_cookies_seq, 0) < ?",
-                [*fields.values(), seq, token_id, seq],
+                f"UPDATE tokens SET {sets}, google_cookies_seq = ? WHERE id = ? AND COALESCE(google_cookies_seq, 0) < ? "
+                "AND NOT EXISTS (SELECT 1 FROM ultra_browsers b WHERE b.token_id = tokens.id AND b.mode = 'managed' "
+                "AND COALESCE(b.route_key, '') != ?)",
+                [*fields.values(), seq, token_id, seq, (route_key or "").strip() or "\x00no-route"],
             )
             await db.commit()
             return cur.rowcount if cur.rowcount is not None else 0
@@ -1549,6 +1776,13 @@ class Database:
         recent_cutoff = (now - timedelta(minutes=self.DEVICE_ACTIVE_WINDOW_MIN)).isoformat()
         async with self._connect(write=True) as db:
             db.row_factory = aiosqlite.Row
+            # Ultra ports (free, reserved or retiring) are never handed out, whatever pool snapshot the
+            # caller read before (R3-2: a reservation may have committed in between).
+            ultra = await self._ultra_port_map(db)
+            pool = [p for p in pool if p not in ultra]
+            if not pool:
+                await db.commit()
+                return None
             # Refresh THIS device's liveness first (before the sticky early-return) so it always
             # counts as present for concurrent siblings and can't be evicted while it's active.
             await db.execute(
@@ -1650,6 +1884,7 @@ class Database:
         async with self._connect() as db:
             used = {int(r[0]) for r in await (await db.execute("SELECT port FROM device_port_assignments")).fetchall()}
             used |= {int(r[0]) for r in await (await db.execute("SELECT to_port FROM port_migrations")).fetchall()}
+            used |= set(await self._ultra_port_map(db))
             for (url,) in await (await db.execute("SELECT redeem_proxy_url FROM tokens WHERE is_active = 1")).fetchall():
                 if proxy_port(url) is not None:
                     used.add(proxy_port(url))  # an account (e.g. away mode) may redeem there without a device row
@@ -1667,7 +1902,7 @@ class Database:
                 "UNION SELECT 1 FROM port_migrations WHERE to_port = ? AND route_key != ?",
                 (int(to_port), route_key, int(to_port), route_key),
             )).fetchone()
-            if taken:
+            if taken or int(to_port) in await self._ultra_port_map(db):
                 return False
             cur = await db.execute(
                 "INSERT OR IGNORE INTO port_migrations (route_key, token_id, from_port, to_port, state, created_at) "
@@ -1723,6 +1958,8 @@ class Database:
             clash = await (await db.execute(
                 "SELECT 1 FROM device_port_assignments WHERE port = ? AND route_key != ?", (mig["to_port"], route_key)
             )).fetchone()
+            if not clash and int(mig["to_port"]) in await self._ultra_port_map(db):
+                clash = True  # an Ultra port is never offered as a shared-pool move
             if not owner or (owner["extension_route_key"] or "") != route_key or clash:
                 await db.commit()
                 return None
@@ -1774,6 +2011,14 @@ class Database:
                 await db.execute("DELETE FROM port_migrations WHERE route_key = ?", (route_key,))
                 await db.commit()
                 return False, "device no longer owns the account (migration dropped)", dict(mig)
+            managed = await (await db.execute(
+                "SELECT 1 FROM ultra_browsers WHERE token_id = ? AND mode = 'managed'", (mig["token_id"],)
+            )).fetchone()
+            if managed is not None or int(port) in await self._ultra_port_map(db):
+                # A managed Ultra browser keeps its own IP; an Ultra port never becomes a pool move (R3-1/R3-2).
+                await db.execute("DELETE FROM port_migrations WHERE route_key = ?", (route_key,))
+                await db.commit()
+                return False, "managed Ultra browser or Ultra port (migration dropped)", dict(mig)
             await db.execute(
                 "INSERT INTO device_port_assignments (route_key, port, assigned_at, last_seen) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(route_key) DO UPDATE SET port = excluded.port, assigned_at = excluded.assigned_at, last_seen = excluded.last_seen",
@@ -1803,10 +2048,20 @@ class Database:
         Returns False when the redeem report was stale (not written)."""
         wrote = True
         async with self._connect(write=True) as db:
+            routing_ok, redeem_ok = await self._ultra_write_verdict(db, token_id, route_key, redeem_url)
+            if not routing_ok:
+                await db.commit()
+                return False
+            if not redeem_ok:
+                redeem_url, wrote = None, False
+            # A managed Ultra browser's own route (verdict passed) always takes the binding, even over an
+            # explicit key the account had on a laptop.
+            managed = await (await db.execute(
+                "SELECT 1 FROM ultra_browsers WHERE token_id = ? AND mode = 'managed'", (int(token_id),))).fetchone() is not None
             if route_key:
                 row = await (await db.execute("SELECT extension_route_key FROM tokens WHERE id = ?", (int(token_id),))).fetchone()
                 cur_rk = ((row[0] if row else "") or "").strip()
-                if not cur_rk or cur_rk.startswith("auto-"):
+                if managed or not cur_rk or cur_rk.startswith("auto-"):
                     await db.execute("UPDATE tokens SET extension_route_key = ? WHERE id = ?", (route_key, int(token_id)))
                     if cur_rk and cur_rk != route_key:
                         await db.execute(
@@ -1833,6 +2088,10 @@ class Database:
         assignment — checked in the same statement, so a push sent before a confirmed switch can
         never overwrite it afterwards. Returns False when the report was stale."""
         async with self._connect(write=True) as db:
+            routing_ok, redeem_ok = await self._ultra_write_verdict(db, token_id, route_key, url)
+            if not (routing_ok and redeem_ok):
+                await db.commit()
+                return False
             if route_key and pool_managed and proxy_port(url) is not None:
                 cur = await db.execute(
                     "UPDATE tokens SET redeem_proxy_url = ? WHERE id = ? AND NOT EXISTS ("
@@ -3057,8 +3316,17 @@ class Database:
 
     async def update_plugin_config(self, connection_token: str, auto_enable_on_update: bool = True,
                                    ext_proxy_pool: Optional[str] = None):
-        """Update plugin configuration. ext_proxy_pool=None leaves the pool unchanged."""
+        """Update plugin configuration. ext_proxy_pool=None leaves the pool unchanged.
+        Raises ValueError when the new pool contains an Ultra port (checked in the same transaction)."""
         async with self._connect(write=True) as db:
+            if ext_proxy_pool:
+                try:
+                    pool_ports = {int(p) for p in (json.loads(ext_proxy_pool) or {}).get("ports") or []}
+                except (ValueError, TypeError, AttributeError):
+                    pool_ports = set()
+                clash = sorted(pool_ports & set(await self._ultra_port_map(db)))
+                if clash:
+                    raise ValueError(f"port(s) {clash} are kept for Ultra browsers and cannot be in the shared pool")
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM plugin_config WHERE id = 1")
             row = await cursor.fetchone()

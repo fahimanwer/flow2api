@@ -78,6 +78,9 @@ class Token(BaseModel):
     # client sequence of that write (docs/cookie-sync.md).
     google_cookies_updated_at: Optional[datetime] = None
     google_cookies_seq: int = 0
+    # Ultra browsers (2026-10-05): serving exclusion owned by the Ultra coordinator ('' = none;
+    # 'onboarding' | 'stopped' | 'restart' | 'update' | 'start'). Enable never clears it.
+    ultra_hold: Optional[str] = ""
 
     # 429 ban fields
     ban_reason: Optional[str] = None  # Ban reason: "429_rate_limit" or None
