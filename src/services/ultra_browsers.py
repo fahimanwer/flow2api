@@ -583,6 +583,12 @@ class UltraService:
                 "JOIN ultra_browsers b ON b.name = j.browser WHERE j.state = 'queued' AND b.host_id = ? "
                 "ORDER BY j.created_at, j.id", (host_id,))).fetchall()
             for job_id, browser, kind, mutating, args, attempt_id, delivered in rows:
+                if kind == "update":
+                    # one extension update at a time across the host, automatic or requested by a person
+                    other = await (await conn.execute(
+                        "SELECT 1 FROM ultra_jobs WHERE kind = 'update' AND state = 'leased'")).fetchone()
+                    if other:
+                        continue
                 if mutating:
                     busy = await (await conn.execute(
                         "SELECT 1 FROM ultra_jobs WHERE browser = ? AND mutating = 1 AND state = 'leased'", (browser,))).fetchone()

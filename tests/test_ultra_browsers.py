@@ -657,6 +657,26 @@ class LifecycleReleaseTests(Base):
         self.assertNotEqual(rows[0][0], (await self._sql("SELECT browser FROM ultra_jobs WHERE kind = 'update' AND state = 'done'"))[0][0])
 
 
+class ManualUpdateSerializationTests(Base):
+    async def test_manual_updates_on_two_browsers_are_leased_one_at_a_time(self):
+        """Codex round 2: the one-update-at-a-time rule lives in leasing, so manual requests obey it too."""
+        names = []
+        for i, port in enumerate((8011, 8002)):
+            names.append((await self._managed(email=f"m{i}@x.com", port=port))["name"])
+        await self._sql("UPDATE ultra_browsers SET state = 'ok', onboarding_hold = 0")
+        await self._sql("UPDATE ultra_jobs SET state = 'done'")
+        for n in names:
+            await self.svc.request_job(n, "update")
+        first = await self.svc.lease("h1")
+        self.assertEqual(first["kind"], "update")
+        self.assertIsNone(await self.svc.lease("h1"))      # the second browser's update waits
+        await self.svc.request_job(first["browser"], "screenshot")
+        self.assertEqual((await self.svc.lease("h1"))["kind"], "screenshot")  # other jobs are not blocked
+        await self.svc.handle_result("h1", first["id"], "done", {"ready": True})
+        second = await self.svc.lease("h1")
+        self.assertEqual((second["kind"], second["browser"]), ("update", [n for n in names if n != first["browser"]][0]))
+
+
 class DownloadAuthTests(Base):
     async def test_header_auth_download_and_old_query_form(self):
         """REGRESSION (code review #4): the agent authenticates the zip download with a header."""
