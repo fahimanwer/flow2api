@@ -1388,10 +1388,18 @@
             ].join(' · ');
             $('ultraAddBtn').disabled = !d.slice_b_enabled;
             $('ultraAddBtn').classList.toggle('opacity-50', !d.slice_b_enabled);
+            // The 8-s refresh rebuilds the form and rows: keep what a person has chosen or half-typed.
+            const keepPort = $('uaPort').value;
+            const keepCodes = {};
+            document.querySelectorAll('input[id^="uc_"]').forEach((el) => { keepCodes[el.id] = el.value; });
+            const focused = document.activeElement && document.activeElement.id;
             const free = (d.ports || []).filter((p) => p.state === 'free' && !p.browser_name);
             $('uaPort').innerHTML = free.map((p) => `<option value="${p.port}">${p.port} ${ue(p.city || '')}</option>`).join('') || '<option value="">no free Ultra port</option>';
             $('ultraPorts').innerHTML = (d.ports || []).map((p) => `<tr class="border-b border-border"><td class="p-3">${p.port}</td><td class="p-3">${ue(p.state)}</td><td class="p-3">${ue(p.browser_name || '-')}</td><td class="p-3">${ue(p.city || '-')} / ${ue(p.timezone || '-')}</td><td class="p-3">${ue(p.expected_egress_ip || '-')}</td></tr>`).join('') || '<tr><td class="p-3 text-muted-foreground" colspan="5">No Ultra ports yet</td></tr>';
             $('ultraRows').innerHTML = (d.browsers || []).map(ultraRow).join('') || '<tr><td class="p-3 text-muted-foreground" colspan="7">No Ultra browsers yet</td></tr>';
+            if (keepPort && free.some((p) => String(p.port) === keepPort)) $('uaPort').value = keepPort;
+            for (const [id, v] of Object.entries(keepCodes)) { const el = $(id); if (el) el.value = v; }
+            if (focused && focused.startsWith('uc_') && $(focused)) $(focused).focus();
         }
         function ultraRow(b) {
             const o = b.obs || {}, t = b.token, a = b.attempt, managed = b.mode === 'managed', on = ultraData && ultraData.slice_b_enabled;
