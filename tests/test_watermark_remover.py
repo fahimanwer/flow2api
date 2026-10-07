@@ -92,11 +92,13 @@ class WatermarkRemoverTests(unittest.TestCase):
                     self.assertIs(cleaned, data)
 
     def test_unknown_size_is_left_alone(self):
-        data = _jpeg(_background("flat", 1024, 1024))
+        # 1000x1000 is not a Flow output size (1024x1024 became calibrated on 7 Oct 2026).
+        self.assertNotIn((1000, 1000), wm.KNOWN_SPECS)
+        data = _jpeg(_background("flat", 1000, 1000))
         cleaned, result = wm.clean_image_bytes(data)
         self.assertFalse(result.applied)
         self.assertEqual(result.reason, "unknown-size")
-        self.assertEqual((result.width, result.height), (1024, 1024))
+        self.assertEqual((result.width, result.height), (1000, 1000))
         self.assertIs(cleaned, data)
 
     def test_pixels_outside_the_logo_barely_move(self):
