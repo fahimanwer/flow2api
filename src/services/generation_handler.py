@@ -34,7 +34,7 @@ from .characters import (
 
 
 # Reference-image limits, from Flow's own model list (GET aisandbox-pa /v1/flow/models,
-# usages[].inputSpec.maxImageReferences, read 2026-09-22): Nano Banana Pro / 2 / 2 Lite = 10,
+# usages[].inputSpec.maxImageReferences, read 2026-09-22; 2026-10-07 for 2.1): Nano Banana Pro / 2.1 / 2 Lite = 10,
 # Omni 1.1 Flash abra_r2v_* = 7, Veo 3.1 Fast and Lite r2v = 3.
 FLOW_IMAGE_MAX_REFERENCES = 10
 FLOW_OMNI_MAX_REFERENCES = 7
@@ -135,101 +135,92 @@ MODEL_CONFIG = {
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
     },
 
-    # Image generation - IMAGEN_3_5 (Imagen 4.0)
-    "imagen-4.0-generate-preview-landscape": {
-        "type": "image",
-        "model_name": "IMAGEN_3_5",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE"
-    },
-    "imagen-4.0-generate-preview-portrait": {
-        "type": "image",
-        "model_name": "IMAGEN_3_5",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT"
-    },
-
-    # Image generation - NARWHAL (new)
+    # Image generation - BELUGA (Nano Banana 2.1). Google retired Nano Banana 2
+    # (NARWHAL): from 2026-10-06 every NARWHAL request got 404 "Requested entity
+    # was not found". 2.1 is Flow's default image model on every tier
+    # (GET /v1/flow/models, read 2026-10-07). Public ids keep the old name.
     "gemini-3.1-flash-image-landscape": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE"
     },
     "gemini-3.1-flash-image-portrait": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT"
     },
     "gemini-3.1-flash-image-square": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE"
     },
     "gemini-3.1-flash-image-four-three": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"
     },
     "gemini-3.1-flash-image-three-four": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"
     },
     "gemini-3.1-flash-image-landscape-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K"
     },
     "gemini-3.1-flash-image-portrait-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K"
     },
     "gemini-3.1-flash-image-square-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K"
     },
     "gemini-3.1-flash-image-four-three-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K"
     },
     "gemini-3.1-flash-image-three-four-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K"
     },
     "gemini-3.1-flash-image-landscape-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
     },
     "gemini-3.1-flash-image-portrait-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
     },
     "gemini-3.1-flash-image-square-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
     },
     "gemini-3.1-flash-image-four-three-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
     },
     "gemini-3.1-flash-image-three-four-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
     },

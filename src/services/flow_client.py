@@ -1723,7 +1723,7 @@ class FlowClient:
             at: Access Token
             project_id: project ID
             prompt: prompt text
-            model_name: NARWHAL / GEM_PIX / GEM_PIX_2 / IMAGEN_3_5
+            model_name: BELUGA (Nano Banana 2.1) / GEM_PIX_2 (Pro) / HARBOR_SEAL (2 Lite)
             aspect_ratio: image aspect ratio
             image_inputs: reference images (for image-to-image)
 

@@ -168,6 +168,8 @@ Open **http://localhost:8000/test** for the built-in model test page. It can:
 
 ### Image generation
 
+> Image models (2026-10-07): `gemini-3.0-pro-image-*` = Nano Banana Pro, `gemini-3.1-flash-image-*` = **Nano Banana 2.1** (Google retired Nano Banana 2; aliases `nano-banana-2` and `nano-banana-2.1` map here), `nano-banana-2-lite-*` = Nano Banana 2 Lite. Imagen 4 is gone.
+
 | Model | Description | Size |
 |---------|--------|--------|
 | `gemini-3.0-pro-image-landscape` | Image/text-to-image | Landscape |
@@ -185,8 +187,6 @@ Open **http://localhost:8000/test** for the built-in model test page. It can:
 | `gemini-3.0-pro-image-square-4k` | Image/text-to-image (4K) | Square |
 | `gemini-3.0-pro-image-four-three-4k` | Image/text-to-image (4K) | Landscape 4:3 |
 | `gemini-3.0-pro-image-three-four-4k` | Image/text-to-image (4K) | Portrait 3:4 |
-| `imagen-4.0-generate-preview-landscape` | Image/text-to-image | Landscape |
-| `imagen-4.0-generate-preview-portrait` | Image/text-to-image | Portrait |
 | `gemini-3.1-flash-image-landscape` | Image/text-to-image | Landscape |
 | `gemini-3.1-flash-image-portrait` | Image/text-to-image | Portrait |
 | `gemini-3.1-flash-image-square` | Image/text-to-image | Square |

@@ -22,16 +22,15 @@ from ..core.logger import debug_logger
 IMAGE_BASE_MODELS = {
     # Gemini 3.0 Pro (GEM_PIX_2)
     "gemini-3.0-pro-image": "gemini-3.0-pro-image",
-    # Gemini 3.1 Flash (NARWHAL)
+    # Nano Banana 2.1 (Flow key BELUGA; replaced Nano Banana 2 / NARWHAL, 2026-10)
     "gemini-3.1-flash-image": "gemini-3.1-flash-image",
     # Nano Banana 2 Lite (HARBOR_SEAL) - lite version, 1K only
     "nano-banana-2-lite": "nano-banana-2-lite",
-    # Imagen 4.0 (IMAGEN_3_5)
-    "imagen-4.0-generate-preview": "imagen-4.0-generate-preview",
     # Friendly public aliases (Google's marketing names). Resolve to the same base
     # model, so they share its quota bookkeeping. Adapted from Danborad/flow2api.
     "nano-banana-pro": "gemini-3.0-pro-image",
-    "nano-banana-2": "gemini-3.1-flash-image",
+    "nano-banana-2": "gemini-3.1-flash-image",   # Google aliases "Nano Banana 2" to 2.1
+    "nano-banana-2.1": "gemini-3.1-flash-image",
 }
 
 # ──────────────────────────────────────────────
@@ -83,7 +82,6 @@ MODEL_SUPPORTED_ASPECTS = {
         "four-three",
         "three-four",
     ],
-    "imagen-4.0-generate-preview": ["landscape", "portrait"],
 }
 
 # imageSize (resolution) values supported by each base model
@@ -91,7 +89,6 @@ MODEL_SUPPORTED_SIZES = {
     "gemini-3.0-pro-image": ["2k", "4k"],
     "gemini-3.1-flash-image": ["2k", "4k"],
     "nano-banana-2-lite": [],  # Lite is 1K only, no upscaling
-    "imagen-4.0-generate-preview": [],  # No upscaling
 }
 
 # imageSize normalization

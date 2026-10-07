@@ -1,8 +1,10 @@
 # Shared Agent Status
 
-Last updated: 2026-10-05 22:10 UTC (PID leak fix: tini as PID 1)
+Last updated: 2026-10-07 (Nano Banana 2.1 swap)
 
 ## Active
+
+- 2026-10-07 (Claude, owner: "nano banana 2 is gone, it's 2.1; make it default, keep only Pro, Flash, Lite"): **Flash image outage → Nano Banana 2.1** (branch `fix/nano-banana-2-1`). CONFIRMED: Google retired Nano Banana 2 (`NARWHAL`, now in `deprecatedModels` of GET aisandbox-pa `/v1/flow/models`); every `gemini-3.1-flash-image-*` request since at least 2026-10-06 17:00 UTC (log start) failed `404 Requested entity was not found` — 0 ok of ~65,000. Replacement `beluga_display` "Nano Banana 2.1", request key `BELUGA`, is Flow's default image model on all tiers and aliases "Nano Banana 2". Fix: the 15 flash ids send `BELUGA` (public ids unchanged), alias `nano-banana-2.1` added, dead Imagen 4 ids removed. Image models now: Pro (`GEM_PIX_2`), 2.1 (`BELUGA`), 2 Lite (`HARBOR_SEAL`). 2.1 also offers 9 new aspect ratios (2:3, 3:2, 4:5, 5:4, ultrawide, 1:4, 4:1, 1:8, 8:1) — NOT wired yet. Upstream has no 2.1 change. Suite 517 pass / 1 pre-existing.
 
 - 2026-10-06 06:07 UTC (Claude): Pro 51's laptop came online 05:51 and moved itself to pool IP 8006 (not the queued 8018); queued move deleted, 51 re-enabled (image+video). flow-ultra-02 (Ultra 55, 8019) registered observe-only in the Ultra browsers watcher.
 
