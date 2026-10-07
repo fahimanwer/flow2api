@@ -68,6 +68,14 @@ class WatermarkSpec:
 # tmp/watermark_test on a few free/Pro images of that size.
 KNOWN_SPECS: Dict[Tuple[int, int], WatermarkSpec] = {
     (1536, 2752): WatermarkSpec(48, 89, 89, "bg_48.png", 0.59),  # 2K portrait (upscaled)
+    # 2K landscape (upscaled), measured 7 Oct 2026 on a Nano Banana 2.1 free/Pro image: logo 48 px,
+    # 89 px margins, strength 0.58. GargantuaX/gemini-watermark-remover's size catalog lists the
+    # same fixed variant for 2752x1536 (48/89/89).
+    (2752, 1536): WatermarkSpec(48, 89, 89, "bg_48.png", 0.59),
+    # 1K square (Pro square), measured 7 Oct 2026 on 3 real Pro images: logo 48 px, 78 px margins
+    # in all 3 (NCC 1.00), strength 0.59-0.61. Flow differs from the Gemini-app value upstream
+    # (96 px / 64 px), so our own samples win.
+    (1024, 1024): WatermarkSpec(48, 78, 78, "bg_48.png", 0.60),
     (1376, 768): WatermarkSpec(48, 73, 73, "bg_48.png", 0.60),   # 1K landscape
     (768, 1376): WatermarkSpec(48, 73, 73, "bg_48.png", 0.60),   # 1K portrait
     # 3:4 1K (gemini-3.0-pro-image-three-four, e.g. a failed 4K enlarge delivered as 1K): measured
