@@ -173,9 +173,8 @@ const STATE = { selectedModel: null, modelConfig: null, images: [], generating: 
 <script>
 // Model categories for sidebar
 const MODEL_CATEGORIES = {
-  "Gemini 3.1 Flash Image": { filter: m => m.startsWith("gemini-3.1-flash-image") },
+  "Nano Banana 2.1 (gemini-3.1-flash-image)": { filter: m => m.startsWith("gemini-3.1-flash-image") },
   "Gemini 3.0 Pro Image": { filter: m => m.startsWith("gemini-3.0-pro-image") },
-  "Imagen 4.0 Image": { filter: m => m.startsWith("imagen-4.0") },
   "Veo 3.1 Text-to-Video (T2V)": { filter: m => m.startsWith("veo_3_1_t2v") && !m.includes("4k") && !m.includes("1080p") },
   "Veo 3.1 Image-to-Video (I2V)": { filter: m => m.startsWith("veo_3_1_i2v") && !m.includes("4k") && !m.includes("1080p") },
   "Veo 3.1 Multi-Image Video (R2V)": { filter: m => m.startsWith("veo_3_1_r2v") && !m.includes("4k") && !m.includes("1080p") },
@@ -185,7 +184,6 @@ const MODEL_CATEGORIES = {
 const FALLBACK_MODELS = {
   "gemini-3.1-flash-image": "Image generation (alias) - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
   "gemini-3.0-pro-image": "Image generation (alias) - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
-  "imagen-4.0-generate-preview": "Image generation (alias) - aspects: landscape, portrait",
   "veo_3_1_t2v_fast": "Video generation (alias) - supports landscape/portrait via generationConfig",
   "veo_3_1_t2v_fast_4s": "Video generation (alias) - 4s, supports landscape/portrait via generationConfig",
   "veo_3_1_t2v_fast_landscape_4s": "Video generation - fast 4s landscape",
@@ -311,7 +309,7 @@ function renderSidebarFallback() {
 }
 
 function getModelType(modelId) {
-  if (modelId.includes("image") || modelId.startsWith("imagen")) return "image";
+  if (modelId.includes("image")) return "image";
   return "video";
 }
 
@@ -358,7 +356,7 @@ function renderSidebar() {
       item.dataset.model = modelId;
 
       const type = getModelType(modelId);
-      const shortName = modelId.replace("gemini-3.1-flash-image-", "").replace("gemini-3.0-pro-image-", "").replace("imagen-4.0-generate-preview-", "");
+      const shortName = modelId.replace("gemini-3.1-flash-image-", "").replace("gemini-3.0-pro-image-", "");
       item.innerHTML = `<span>${shortName}</span><span class="model-tag ${type === 'image' ? 'tag-image' : 'tag-video'}">${type === 'image' ? 'Image' : 'Video'}</span>`;
       item.onclick = () => selectModel(modelId);
       list.appendChild(item);
