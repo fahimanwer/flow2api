@@ -1,4 +1,4 @@
-"""Flow "Characters": a named person/thing built from 1-3 photos, referenced in
+"""Flow "Characters": a named person/thing built from 1-2 photos, referenced in
 prompts as @Name, sent to Flow as an entity (reference) so the face/object stays
 consistent across generations.
 
@@ -6,7 +6,7 @@ Flow's contract (CONFIRMED 2026-09-23 against aisandbox-pa, see docs/flow-charac
 - create:  POST /flow/entities {"entity":{"projectId","entityInfo":{"entityType":"CHARACTER",
            "displayName","characterInfo":{}}}}  -> {"entity":{"entityId",...}}
 - photos:  POST /flow/uploadImage (existing upload_image) then POST /flow:copyProjectMedia into
-           destinationMediaContext.entityContext.characterSlot.imageReferenceIndex = 0,1,2
+           destinationMediaContext.entityContext.characterSlot.imageReferenceIndex = 0,1 (index 2 is refused, 2026-10-11)
 - read:    GET  /flow/entities:batchGet?entityIds=... -> {"results":[{"entity":...}|{"error":{"code":5}}]}
 - use:     requests[i].referenceEntities:[{"entityId"}] and structuredPrompt.parts
            [{"text"} | {"reference":{"entity":{"entityId","handle"}}}] (video: textInput.structuredPrompt)
@@ -27,7 +27,9 @@ from .flow_client import FlowPhotoRefusedError
 
 MAX_CHARACTERS_IMAGE = 10   # Flow model list: inputSpec.maxCharacters for Nano Banana models
 MAX_CHARACTERS_VIDEO = 3    # Omni abra_r2v_* and Veo r2v
-MAX_PHOTOS_PER_CHARACTER = 3
+# Flow refuses a third character slot (copyProjectMedia imageReferenceIndex 2 -> HTTP 400
+# INVALID_ARGUMENT, even on an empty entity; proven on Ultra 55 and 56, 2026-10-11).
+MAX_PHOTOS_PER_CHARACTER = 2
 MAX_PHOTO_BYTES = 12 * 1024 * 1024
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _\-]{0,39}$")
 SETUP_DEADLINE_SECONDS = 120.0
@@ -80,7 +82,10 @@ def validate_characters(characters: Sequence[LoadedCharacter], max_count: int) -
         if not c.images:
             return f"Character {name!r} needs at least one photo"
         if len(c.images) > MAX_PHOTOS_PER_CHARACTER:
-            return f"Character {name!r} has {len(c.images)} photos; at most {MAX_PHOTOS_PER_CHARACTER}"
+            return (
+                f"Character {name!r} has {len(c.images)} photos; Flow takes at most {MAX_PHOTOS_PER_CHARACTER} "
+                "per character (Google refuses a third). Send 1 or 2 photos."
+            )
         for img in c.images:
             if not img or len(img) > MAX_PHOTO_BYTES:
                 return f"A photo of character {name!r} is empty or larger than {MAX_PHOTO_BYTES // (1024 * 1024)} MB"

@@ -131,7 +131,7 @@ class CharacterPhotoRefusalTests(unittest.IsolatedAsyncioTestCase):
     async def test_refused_character_photo_is_a_400_that_names_the_photo_and_asks_for_another_face(self):
         fc = _flow_with_refused_photo(2)
         db = _NoRowsDB()
-        nia = LoadedCharacter(name="Nia", images=[b"a", b"b", b"c"])
+        nia = LoadedCharacter(name="Nia", images=[b"a", b"b"])
         with self.assertRaises(CharacterSetupError) as ctx:
             await CharacterService().ensure(fc, db, MagicMock(id=55, at="at"), "proj", [nia])
         err = ctx.exception
