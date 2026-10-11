@@ -832,6 +832,15 @@ for _duration in (None, 4, 6, 8, 10):
         _cfg["min_images"] = 1
         MODEL_CONFIG[_new_key] = _cfg
 
+# ── Experiment 2026-10-11 (owner: does the Veo 1080p upsampler accept an Omni 1.1 video?):
+#    ONE test model. A refusal is delivered as the 720p clip with flow_upscale.reason, so the
+#    answer is visible either way. Widen to every omni* model only if Google accepts it,
+#    otherwise remove this entry.
+MODEL_CONFIG["omni_8s_portrait_1080p"] = {
+    **MODEL_CONFIG["omni_8s_portrait"],
+    "upsample": {"resolution": "VIDEO_RESOLUTION_1080P", "model_key": "veo_3_1_upsampler_1080p"},
+}
+
 
 def _estimate_video_credit_cost_for_log(model: str, model_config: Dict[str, Any]) -> int:
     """Flow credit cost of a video request, for the request log only."""
