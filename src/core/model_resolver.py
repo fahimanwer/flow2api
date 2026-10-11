@@ -437,6 +437,12 @@ VIDEO_BASE_MODELS = {
     },
 }
 
+# Omni 1080p twins (2026-10-11): same aspect pairs as each omni* base, `_1080p` appended.
+for _omni_base in [k for k in VIDEO_BASE_MODELS if k.startswith("omni")]:
+    VIDEO_BASE_MODELS[f"{_omni_base}_1080p"] = {
+        aspect: f"{model}_1080p" for aspect, model in VIDEO_BASE_MODELS[_omni_base].items()
+    }
+
 
 # Friendly video aliases (Google's product names / short handles). Resolved by
 # _resolve_friendly_video_alias, which also picks I2V / first+last / reference variants
