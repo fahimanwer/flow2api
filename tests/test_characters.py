@@ -29,7 +29,8 @@ class ValidationTests(unittest.TestCase):
     def test_counts_and_photos(self):
         self.assertIn("At most 3", validate_characters([_c("A"), _c("B"), _c("C"), _c("D")], 3))
         self.assertIn("at least one photo", validate_characters([LoadedCharacter("A", [])], 10))
-        self.assertIn("at most 3", validate_characters([_c("A", 4)], 10))
+        self.assertIn("at most 2", validate_characters([_c("A", 3)], 10))
+        self.assertIsNone(validate_characters([_c("A", 2)], 10))
         self.assertIn("empty", validate_characters([LoadedCharacter("A", [b""])], 10))
 
     def test_digest_depends_on_order(self):

@@ -1,6 +1,6 @@
 # Flow Characters (consistent people / objects) — flow2api
 
-A character is a named person or thing built from 1–3 photos. In the prompt you write `@Name`
+A character is a named person or thing built from 1–2 photos. In the prompt you write `@Name`
 and Flow keeps that face/object consistent. flow2api creates the character on the account that
 serves the request, caches it, and passes it to Google as a reference entity.
 
@@ -19,7 +19,9 @@ Add `characters` to a normal request (OpenAI `/v1/chat/completions` or Gemini `/
 ```
 
 - `name`: 1–40 characters, letters/digits/space/`_`/`-`, unique per request (case-insensitive).
-- `images`: 1–3 photos (data URL or http(s) URL), up to 12 MB each. Order matters (it is part of the cache key).
+- `images`: 1–2 photos (data URL or http(s) URL), up to 12 MB each. A third photo answers 400 before any setup:
+  Flow refuses character slot 3 (`imageReferenceIndex` 2 → HTTP 400 `INVALID_ARGUMENT`, even on an empty entity;
+  proven on Ultra 55 and 56, 2026-10-11). Order matters (it is part of the cache key).
 - Mention with `@Name`; `@Maya Rose` beats `@Maya` (longest name wins); `@Unknown` stays plain text.
   A character that is never mentioned is still attached as a reference.
 - Limits: images up to 10 characters; videos up to 3 and only on ingredients models
@@ -32,7 +34,7 @@ Add `characters` to a normal request (OpenAI `/v1/chat/completions` or Gemini `/
 
 1. Validation (names, counts, model type) → 400 before anything is uploaded.
 2. Per character: cache lookup in `flow_characters` (account + project + name + photo digest).
-   Miss → create the entity, upload each photo, attach it to slot 0/1/2, read the entity back.
+   Miss → create the entity, upload each photo, attach it to slot 0/1, read the entity back.
    Any failure → 400/502 to the caller, no generation submitted, no account strike.
 3. Generation: `referenceEntities:[{entityId}]` + `structuredPrompt.parts` with the `@Name` mentions as
    entity references (video: `textInput.structuredPrompt`).
@@ -51,4 +53,7 @@ the account's project; rows are removed with the account/project.
 | image | `flowMedia:batchGenerateImages` `requests[i].referenceEntities`, `structuredPrompt.parts[].reference.entity{entityId,handle}` |
 | video | `video:batchAsyncGenerateVideoReferenceImages` `requests[i].referenceEntities`, `textInput.structuredPrompt.parts` |
 
-Limits come from `GET /v1/flow/models` (`inputSpec.maxCharacters`). The web app counts 3 image slots per character.
+Limits come from `GET /v1/flow/models` (`inputSpec.maxCharacters`). The web app counted 3 image slots per character at launch (2026-09-23, only 1-photo characters were tested live);
+on 2026-10-11 the API takes 2. A photo Google refuses (e.g. `PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD`, "looks like a
+real or famous person") answers 400 `code: photo_refused_by_google` with `photo_index` and `character`: send a
+different photo / face.

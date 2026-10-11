@@ -284,7 +284,7 @@ class TokenRefreshConfig(BaseModel):
 
 # OpenAI Compatible Request Models
 class CharacterInput(BaseModel):
-    """A character: a named person or thing built from 1-3 photos. Write `@Name` in the
+    """A character: a named person or thing built from 1-2 photos. Write `@Name` in the
     prompt and Flow keeps that face/object consistent across images and videos."""
 
     name: str = Field(
@@ -294,7 +294,7 @@ class CharacterInput(BaseModel):
     )
     images: List[str] = Field(
         ...,
-        description="1-3 photos of the character, as data URLs (data:image/jpeg;base64,...) or http(s) URLs, up to 12 MB each.",
+        description="1-2 photos of the character (Flow refuses a third), as data URLs (data:image/jpeg;base64,...) or http(s) URLs, up to 12 MB each.",
         examples=[["data:image/jpeg;base64,/9j/4AAQ...", "https://example.com/maya-side.jpg"]],
     )
 
@@ -368,7 +368,7 @@ class GeminiGenerateContentRequest(BaseModel):
     systemInstruction: Optional[GeminiContent] = None
     characters: Optional[List[CharacterInput]] = Field(
         default=None,
-        description="Flow Characters (same as on /v1/chat/completions): name + 1-3 photos each, referenced as @Name in the prompt.",
+        description="Flow Characters (same as on /v1/chat/completions): name + 1-2 photos each, referenced as @Name in the prompt.",
     )
 
     model_config = ConfigDict(extra="allow")
@@ -391,7 +391,7 @@ class ChatCompletionRequest(BaseModel):
     characters: Optional[List[CharacterInput]] = Field(
         default=None,
         description=(
-            "Flow Characters: people/objects that must look the same across generations. Give each a name and 1-3 "
+            "Flow Characters: people/objects that must look the same across generations. Give each a name and 1-2 "
             "photos, then write @Name in the prompt (e.g. \"@Maya sits in a sunny cafe\"). Images: up to 10 characters. "
             "Videos: up to 3, only on ingredients models (omni-r2v, omni, omni-flash, veo-r2v, veo-r2v-lite). "
             "Character photos are NOT reference images; you may still add image_url parts as ordinary references."
