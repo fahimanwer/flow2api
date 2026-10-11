@@ -19,7 +19,7 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
-from .flow_client import classify_upsample_error
+from .flow_client import FlowPhotoRefusedError, classify_upsample_error
 from .token_manager import upsample_quota_key
 from .watermark_remover import clean_image_bytes
 from .characters import (
@@ -1251,12 +1251,16 @@ class GenerationHandler:
             "base_url": None,
         }
 
-    def _mark_generation_failed(self, generation_result: Optional[Dict[str, Any]], error_message: str):
-        """????????????????????"""
+    def _mark_generation_failed(
+        self, generation_result: Optional[Dict[str, Any]], error_message: str, caller_fault: bool = False
+    ):
+        """Record a failure whose error response was already sent. caller_fault=True (bad
+        input, e.g. a photo Google refuses) logs it as a 400 and puts no strike on the account."""
         if isinstance(generation_result, dict):
             generation_result["success"] = False
             generation_result["error_message"] = error_message
             generation_result["error_emitted"] = True
+            generation_result["caller_fault"] = caller_fault
 
     def _mark_generation_succeeded(self, generation_result: Optional[Dict[str, Any]]):
         """???????"""
@@ -1315,6 +1319,15 @@ class GenerationHandler:
             return text
         return f"{text[:max_length - 3]}..."
 
+    async def _upload_photo(self, token, image_bytes: bytes, aspect_ratio: str, project_id: str, position: int) -> str:
+        """Upload one photo; a Google refusal is tagged with the photo's 1-based position so the
+        caller learns WHICH photo to replace."""
+        try:
+            return await self.flow_client.upload_image(token.at, image_bytes, aspect_ratio, project_id=project_id)
+        except FlowPhotoRefusedError as exc:
+            exc.photo_index = position
+            raise
+
     async def _upload_reference_images(
         self,
         token,
@@ -1325,13 +1338,11 @@ class GenerationHandler:
         """Upload images a few at a time; media ids come back in input order."""
         semaphore = asyncio.Semaphore(REFERENCE_UPLOAD_CONCURRENCY)
 
-        async def _upload(image_bytes: bytes) -> str:
+        async def _upload(image_bytes: bytes, position: int) -> str:
             async with semaphore:
-                return await self.flow_client.upload_image(
-                    token.at, image_bytes, aspect_ratio, project_id=project_id
-                )
+                return await self._upload_photo(token, image_bytes, aspect_ratio, project_id, position)
 
-        tasks = [asyncio.create_task(_upload(img)) for img in images]
+        tasks = [asyncio.create_task(_upload(img, i + 1)) for i, img in enumerate(images)]
         try:
             return list(await asyncio.gather(*tasks))
         except BaseException:
@@ -1655,8 +1666,9 @@ class GenerationHandler:
             # 6. Record usage
             if not generation_result.get("success"):
                 error_msg = generation_result.get("error_message") or "Generation did not complete successfully"
+                caller_fault = bool(generation_result.get("caller_fault"))
                 debug_logger.log_warning(f"[GENERATION] Generation failed, not counted: {error_msg}")
-                if token:
+                if token and not caller_fault:
                     await self.token_manager.record_error(token.id, error_msg, model)
                 duration = time.time() - start_time
                 record_generation_result(generation_type, "failed", duration)
@@ -1669,7 +1681,7 @@ class GenerationHandler:
                     request_operation,
                     request_payload,
                     {"error": error_msg, "performance": perf_trace},
-                    500,
+                    400 if caller_fault else 500,
                     duration,
                     log_id=request_log_state.get("id"),
                     status_text="failed",
@@ -1761,6 +1773,34 @@ class GenerationHandler:
                 progress=request_log_state.get("progress", 0),
             )
             raise
+        except FlowPhotoRefusedError as e:
+            # Google refused one of the caller's photos for its content (2026-10-11:
+            # PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD). Their input, not the account's fault:
+            # 400 with a stable code so the caller swaps the photo, and no strike.
+            index = e.photo_index or (1 if images and len(images) == 1 else None)
+            what = f"reference image {index}" if index else "one of your reference images"
+            error_msg = e.caller_message(what)
+            error_extra = e.error_extra(photo_index=index)
+            debug_logger.op_warning(f"[GEN] req={request_id} token={token.id if token else None} PHOTO_REFUSED: {e.reason} photo={index}")
+            duration = time.time() - start_time
+            record_generation_result(generation_type or "unknown", "failed", duration)
+            perf_trace["status"] = "failed"
+            perf_trace["total_ms"] = int(duration * 1000)
+            perf_trace["error"] = error_msg
+            await self._log_request(
+                token.id if token else None,
+                request_operation if generation_type else "generate_unknown",
+                request_payload if 'request_payload' in locals() else {"model": model},
+                {"error": error_msg, "error_detail": error_extra, "performance": perf_trace},
+                400,
+                duration,
+                log_id=request_log_state.get("id"),
+                status_text="failed",
+                progress=request_log_state.get("progress", 0),
+            )
+            if stream:
+                yield self._create_stream_chunk(f"Error: {error_msg}\n")
+            yield self._create_error_response(error_msg, status_code=400, extra=error_extra)
         except Exception as e:
             error_msg = f"Generation failed: {str(e)}"
             debug_logger.log_error(f"[GENERATION] ❌ {error_msg}")
@@ -1908,7 +1948,7 @@ class GenerationHandler:
         if characters:
             char_error = validate_characters(characters, MAX_CHARACTERS_IMAGE)
             if char_error:
-                self._mark_generation_failed(generation_result, char_error)
+                self._mark_generation_failed(generation_result, char_error, caller_fault=True)
                 yield self._create_error_response(char_error, status_code=400)
                 return
             try:
@@ -1921,8 +1961,8 @@ class GenerationHandler:
                 if image_trace is not None:
                     image_trace["characters_ms"] = int((time.time() - characters_started_at) * 1000)
             except CharacterSetupError as exc:
-                self._mark_generation_failed(generation_result, str(exc))
-                yield self._create_error_response(str(exc), status_code=exc.status_code)
+                self._mark_generation_failed(generation_result, str(exc), caller_fault=exc.status_code < 500)
+                yield self._create_error_response(str(exc), status_code=exc.status_code, extra=exc.extra or None)
                 return
         prompt_parts, reference_entities = (build_prompt_parts(prompt, character_entities) if character_entities else (None, None))
 
@@ -2306,12 +2346,12 @@ class GenerationHandler:
             if characters:
                 if video_type not in ("r2v", "omni"):
                     error_msg = "Characters need an ingredients model (omni-r2v, omni, veo-r2v, veo-r2v-lite)"
-                    self._mark_generation_failed(generation_result, error_msg)
+                    self._mark_generation_failed(generation_result, error_msg, caller_fault=True)
                     yield self._create_error_response(error_msg, status_code=400)
                     return
                 char_error = validate_characters(characters, MAX_CHARACTERS_VIDEO)
                 if char_error:
-                    self._mark_generation_failed(generation_result, char_error)
+                    self._mark_generation_failed(generation_result, char_error, caller_fault=True)
                     yield self._create_error_response(char_error, status_code=400)
                     return
                 if video_type == "omni":
@@ -2376,8 +2416,8 @@ class GenerationHandler:
                     if video_trace is not None:
                         video_trace["characters_ms"] = int((time.time() - characters_started_at) * 1000)
                 except CharacterSetupError as exc:
-                    self._mark_generation_failed(generation_result, str(exc))
-                    yield self._create_error_response(str(exc), status_code=exc.status_code)
+                    self._mark_generation_failed(generation_result, str(exc), caller_fault=exc.status_code < 500)
+                    yield self._create_error_response(str(exc), status_code=exc.status_code, extra=exc.extra or None)
                     return
             prompt_parts, reference_entities = (build_prompt_parts(prompt, character_entities) if character_entities else (None, None))
 
@@ -2392,8 +2432,8 @@ class GenerationHandler:
                     # 1 image: first frame only
                     if stream:
                         yield self._create_stream_chunk("Uploading first-frame image...\n")
-                    start_media_id = await self.flow_client.upload_image(
-                        token.at, images[0], model_config["aspect_ratio"], project_id=project_id
+                    start_media_id = await self._upload_photo(
+                        token, images[0], model_config["aspect_ratio"], project_id, 1
                     )
                     debug_logger.log_info(f"[I2V] Uploaded first frame only: {start_media_id}")
 
@@ -2401,11 +2441,11 @@ class GenerationHandler:
                     # 2 images: first + last frame
                     if stream:
                         yield self._create_stream_chunk("Uploading first-frame and last-frame images...\n")
-                    start_media_id = await self.flow_client.upload_image(
-                        token.at, images[0], model_config["aspect_ratio"], project_id=project_id
+                    start_media_id = await self._upload_photo(
+                        token, images[0], model_config["aspect_ratio"], project_id, 1
                     )
-                    end_media_id = await self.flow_client.upload_image(
-                        token.at, images[1], model_config["aspect_ratio"], project_id=project_id
+                    end_media_id = await self._upload_photo(
+                        token, images[1], model_config["aspect_ratio"], project_id, 2
                     )
                     debug_logger.log_info(f"[I2V] Uploaded first + last frame: {start_media_id}, {end_media_id}")
 
@@ -2666,6 +2706,7 @@ class GenerationHandler:
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
         extend_source_media_id: Optional[str] = None,
+        upscale_stage: bool = False,
     ) -> AsyncGenerator:
         """Poll video generation result
         
@@ -2679,9 +2720,12 @@ class GenerationHandler:
         max_attempts = config.max_poll_attempts
         poll_interval = config.poll_interval
         
-        # If upscaling, allow more poll attempts (upscale can take 30 minutes)
-        if upsample_config:
+        # If upscaling, allow more poll attempts (upscale can take 30 minutes). upscale_stage
+        # is the upscale job itself (recursive call, upsample_config=None): it gets the long
+        # budget and no 4-minute "stuck while ACTIVE" cutoff (Codex, 2026-10-11).
+        if upsample_config or upscale_stage:
             max_attempts = max_attempts * 3  # upscale takes longer
+        stuck_after_attempts = max_attempts if upscale_stage else 80
 
         consecutive_poll_errors = 0
         last_poll_error: Optional[Exception] = None
@@ -2801,9 +2845,20 @@ class GenerationHandler:
                     operation["operation"]["metadata"] = metadata
 
                     # ========== Video upscale ==========
+                    # A failed upscale delivers the 720p original WITH a flow_upscale note
+                    # (requested vs delivered), the same rule as the image enlarge. Until
+                    # 2026-10-11 an undefined `normalized_tier` here made every upscale fail
+                    # silently and callers took the 720p file for 1080p/4K.
+                    upscale_note: Optional[Dict[str, Any]] = None
+                    upscaled_to = response_state.get("video_upscale_requested")
+                    if upscaled_to and not upsample_config:
+                        # This is the upscaled video itself (recursive poll below).
+                        upscale_note = {"requested": upscaled_to, "delivered": upscaled_to}
+                    if upsample_config:
+                        resolution_name = "4K" if "4K" in upsample_config["resolution"] else "1080p"
+                        upscale_fail_reason = "" if video_media_id else "no media id to upscale"
                     if upsample_config and video_media_id:
                         if stream:
-                            resolution_name = "4K" if "4K" in upsample_config["resolution"] else "1080P"
                             yield self._create_stream_chunk(f"\nVideo generation complete, starting {resolution_name} upscaling... (may take up to 30 minutes)\n")
                         
                         try:
@@ -2815,7 +2870,7 @@ class GenerationHandler:
                                 aspect_ratio=aspect_ratio,
                                 resolution=upsample_config["resolution"],
                                 model_key=upsample_config["model_key"],
-                                user_paygate_tier=normalized_tier,
+                                user_paygate_tier=normalize_user_paygate_tier(token.user_paygate_tier),
                                 token_id=token.id,
                                 token_video_concurrency=token.video_concurrency,
                             )
@@ -2824,6 +2879,7 @@ class GenerationHandler:
                             if upsample_operations:
                                 if stream:
                                     yield self._create_stream_chunk("Upscaling task submitted, continuing to poll...\n")
+                                response_state["video_upscale_requested"] = resolution_name
                                 
                                 # Recursively poll the upscale result (no further upscale)
                                 async for chunk in self._poll_video_result(
@@ -2835,16 +2891,24 @@ class GenerationHandler:
                                     generation_result,
                                     response_state,
                                     request_log_state,
+                                    upscale_stage=True,
                                 ):
                                     yield chunk
                                 return
-                            else:
-                                if stream:
-                                    yield self._create_stream_chunk("⚠️ Failed to create upscaling task, returning original video\n")
+                            upscale_fail_reason = "Google returned no upscale task"
                         except Exception as e:
                             debug_logger.log_error(f"Video upsample failed: {str(e)}")
-                            if stream:
-                                yield self._create_stream_chunk(f"⚠️ Upscale failed: {str(e)}, returning original video\n")
+                            upscale_fail_reason = self._normalize_error_message(e, max_length=300)
+                    if upsample_config:
+                        upscale_note = {"requested": resolution_name, "delivered": "720p", "reason": upscale_fail_reason}
+                        response_state["flow_upscale"] = upscale_note
+                        debug_logger.op_warning(
+                            f"[UPSAMPLE] token={token.id} video requested={resolution_name} delivered=720p reason={upscale_fail_reason[:160]}"
+                        )
+                        if stream:
+                            yield self._create_stream_chunk(
+                                f"⚠️ Not upscaled — delivering the original 720p video (requested {resolution_name}; reason: {upscale_fail_reason})\n"
+                            )
 
                     # ========== Extend video concatenation ==========
                     if extend_source_media_id and video_media_id:
@@ -2945,6 +3009,8 @@ class GenerationHandler:
                         "model": resolved_video.get("model"),
                         "duration": resolved_video.get("duration"),
                     }
+                    if upscale_note:
+                        response_state["generated_assets"]["upscale"] = upscale_note
 
                     # Return result
                     self._mark_generation_succeeded(generation_result)
@@ -2952,13 +3018,15 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk(
                             f"<video src='{local_url}' data-media-id='{video_media_id}' controls style='max-width:100%'></video>",
-                            finish_reason="stop"
+                            finish_reason="stop",
+                            extra={"flow_upscale": upscale_note} if upscale_note else None,
                         )
 
                     else:
                         yield self._create_completion_response(
                             local_url,  # Pass the URL; the method formats it
-                            media_type="video"
+                            media_type="video",
+                            upscale=upscale_note,
                         )
                     return
 
@@ -2990,7 +3058,7 @@ class GenerationHandler:
                     yield self._create_error_response(error_msg, status_code=502)
                     return
                     
-                elif status == "MEDIA_GENERATION_STATUS_ACTIVE" and attempt > 80:
+                elif status == "MEDIA_GENERATION_STATUS_ACTIVE" and attempt > stuck_after_attempts:
                     # If still ACTIVE after 4 minutes (80 * 3s = 240s), treat it as stuck
                     error_msg = "Video generation timed out (upstream stalled for over 4 minutes, automatically cancelled)"
                     await self._fail_video_task(checked_operations, error_msg)

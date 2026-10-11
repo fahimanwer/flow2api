@@ -41,6 +41,80 @@ class FlowAPIError(Exception):
         super().__init__(message)
 
 
+# Google refusing the CONTENT of a request (prompt or photo). Shared by the enlarge
+# classifier and the photo-upload refusal below.
+CONTENT_REFUSAL_REASONS = ("PUBLIC_ERROR_UNSAFE", "PUBLIC_ERROR_SEXUAL", "PUBLIC_ERROR_MINOR", "PUBLIC_ERROR_PROMINENT")
+
+
+def _describe_photo_refusal(reason: str) -> str:
+    reason = reason.upper()
+    if "PROMINENT" in reason:
+        return "it looks like a real or famous person"
+    if "MINOR" in reason:
+        return "it seems to show a child"
+    if "SEXUAL" in reason:
+        return "Google rated it sexual"
+    return "Google's safety filter blocked it"
+
+
+class FlowPhotoRefusedError(Exception):
+    """Google refused an uploaded photo for its CONTENT (2026-10-11: HTTP 400
+    PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD on one AI-made face, on every account, while the
+    same character's other photos uploaded fine). Permanent for that photo: retrying or
+    switching account gets the same answer, and it is the caller's input, not the
+    account's fault. Callers that upload several photos fill in ``photo_index`` (1-based)."""
+
+    def __init__(self, reason: str, google_message: str):
+        self.reason = reason
+        self.google_message = google_message
+        self.plain = _describe_photo_refusal(reason)
+        self.photo_index: Optional[int] = None
+        super().__init__(f"Google refused this photo: {self.plain} ({google_message})")
+
+    def caller_message(self, what: str) -> str:
+        """`what` names the photo for the caller, e.g. "photo 1 of character 'Nia'"."""
+        other = "a different photo with a different face" if "PROMINENT" in self.reason.upper() else "a different photo"
+        return f"Google refused {what}: {self.plain}. Send {other}. Google said: {self.google_message}"
+
+    def error_extra(self, **more: Any) -> Dict[str, Any]:
+        """Machine-readable fields for the caller's error JSON."""
+        return {"code": "photo_refused_by_google", "google_reason": self.reason, **more}
+
+
+def flow_api_error_from_body(status_code: int, body_text: str) -> FlowAPIError:
+    """FlowAPIError for the urllib path: "HTTP Error <n>: <reason>: <message>" with the
+    structured reason set. The reason is read from the FULL body: cutting it to 200 characters first split
+    PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD in half (Codex review, 2026-10-11)."""
+    reason, message = "", ""
+    try:
+        info = json.loads(body_text).get("error")
+        if isinstance(info, dict):
+            message = str(info.get("message") or "")
+            for detail in info.get("details") or []:
+                if isinstance(detail, dict) and detail.get("reason"):
+                    reason = str(detail["reason"])
+                    break
+    except Exception:
+        pass
+    if reason:
+        # Keep the "HTTP Error <n>" prefix: _get_retry_reason matches 500/403/429 on it.
+        return FlowAPIError(status_code, f"HTTP Error {status_code}: {reason}: {message}".rstrip(": "), reason)
+    return FlowAPIError(status_code, f"HTTP Error {status_code}: {body_text[:200]}")
+
+
+def photo_refusal_reason(error: BaseException) -> Optional[str]:
+    """The Google reason when `error` is a 4xx content refusal of an upload, else None.
+    The structured reason is preferred; the text is the fallback for the urllib path,
+    whose FlowAPIError carries only the raw body."""
+    if not isinstance(error, FlowAPIError) or not 400 <= int(error.status_code or 0) < 500:
+        return None
+    reason = (error.reason or "").upper()
+    if not reason:
+        found = re.search(r"PUBLIC_ERROR_[A-Z_]+", str(error).upper())
+        reason = found.group(0) if found else ""
+    return reason if reason.startswith(CONTENT_REFUSAL_REASONS) else None
+
+
 def classify_upsample_error(error: BaseException) -> str:
     """Sort a failed 2K/4K enlarge call (live evidence 26 Sep 2026):
     quota   - PER_MODEL_DAILY_QUOTA_REACHED: the account's upscaler quota is spent until the PT reset
@@ -56,7 +130,7 @@ def classify_upsample_error(error: BaseException) -> str:
         return "access"
     if "UNUSUAL_ACTIVITY" in text or "RECAPTCHA EVALUATION FAILED" in text:
         return "traffic"
-    if any(k in text for k in ("PUBLIC_ERROR_UNSAFE", "PUBLIC_ERROR_SEXUAL", "PUBLIC_ERROR_MINOR", "PUBLIC_ERROR_PROMINENT")):
+    if any(k in text for k in CONTENT_REFUSAL_REASONS):
         return "refused"
     return "other"
 
@@ -969,7 +1043,7 @@ class FlowClient:
                 except Exception:
                     pass
             body_text = payload.decode("utf-8", errors="replace")
-            raise FlowAPIError(status_code, f"HTTP Error {status_code}: {body_text[:200]}") from exc
+            raise flow_api_error_from_body(status_code, body_text) from exc
         except Exception as exc:
             raise Exception(str(exc)) from exc
 
@@ -980,7 +1054,7 @@ class FlowClient:
                 pass
         body_text = payload.decode("utf-8", errors="replace")
         if status_code >= 400:
-            raise FlowAPIError(status_code, f"HTTP Error {status_code}: {body_text[:200]}")
+            raise flow_api_error_from_body(status_code, body_text)
 
         try:
             return json.loads(body_text) if body_text else {}
@@ -1648,6 +1722,12 @@ class FlowClient:
                 raise Exception(f"Invalid upload response: missing media id, keys={list(new_result.keys())}")
             except Exception as new_upload_error:
                 last_error = new_upload_error
+                refused = photo_refusal_reason(new_upload_error)
+                if refused:
+                    # Google refused the photo itself: the same bytes get the same answer on
+                    # every retry, every account and the legacy endpoint (2026-10-11).
+                    debug_logger.event(f"[UPLOAD] Google refused the photo: {refused} (not retried)")
+                    raise FlowPhotoRefusedError(refused, str(new_upload_error)) from new_upload_error
                 retry_reason = "network timeout" if self._is_timeout_error(new_upload_error) else self._get_retry_reason(str(new_upload_error))
 
                 # The old endpoint has no projectId, so a project-scoped upload that falls back may land in the wrong project.
@@ -1662,7 +1742,8 @@ class FlowClient:
                     raise RuntimeError(
                         "Project-scoped image upload failed via /flow/uploadImage; "
                         "legacy :uploadUserImage fallback is disabled because it may attach media "
-                        f"to a different project (project_id={normalized_project_id})."
+                        f"to a different project (project_id={normalized_project_id}). "
+                        f"Last error: {str(new_upload_error)[:300]}"
                     ) from new_upload_error
 
                 debug_logger.log_warning(
@@ -1688,6 +1769,10 @@ class FlowClient:
                 raise Exception(f"Legacy upload response missing media id: keys={list(legacy_result.keys())}")
             except Exception as legacy_upload_error:
                 last_error = legacy_upload_error
+                refused = photo_refusal_reason(legacy_upload_error)
+                if refused:
+                    debug_logger.event(f"[UPLOAD] Google refused the photo (legacy endpoint): {refused} (not retried)")
+                    raise FlowPhotoRefusedError(refused, str(legacy_upload_error)) from legacy_upload_error
                 retry_reason = self._get_retry_reason(str(legacy_upload_error))
                 if retry_reason and retry_attempt < max_retries - 1:
                     debug_logger.log_warning(

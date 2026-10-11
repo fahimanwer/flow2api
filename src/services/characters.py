@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..core.logger import debug_logger
+from .flow_client import FlowPhotoRefusedError
 
 MAX_CHARACTERS_IMAGE = 10   # Flow model list: inputSpec.maxCharacters for Nano Banana models
 MAX_CHARACTERS_VIDEO = 3    # Omni abra_r2v_* and Veo r2v
@@ -50,11 +51,13 @@ class LoadedCharacter:
 
 class CharacterSetupError(Exception):
     """Character validation/setup failed BEFORE any generation was submitted.
-    status_code is what the caller gets (400 = their input, 502 = Google)."""
+    status_code is what the caller gets (400 = their input, 502 = Google); `extra` adds
+    machine-readable fields (e.g. code=photo_refused_by_google) to the caller's error JSON."""
 
-    def __init__(self, message: str, status_code: int = 502):
+    def __init__(self, message: str, status_code: int = 502, extra: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.status_code = status_code
+        self.extra = extra or {}
 
 
 def validate_characters(characters: Sequence[LoadedCharacter], max_count: int) -> Optional[str]:
@@ -206,9 +209,14 @@ class CharacterService:
                 )
             except asyncio.CancelledError:
                 raise
+            except FlowPhotoRefusedError as exc:
+                raise CharacterSetupError(
+                    exc.caller_message(f"photo {index + 1} of character {character.name!r}"), 400,
+                    extra=exc.error_extra(photo_index=index + 1, character=character.name),
+                )
             except Exception as exc:
                 raise CharacterSetupError(
-                    f"Flow could not attach photo {index + 1} of character {character.name!r}: {str(exc)[:200]}", 502
+                    f"Flow could not attach photo {index + 1} of character {character.name!r}: {str(exc)[:400]}", 502
                 )
         state = await self._read_back(flow_client, token, entity_id, expected_photos=len(character.images))
         if state != "ok":

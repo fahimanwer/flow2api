@@ -567,23 +567,45 @@ def _build_openai_json_response(payload: Dict[str, Any]) -> JSONResponse:
     return JSONResponse(content=payload, status_code=_get_error_status_code(payload))
 
 
-def _build_gemini_error_payload(status_code: int, message: str) -> Dict[str, Any]:
-    return {
+def _build_gemini_error_payload(
+    status_code: int, message: str, handler_error: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    payload = {
         "error": {
             "code": status_code,
             "message": message,
             "status": GEMINI_STATUS_MAP.get(status_code, "UNKNOWN"),
         }
     }
+    # A specific handler code (e.g. photo_refused_by_google) travels as a google.rpc.ErrorInfo,
+    # so Gemini-format callers can act on it like OpenAI-format callers do.
+    code = (handler_error or {}).get("code")
+    if isinstance(code, str) and code and code != "generation_failed":
+        metadata = {
+            key: str(value)
+            for key, value in (handler_error or {}).items()
+            if key not in ("message", "type", "code", "status_code") and value is not None
+        }
+        payload["error"]["details"] = [{
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": code.upper(),
+            "domain": "flow2api",
+            "metadata": metadata,
+        }]
+    return payload
+
+
+def _gemini_error_from_handler_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    error = payload.get("error", {})
+    return _build_gemini_error_payload(
+        _get_error_status_code(payload), error.get("message", "Generation failed"), error
+    )
 
 
 def _build_gemini_error_response_from_handler(payload: Dict[str, Any]) -> JSONResponse:
-    error = payload.get("error", {})
-    status_code = _get_error_status_code(payload)
-    message = error.get("message", "Generation failed")
     return JSONResponse(
-        status_code=status_code,
-        content=_build_gemini_error_payload(status_code, message),
+        status_code=_get_error_status_code(payload),
+        content=_gemini_error_from_handler_payload(payload),
     )
 
 
@@ -792,6 +814,7 @@ async def _iterate_gemini_stream(
     client: str = "",
 ):
     handler = _ensure_generation_handler()
+    errored = False
     async for chunk in handler.handle_generation(
         model=normalized.model,
         prompt=normalized.prompt,
@@ -802,16 +825,19 @@ async def _iterate_gemini_stream(
         client=client,
         characters=normalized.characters,
     ):
+        if errored:
+            # Keep draining after the error so the handler finishes its own accounting
+            # (request log leaves 102); returning early abandoned it (Codex, 2026-10-11).
+            continue
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
             if payload_text == "[DONE]":
                 continue
             payload = _parse_handler_result(payload_text)
             if "error" in payload:
-                yield (
-                    f"data: {json.dumps(_build_gemini_error_payload(_get_error_status_code(payload), payload['error'].get('message', 'Generation failed')), ensure_ascii=False)}\n\n"
-                )
-                return
+                yield f"data: {json.dumps(_gemini_error_from_handler_payload(payload), ensure_ascii=False)}\n\n"
+                errored = True
+                continue
 
             event = await _convert_openai_stream_chunk_to_gemini_event(
                 payload,
@@ -823,10 +849,9 @@ async def _iterate_gemini_stream(
 
         payload = _parse_handler_result(chunk)
         if "error" in payload:
-            yield (
-                f"data: {json.dumps(_build_gemini_error_payload(_get_error_status_code(payload), payload['error'].get('message', 'Generation failed')), ensure_ascii=False)}\n\n"
-            )
-            return
+            yield f"data: {json.dumps(_gemini_error_from_handler_payload(payload), ensure_ascii=False)}\n\n"
+            errored = True
+            continue
 
         event = await _convert_openai_stream_chunk_to_gemini_event(
             payload,
