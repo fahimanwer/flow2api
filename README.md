@@ -159,193 +159,29 @@ Prometheus can scrape `/metrics` directly. On Kubernetes, scrape it only from in
 
 Open **http://localhost:8000/test** for the built-in model test page. It can:
 
-- Browse all available models by category (image generation, text/image-to-video, multi-image video, video upscaling, etc.)
+- Browse every model grouped by family (Nano Banana 2.1 / Pro / 2 Lite, Omni 1.1 Flash, Veo 3.1 Fast / Quality / Lite) with its readable name; image limits come from `/v1/models`
 - Test with one click from a prompt, with streamed progress
 - Upload images for image-to-image / image-to-video
 - Preview the image or video when generation finishes
 
 ## 📋 Supported models
 
-### Image generation
+The full, always-current list is **`GET /v1/models`** (and the `/test` page). Each entry keeps its `id`
+(what you send) and adds a readable `name`, `family`, `google_model`, `mode`, `orientation`,
+`duration_seconds`, `resolution`, `accounts`, `inputs` and `aliases`. Names, aliases, modes, account
+rules and credit costs are explained in **[docs/models.md](docs/models.md)**.
 
-> Image models (2026-10-07): `gemini-3.0-pro-image-*` = Nano Banana Pro, `gemini-3.1-flash-image-*` = **Nano Banana 2.1** (Google retired Nano Banana 2; aliases `nano-banana-2` and `nano-banana-2.1` map here), `nano-banana-2-lite-*` = Nano Banana 2 Lite. Imagen 4 is gone.
+| Family (Google's name) | Ids you can send (old ids keep working) |
+|---|---|
+| Nano Banana 2.1 (`gemini-nano-banana-2.1`) | `nano-banana-2.1-{aspect}[-2k\|-4k]` = `gemini-3.1-flash-image-{aspect}[-2k\|-4k]` |
+| Nano Banana Pro (`gemini-3-pro-image`) | `nano-banana-pro-{aspect}[-2k\|-4k]` = `gemini-3.0-pro-image-{aspect}[-2k\|-4k]` |
+| Nano Banana 2 Lite (`gemini-3.1-flash-lite-image`) | `nano-banana-2-lite-{aspect}` (1K only) |
+| Omni 1.1 Flash (`gemini-omni-1.1-flash`) | `omni-1.1-flash-{4,6,8,10}s-{landscape,portrait}[-1080p]` = `omni_{d}s[_portrait][_1080p]`; ingredients (every image is a reference): `omni-1.1-flash-ingredients-…` = `omni_r2v_…` |
+| Veo 3.1 Fast / Quality / Lite | `veo_3_1_t2v…` (text), `veo_3_1_i2v…` (frames), `veo_3_1_r2v…` (ingredients), `…_1080p` / `…_4k` (upscaled), `veo_3_1_extend…` |
 
-| Model | Description | Size |
-|---------|--------|--------|
-| `gemini-3.0-pro-image-landscape` | Image/text-to-image | Landscape |
-| `gemini-3.0-pro-image-portrait` | Image/text-to-image | Portrait |
-| `gemini-3.0-pro-image-square` | Image/text-to-image | Square |
-| `gemini-3.0-pro-image-four-three` | Image/text-to-image | Landscape 4:3 |
-| `gemini-3.0-pro-image-three-four` | Image/text-to-image | Portrait 3:4 |
-| `gemini-3.0-pro-image-landscape-2k` | Image/text-to-image (2K) | Landscape |
-| `gemini-3.0-pro-image-portrait-2k` | Image/text-to-image (2K) | Portrait |
-| `gemini-3.0-pro-image-square-2k` | Image/text-to-image (2K) | Square |
-| `gemini-3.0-pro-image-four-three-2k` | Image/text-to-image (2K) | Landscape 4:3 |
-| `gemini-3.0-pro-image-three-four-2k` | Image/text-to-image (2K) | Portrait 3:4 |
-| `gemini-3.0-pro-image-landscape-4k` | Image/text-to-image (4K) | Landscape |
-| `gemini-3.0-pro-image-portrait-4k` | Image/text-to-image (4K) | Portrait |
-| `gemini-3.0-pro-image-square-4k` | Image/text-to-image (4K) | Square |
-| `gemini-3.0-pro-image-four-three-4k` | Image/text-to-image (4K) | Landscape 4:3 |
-| `gemini-3.0-pro-image-three-four-4k` | Image/text-to-image (4K) | Portrait 3:4 |
-| `gemini-3.1-flash-image-landscape` | Image/text-to-image | Landscape |
-| `gemini-3.1-flash-image-portrait` | Image/text-to-image | Portrait |
-| `gemini-3.1-flash-image-square` | Image/text-to-image | Square |
-| `gemini-3.1-flash-image-four-three` | Image/text-to-image | Landscape 4:3 |
-| `gemini-3.1-flash-image-three-four` | Image/text-to-image | Portrait 3:4 |
-| `gemini-3.1-flash-image-landscape-2k` | Image/text-to-image (2K) | Landscape |
-| `gemini-3.1-flash-image-portrait-2k` | Image/text-to-image (2K) | Portrait |
-| `gemini-3.1-flash-image-square-2k` | Image/text-to-image (2K) | Square |
-| `gemini-3.1-flash-image-four-three-2k` | Image/text-to-image (2K) | Landscape 4:3 |
-| `gemini-3.1-flash-image-three-four-2k` | Image/text-to-image (2K) | Portrait 3:4 |
-| `gemini-3.1-flash-image-landscape-4k` | Image/text-to-image (4K) | Landscape |
-| `gemini-3.1-flash-image-portrait-4k` | Image/text-to-image (4K) | Portrait |
-| `gemini-3.1-flash-image-square-4k` | Image/text-to-image (4K) | Square |
-| `gemini-3.1-flash-image-four-three-4k` | Image/text-to-image (4K) | Landscape 4:3 |
-| `gemini-3.1-flash-image-three-four-4k` | Image/text-to-image (4K) | Portrait 3:4 |
-| `nano-banana-2-lite-landscape` | Image/text-to-image (Nano Banana 2 Lite, 1K only) | Landscape |
-| `nano-banana-2-lite-portrait` | Image/text-to-image (Nano Banana 2 Lite, 1K only) | Portrait |
-| `nano-banana-2-lite-square` | Image/text-to-image (Nano Banana 2 Lite, 1K only) | Square |
-| `nano-banana-2-lite-four-three` | Image/text-to-image (Nano Banana 2 Lite, 1K only) | Landscape 4:3 |
-| `nano-banana-2-lite-three-four` | Image/text-to-image (Nano Banana 2 Lite, 1K only) | Portrait 3:4 |
-
-### Video generation
-
-#### Text-to-video (T2V)
-⚠️ **Image upload not supported**
-
-| Model | Description | Size |
-|---------|---------|--------|
-| `veo_3_1_t2v_fast_portrait` | Text-to-video | Portrait |
-| `veo_3_1_t2v_fast_landscape` | Text-to-video | Landscape |
-| `veo_3_1_t2v_fast_portrait_ultra` | Text-to-video | Portrait |
-| `veo_3_1_t2v_fast_ultra` | Text-to-video | Landscape |
-| `veo_3_1_t2v_fast_portrait_ultra_relaxed` | Text-to-video | Portrait |
-| `veo_3_1_t2v_fast_ultra_relaxed` | Text-to-video | Landscape |
-| `veo_3_1_t2v_portrait` | Text-to-video | Portrait |
-| `veo_3_1_t2v_landscape` | Text-to-video | Landscape |
-| `veo_3_1_t2v_landscape_4s` | Text-to-video 4s | Landscape |
-| `veo_3_1_t2v_portrait_4s` | Text-to-video 4s | Portrait |
-| `veo_3_1_t2v_landscape_6s` | Text-to-video 6s | Landscape |
-| `veo_3_1_t2v_portrait_6s` | Text-to-video 6s | Portrait |
-| `veo_3_1_t2v_fast_landscape_4s` | Text-to-video Fast 4s | Landscape |
-| `veo_3_1_t2v_fast_portrait_4s` | Text-to-video Fast 4s | Portrait |
-| `veo_3_1_t2v_fast_landscape_6s` | Text-to-video Fast 6s | Landscape |
-| `veo_3_1_t2v_fast_portrait_6s` | Text-to-video Fast 6s | Portrait |
-| `veo_3_1_t2v_lite_portrait` | Text-to-video Lite | Portrait |
-| `veo_3_1_t2v_lite_landscape` | Text-to-video Lite | Landscape |
-| `veo_3_1_t2v_lite_4s_portrait` | Text-to-video Lite 4s | Portrait |
-| `veo_3_1_t2v_lite_4s_landscape` | Text-to-video Lite 4s | Landscape |
-| `veo_3_1_t2v_lite_6s_portrait` | Text-to-video Lite 6s | Portrait |
-| `veo_3_1_t2v_lite_6s_landscape` | Text-to-video Lite 6s | Landscape |
-
-#### First/last-frame models (I2V - Image to Video)
-📸 **Takes 1-2 images: 1 image = first frame, 2 images = first and last frames**
-
-> 💡 **Auto-selection**: the system picks the matching model_key from the number of images
-> - **Single-frame mode** (1 image): generates a video from the first frame
-> - **Two-frame mode** (2 images): generates a transition video from first + last frame
-> - `veo_3_1_i2v_lite_*` takes **1** first-frame image only
-> - `veo_3_1_interpolation_lite_*` takes exactly **2** images (first and last frame)
-
-| Model | Description | Size |
-|---------|---------|--------|
-| `veo_3_1_i2v_s_fast_portrait_fl` | Image-to-video | Portrait |
-| `veo_3_1_i2v_s_fast_fl` | Image-to-video | Landscape |
-| `veo_3_1_i2v_s_fast_portrait_ultra_fl` | Image-to-video | Portrait |
-| `veo_3_1_i2v_s_fast_ultra_fl` | Image-to-video | Landscape |
-| `veo_3_1_i2v_s_fast_portrait_ultra_relaxed` | Image-to-video | Portrait |
-| `veo_3_1_i2v_s_fast_ultra_relaxed` | Image-to-video | Landscape |
-| `veo_3_1_i2v_s_portrait` | Image-to-video | Portrait |
-| `veo_3_1_i2v_s_landscape` | Image-to-video | Landscape |
-| `veo_3_1_i2v_s_landscape_4s` | Image-to-video 4s | Landscape |
-| `veo_3_1_i2v_s_portrait_4s` | Image-to-video 4s | Portrait |
-| `veo_3_1_i2v_s_landscape_6s` | Image-to-video 6s | Landscape |
-| `veo_3_1_i2v_s_portrait_6s` | Image-to-video 6s | Portrait |
-| `veo_3_1_i2v_s_fast_landscape_4s_fl` | Image-to-video Fast 4s | Landscape |
-| `veo_3_1_i2v_s_fast_portrait_4s_fl` | Image-to-video Fast 4s | Portrait |
-| `veo_3_1_i2v_s_fast_landscape_6s_fl` | Image-to-video Fast 6s | Landscape |
-| `veo_3_1_i2v_s_fast_portrait_6s_fl` | Image-to-video Fast 6s | Portrait |
-| `veo_3_1_i2v_lite_portrait` | Image-to-video Lite (first frame only) | Portrait |
-| `veo_3_1_i2v_lite_landscape` | Image-to-video Lite (first frame only) | Landscape |
-| `veo_3_1_i2v_lite_4s_portrait` | Image-to-video Lite 4s (first frame only) | Portrait |
-| `veo_3_1_i2v_lite_4s_landscape` | Image-to-video Lite 4s (first frame only) | Landscape |
-| `veo_3_1_i2v_lite_6s_portrait` | Image-to-video Lite 6s (first frame only) | Portrait |
-| `veo_3_1_i2v_lite_6s_landscape` | Image-to-video Lite 6s (first frame only) | Landscape |
-| `veo_3_1_interpolation_lite_portrait` | Image-to-video Lite (first/last-frame transition) | Portrait |
-| `veo_3_1_interpolation_lite_landscape` | Image-to-video Lite (first/last-frame transition) | Landscape |
-| `veo_3_1_interpolation_lite_4s_portrait` | Image-to-video Lite 4s (first/last-frame transition) | Portrait |
-| `veo_3_1_interpolation_lite_4s_landscape` | Image-to-video Lite 4s (first/last-frame transition) | Landscape |
-| `veo_3_1_interpolation_lite_6s_portrait` | Image-to-video Lite 6s (first/last-frame transition) | Portrait |
-| `veo_3_1_interpolation_lite_6s_landscape` | Image-to-video Lite 6s (first/last-frame transition) | Landscape |
-
-#### Multi-image generation (R2V - Reference Images to Video)
-🖼️ **Takes multiple images**
-
-> **2026-03-06 update**
->
-> - Synced to the upstream's new `R2V` video request body
-> - `textInput` replaced by `structuredPrompt.parts`
-> - New top-level `mediaGenerationContext.batchId`
-> - New top-level `useV2ModelConfig: true`
-> - Landscape and portrait `R2V` models share the same new request body
-> - The upstream `videoModelKey` for landscape `R2V` now uses the `*_landscape` form
-> - Under the current upstream protocol, `referenceImages` takes at most **3** images
-
-| Model | Description | Size |
-|---------|---------|--------|
-| `veo_3_1_r2v_fast_portrait` | Image-to-video | Portrait |
-| `veo_3_1_r2v_fast_landscape` | Image-to-video | Landscape |
-| `veo_3_1_r2v_fast_portrait_ultra` | Image-to-video | Portrait |
-| `veo_3_1_r2v_fast_landscape_ultra` | Image-to-video | Landscape |
-| `veo_3_1_r2v_fast_portrait_ultra_relaxed` | Image-to-video | Portrait |
-| `veo_3_1_r2v_fast_landscape_ultra_relaxed` | Image-to-video | Landscape |
-
-#### Video upscale models (Upsample)
-
-These models do not call an upstream upsampler key directly. They first generate the video with the matching regular Veo 3.1 model, then submit a 1080P/4K upscale request.
-
-| Model | Description | Output |
-|---------|---------|--------|
-| `veo_3_1_t2v_landscape_4k` | Text-to-video upscale | 4K |
-| `veo_3_1_t2v_portrait_4k` | Text-to-video upscale | 4K |
-| `veo_3_1_t2v_landscape_1080p` | Text-to-video upscale | 1080P |
-| `veo_3_1_t2v_portrait_1080p` | Text-to-video upscale | 1080P |
-| `veo_3_1_t2v_landscape_4s_4k` | Text-to-video 4s upscale | 4K |
-| `veo_3_1_t2v_portrait_4s_4k` | Text-to-video 4s upscale | 4K |
-| `veo_3_1_t2v_landscape_4s_1080p` | Text-to-video 4s upscale | 1080P |
-| `veo_3_1_t2v_portrait_4s_1080p` | Text-to-video 4s upscale | 1080P |
-| `veo_3_1_t2v_landscape_6s_4k` | Text-to-video 6s upscale | 4K |
-| `veo_3_1_t2v_portrait_6s_4k` | Text-to-video 6s upscale | 4K |
-| `veo_3_1_t2v_landscape_6s_1080p` | Text-to-video 6s upscale | 1080P |
-| `veo_3_1_t2v_portrait_6s_1080p` | Text-to-video 6s upscale | 1080P |
-| `veo_3_1_t2v_fast_portrait_4k` | Text-to-video upscale | 4K |
-| `veo_3_1_t2v_fast_4k` | Text-to-video upscale | 4K |
-| `veo_3_1_t2v_fast_portrait_ultra_4k` | Text-to-video upscale | 4K |
-| `veo_3_1_t2v_fast_ultra_4k` | Text-to-video upscale | 4K |
-| `veo_3_1_t2v_fast_portrait_1080p` | Text-to-video upscale | 1080P |
-| `veo_3_1_t2v_fast_1080p` | Text-to-video upscale | 1080P |
-| `veo_3_1_t2v_fast_portrait_ultra_1080p` | Text-to-video upscale | 1080P |
-| `veo_3_1_t2v_fast_ultra_1080p` | Text-to-video upscale | 1080P |
-| `veo_3_1_i2v_s_fast_portrait_ultra_fl_4k` | Image-to-video upscale | 4K |
-| `veo_3_1_i2v_s_fast_ultra_fl_4k` | Image-to-video upscale | 4K |
-| `veo_3_1_i2v_s_fast_portrait_ultra_fl_1080p` | Image-to-video upscale | 1080P |
-| `veo_3_1_i2v_s_fast_ultra_fl_1080p` | Image-to-video upscale | 1080P |
-| `veo_3_1_i2v_s_landscape_4k` | Image-to-video upscale | 4K |
-| `veo_3_1_i2v_s_portrait_4k` | Image-to-video upscale | 4K |
-| `veo_3_1_i2v_s_landscape_1080p` | Image-to-video upscale | 1080P |
-| `veo_3_1_i2v_s_portrait_1080p` | Image-to-video upscale | 1080P |
-| `veo_3_1_i2v_s_landscape_4s_4k` | Image-to-video 4s upscale | 4K |
-| `veo_3_1_i2v_s_portrait_4s_4k` | Image-to-video 4s upscale | 4K |
-| `veo_3_1_i2v_s_landscape_4s_1080p` | Image-to-video 4s upscale | 1080P |
-| `veo_3_1_i2v_s_portrait_4s_1080p` | Image-to-video 4s upscale | 1080P |
-| `veo_3_1_i2v_s_landscape_6s_4k` | Image-to-video 6s upscale | 4K |
-| `veo_3_1_i2v_s_portrait_6s_4k` | Image-to-video 6s upscale | 4K |
-| `veo_3_1_i2v_s_landscape_6s_1080p` | Image-to-video 6s upscale | 1080P |
-| `veo_3_1_i2v_s_portrait_6s_1080p` | Image-to-video 6s upscale | 1080P |
-| `veo_3_1_r2v_fast_portrait_ultra_4k` | Multi-image video upscale | 4K |
-| `veo_3_1_r2v_fast_landscape_ultra_4k` | Multi-image video upscale | 4K |
-| `veo_3_1_r2v_fast_portrait_ultra_1080p` | Multi-image video upscale | 1080P |
-| `veo_3_1_r2v_fast_landscape_ultra_1080p` | Multi-image video upscale | 1080P |
+`{aspect}` = `landscape`, `portrait`, `square`, `four-three`, `three-four`. `gemini-3.1-flash-image-*`
+runs **Nano Banana 2.1**: Google's Nano Banana 2 was retired in Flow on 2026-10-06 and the id was kept so
+no caller breaks. All `*_relaxed` Veo ids are retired by Google (marked in `/v1/models`).
 
 ## 📡 API examples (streaming required)
 

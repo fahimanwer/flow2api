@@ -384,7 +384,7 @@ app = FastAPI(
         "with a prompt (and `image_url` parts as reference images) returns a markdown image link or an HTML video tag.\n\n"
         "**Characters (consistent people / objects):** add `characters: [{\"name\": \"Maya\", \"images\": [...]}]` "
         "to the request and write `@Maya` in the prompt. 1-2 photos per character; images up to 10 characters, videos up to 3 "
-        "(ingredients models only: omni-r2v, omni, omni-flash, veo-r2v, veo-r2v-lite). "
+        "(Omni 1.1 Flash and Veo 3.1 ingredients models only, e.g. omni-1.1-flash-ingredients-8s-portrait, veo_3_1_r2v_fast_portrait). Readable model names, aliases and what each model accepts: `GET /v1/models` and docs/models.md. "
         "Full details in the request schema below (`characters`)."
     ),
     version="1.0.0",

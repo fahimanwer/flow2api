@@ -25,7 +25,8 @@ Add `characters` to a normal request (OpenAI `/v1/chat/completions` or Gemini `/
 - Mention with `@Name`; `@Maya Rose` beats `@Maya` (longest name wins); `@Unknown` stays plain text.
   A character that is never mentioned is still attached as a reference.
 - Limits: images up to 10 characters; videos up to 3 and only on ingredients models
-  (`omni-r2v`, `omni`, `omni-flash`, `veo-r2v`, `veo-r2v-lite`, `veo_3_1_r2v_*`). Frame models
+  (Omni 1.1 Flash: `omni-1.1-flash-ingredients-{d}s-{orientation}[-1080p]` = `omni_r2v_*`, `omni-1.1-flash-*` = `omni*`;
+  Veo 3.1: `veo_3_1_r2v_*`, `veo-r2v`, `veo-r2v-lite`; names explained in `docs/models.md`). Frame models
   (start/end frame, text-to-video, extend) answer 400. `omni` / `omni-flash` with characters always take
   the ingredients route (a first/last-frame video cannot carry characters).
 - Ordinary reference images (`image_url` parts) still work alongside characters.
