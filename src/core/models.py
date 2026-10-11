@@ -393,7 +393,7 @@ class ChatCompletionRequest(BaseModel):
         description=(
             "Flow Characters: people/objects that must look the same across generations. Give each a name and 1-2 "
             "photos, then write @Name in the prompt (e.g. \"@Maya sits in a sunny cafe\"). Images: up to 10 characters. "
-            "Videos: up to 3, only on ingredients models (omni-r2v, omni, omni-flash, veo-r2v, veo-r2v-lite). "
+            "Videos: up to 3, only on Omni 1.1 Flash (omni-1.1-flash-*, omni-1.1-flash-ingredients-*; old ids omni*, omni_r2v*) and Veo 3.1 ingredients models (veo_3_1_r2v_*, veo-r2v, veo-r2v-lite). "
             "Character photos are NOT reference images; you may still add image_url parts as ordinary references."
         ),
     )

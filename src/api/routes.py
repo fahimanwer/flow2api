@@ -16,6 +16,7 @@ from ..core.client_policy import resolve_client
 from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
+from ..services.model_catalog import model_catalog, readable_alias_entries
 from ..core.models import (
     ChatCompletionRequest,
     ChatMessage,
@@ -113,53 +114,30 @@ def _ensure_generation_handler() -> GenerationHandler:
     return generation_handler
 
 
-def _build_model_description(model_config: Dict[str, Any]) -> str:
-    """Build a human-readable description for model listing endpoints."""
-    description = f"{model_config['type'].capitalize()} generation"
-    if model_config["type"] == "image":
-        description += f" - {model_config['model_name']} · up to 10 reference images · characters (@Name) up to 10"
-    else:
-        description += f" - {model_config['model_key']}"
-        video_type = model_config.get("video_type")
-        if video_type in ("r2v", "omni"):
-            description += f" · ingredients up to {model_config.get('max_images', 3)} images · characters (@Name) up to 3"
-        elif video_type == "i2v":
-            description += " · start/end frame images · no characters"
-        elif video_type == "t2v":
-            description += " · text only"
-    return description
+def _get_openai_model_catalog() -> List[Dict[str, Any]]:
+    """/v1/models entries: the stable id plus plain-words fields (services/model_catalog.py)."""
+    return model_catalog()
 
 
-def _get_openai_model_catalog() -> List[Dict[str, str]]:
-    """Collect OpenAI-compatible model list entries."""
-    return [
-        {
-            "id": model_id,
-            "description": _build_model_description(model_config),
-        }
-        for model_id, model_config in MODEL_CONFIG.items()
-    ]
-
-
-def _get_gemini_model_catalog() -> Dict[str, str]:
-    """Collect Gemini-compatible model metadata for /models endpoints."""
-    catalog: Dict[str, str] = {}
-
+def _get_gemini_model_catalog() -> Dict[str, Dict[str, str]]:
+    """Gemini-shape catalog: id -> {displayName, description}. Real models first, then the
+    readable full-name aliases, then the older short (generationConfig) aliases."""
+    catalog: Dict[str, Dict[str, str]] = {}
+    for entry in model_catalog():
+        catalog[entry["id"]] = {"displayName": entry["name"], "description": entry["description"]}
+    for entry in readable_alias_entries():
+        catalog.setdefault(entry["id"], {"displayName": entry["name"], "description": entry["description"]})
     for alias_id, description in get_base_model_aliases().items():
-        catalog[alias_id] = description
-
-    for model_id, model_config in MODEL_CONFIG.items():
-        catalog.setdefault(model_id, _build_model_description(model_config))
-
+        catalog.setdefault(alias_id, {"displayName": alias_id, "description": description})
     return catalog
 
 
-def _build_gemini_model_resource(model_id: str, description: str) -> Dict[str, Any]:
+def _build_gemini_model_resource(model_id: str, info: Dict[str, str]) -> Dict[str, Any]:
     """Build a Gemini-compatible model resource payload."""
     return {
         "name": f"models/{model_id}",
-        "displayName": model_id,
-        "description": description,
+        "displayName": info.get("displayName") or model_id,
+        "description": info.get("description", ""),
         "version": "flow2api",
         "inputTokenLimit": 0,
         "outputTokenLimit": 0,
@@ -863,25 +841,17 @@ async def _iterate_gemini_stream(
 
 @router.get("/v1/models")
 async def list_models(api_key: str = Depends(verify_api_key_flexible)):
-    """List available models."""
-    models = [
-        {
-            "id": model["id"],
-            "object": "model",
-            "owned_by": "flow2api",
-            "description": model["description"],
-        }
-        for model in _get_openai_model_catalog()
-    ]
-
-    return {"object": "list", "data": models}
+    """List every model: stable `id` (what you send), plus `name`, `family`, `google_model`, `mode`,
+    `orientation`, `duration_seconds`, `resolution`, `accounts`, `inputs` and readable `aliases`."""
+    return {"object": "list", "data": _get_openai_model_catalog()}
 
 
 @router.get("/v1/models/aliases")
 async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
-    """List simplified model aliases for generationConfig-based resolution."""
+    """List aliases: readable full names (exact, e.g. omni-1.1-flash-ingredients-8s-portrait), then the
+    short names that pick aspect/size from generationConfig (e.g. nano-banana-2.1)."""
     aliases = get_base_model_aliases()
-    alias_models = []
+    alias_models = list(readable_alias_entries())
     for alias_id, description in aliases.items():
         alias_models.append(
             {
@@ -902,8 +872,8 @@ async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
     catalog = _get_gemini_model_catalog()
     return {
         "models": [
-            _build_gemini_model_resource(model_id, description)
-            for model_id, description in catalog.items()
+            _build_gemini_model_resource(model_id, info)
+            for model_id, info in catalog.items()
         ]
     }
 
@@ -913,14 +883,14 @@ async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
 async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_flexible)):
     """Return a single model using Gemini-compatible response shape."""
     catalog = _get_gemini_model_catalog()
-    description = catalog.get(model)
-    if not description:
+    info = catalog.get(model)
+    if not info:
         return JSONResponse(
             status_code=404,
             content=_build_gemini_error_payload(404, f"Model not found: {model}"),
         )
 
-    return _build_gemini_model_resource(model, description)
+    return _build_gemini_model_resource(model, info)
 
 
 @router.post(
@@ -933,7 +903,7 @@ async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_fle
         "```json\n{\n  \"model\": \"nano-banana-2-lite-square\",\n  \"messages\": [{\"role\": \"user\", \"content\": "
         "\"@Maya sits in a sunny cafe, smiling at the camera\"}],\n  \"characters\": [{\"name\": \"Maya\", \"images\": "
         "[\"data:image/jpeg;base64,...\"]}]\n}\n```\n\n"
-        "Videos with characters need an ingredients model (omni-r2v, omni, omni-flash, veo-r2v, veo-r2v-lite). "
+        "Videos with characters need Omni 1.1 Flash (e.g. `omni-1.1-flash-ingredients-8s-portrait`, old id `omni_r2v_8s_portrait`) or a Veo 3.1 ingredients model (`veo_3_1_r2v_*`). Every model's readable name and inputs: `GET /v1/models`. "
         "Bad character input answers 400 before anything is generated."
     ),
 )

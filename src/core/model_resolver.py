@@ -13,7 +13,7 @@ Example:
 
 import re
 from io import BytesIO
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 from ..core.logger import debug_logger
 
 # ──────────────────────────────────────────────
@@ -444,6 +444,37 @@ for _omni_base in [k for k in VIDEO_BASE_MODELS if k.startswith("omni")]:
     }
 
 
+# Readable full-name aliases (2026-10-11): one exact name per model, no generationConfig needed.
+# They resolve straight to the existing MODEL_CONFIG id (resolve_model_name returns at once), so
+# tier gating, quota, client policy and logs see the same id as before. Existing ids stay valid
+# and stay primary in /v1/models (callers such as pinterest-factory check them by id).
+#   nano-banana-2.1-*  = gemini-3.1-flash-image-*  (that id now runs Nano Banana 2.1 / BELUGA;
+#                        Google's own "gemini-3.1-flash-image" is Nano Banana 2, retired in Flow)
+#   nano-banana-pro-*  = gemini-3.0-pro-image-*    (Google: gemini-3-pro-image)
+#   omni-1.1-flash-{d}s-{orientation}[-1080p]              = omni_{d}s[_portrait][_1080p]
+#   omni-1.1-flash-ingredients-{d}s-{orientation}[-1080p]  = omni_r2v_{d}s[_portrait][_1080p]
+READABLE_IMAGE_ASPECTS = ("landscape", "portrait", "square", "four-three", "three-four")
+READABLE_MODEL_ALIASES: Dict[str, str] = {}
+for _aspect in READABLE_IMAGE_ASPECTS:
+    for _size in ("", "-2k", "-4k"):
+        READABLE_MODEL_ALIASES[f"nano-banana-2.1-{_aspect}{_size}"] = f"gemini-3.1-flash-image-{_aspect}{_size}"
+        READABLE_MODEL_ALIASES[f"nano-banana-pro-{_aspect}{_size}"] = f"gemini-3.0-pro-image-{_aspect}{_size}"
+for _duration in (4, 6, 8, 10):
+    for _orientation, _orientation_suffix in (("landscape", ""), ("portrait", "_portrait")):
+        for _res, _res_suffix in (("", ""), ("-1080p", "_1080p")):
+            READABLE_MODEL_ALIASES[f"omni-1.1-flash-{_duration}s-{_orientation}{_res}"] = (
+                f"omni_{_duration}s{_orientation_suffix}{_res_suffix}"
+            )
+            READABLE_MODEL_ALIASES[f"omni-1.1-flash-ingredients-{_duration}s-{_orientation}{_res}"] = (
+                f"omni_r2v_{_duration}s{_orientation_suffix}{_res_suffix}"
+            )
+
+
+def readable_aliases_for(model_id: str) -> List[str]:
+    """Readable alias names that resolve to `model_id`."""
+    return sorted(alias for alias, target in READABLE_MODEL_ALIASES.items() if target == model_id)
+
+
 # Friendly video aliases (Google's product names / short handles). Resolved by
 # _resolve_friendly_video_alias, which also picks I2V / first+last / reference variants
 # from the number of input images and the Omni duration from durationSeconds.
@@ -490,11 +521,11 @@ VIDEO_ALIAS_DISPLAY_NAMES = {
     "veo-interpolate": "Veo 3.1 First/Last Frame Lite",
     "veo-i2v-ultra": "Veo 3.1 Fast Ultra I2V",
     "veo-i2v-relaxed": "Veo 3.1 Fast Ultra Relaxed I2V",
-    "veo-r2v": "Veo 3.1 R2V",
-    "veo-r2v-ultra": "Veo 3.1 R2V Ultra",
-    "veo-r2v-relaxed": "Veo 3.1 R2V Ultra Relaxed",
-    "veo-r2v-lite": "Veo 3.1 Lite R2V",
-    "omni-r2v": "Omni 1.1 Flash R2V",
+    "veo-r2v": "Veo 3.1 Fast Ingredients (reference images)",
+    "veo-r2v-ultra": "Veo 3.1 Fast Ingredients (reference images), Ultra",
+    "veo-r2v-relaxed": "Veo 3.1 Fast Ingredients, Ultra relaxed queue (retired by Google)",
+    "veo-r2v-lite": "Veo 3.1 Lite Ingredients (reference images)",
+    "omni-r2v": "Omni 1.1 Flash Ingredients (reference images)",
     "veo-extend": "Veo 3.1 Extend",
 }
 
@@ -840,6 +871,14 @@ def resolve_model_name(
     Returns:
         Resolved internal model name
     """
+    # ────── Readable full-name aliases: exact, returned at once ──────
+    # (No further resolution: e.g. omni_8s is also a VIDEO_BASE_MODELS family that
+    # generationConfig could re-route; an exact readable name must not be re-routed.)
+    readable_target = READABLE_MODEL_ALIASES.get(model)
+    if readable_target and (not model_config or readable_target in model_config):
+        debug_logger.log_info(f"[MODEL_RESOLVER] Readable alias resolved: {model} → {readable_target}")
+        return readable_target
+
     # ────── Image model resolution ──────
     if model in IMAGE_BASE_MODELS:
         base = IMAGE_BASE_MODELS[model]

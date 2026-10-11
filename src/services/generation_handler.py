@@ -2353,7 +2353,10 @@ class GenerationHandler:
             character_entities: Dict[str, str] = {}
             if characters:
                 if video_type not in ("r2v", "omni"):
-                    error_msg = "Characters need an ingredients model (omni-r2v, omni, veo-r2v, veo-r2v-lite)"
+                    error_msg = (
+                        "Characters need an Omni 1.1 Flash or Veo 3.1 ingredients model, e.g. "
+                        "omni-1.1-flash-ingredients-8s-portrait (= omni_r2v_8s_portrait) or veo_3_1_r2v_fast_portrait"
+                    )
                     self._mark_generation_failed(generation_result, error_msg, caller_fault=True)
                     yield self._create_error_response(error_msg, status_code=400)
                     return
