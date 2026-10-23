@@ -250,3 +250,89 @@ def test_network_failures_become_transient_and_keep_their_text():
     with pytest.raises(ck.FlowTransientError) as err:
         asyncio.run(ck._network(boom()))
     assert "curl: (56)" in str(err.value) and ck.TRANSIENT_MARKER in str(err.value)
+
+
+def test_google_interstitial_is_transient_but_off_google_is_auth():
+    import asyncio
+    from unittest.mock import patch
+
+    class Resp:
+        def __init__(self, status, location=""):
+            self.status_code, self.text, self.headers = status, "", {"location": location}
+
+    class Http:
+        def __init__(self, location):
+            self.location, self.cookies = location, type("C", (), {"jar": ck.CookieJar()})()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, *a, **k):
+            return Resp(302, self.location)
+
+    def run(location):
+        session = ck.FlowCookieSession(handle="h", email="", proxy="http://p", jar=ck.CookieJar(), source_fingerprint="f")
+        with patch.object(ck, "AsyncSession", lambda **kw: Http(location)):
+            asyncio.run(ck.load_bootstrap(session))
+
+    with pytest.raises(ck.FlowTransientError):
+        run("https://www.google.com/sorry/index?continue=x")
+    with pytest.raises(ck.FlowCookieAuthError):
+        run("https://evil.example.com/")
+
+
+def test_envelope_er_frames_are_transient_and_401_is_auth():
+    with pytest.raises(ck.FlowRpcError) as err:
+        ck.extract_rpc_payload([[["er", None, None, None, None, 400]]], "ogiZ0b")
+    assert err.value.transient and ck.TRANSIENT_MARKER in str(err.value.code)
+    with pytest.raises(ck.FlowCookieAuthError):
+        ck.extract_rpc_payload([[["er", None, None, None, None, 401]]], "ogiZ0b")
+
+
+def test_xsrf_frame_does_not_resubmit_an_answered_rpc():
+    import asyncio
+    from unittest.mock import patch
+
+    posts = []
+    answered = '[["xsrf","NEW"],["wrb.fr","ogiZ0b","[1]",null,null,null,"generic"]]'
+
+    class Resp:
+        status_code = 200
+        def __init__(self, text):
+            self.text = text
+
+    class Http:
+        cookies = type("C", (), {"jar": ck.CookieJar()})()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, *a, **k):
+            posts.append(1)
+            return Resp(answered)
+
+    session = ck.FlowCookieSession(handle="h", email="a@x.com", proxy="http://p", jar=ck.CookieJar(), source_fingerprint="f",
+                                   bl="boq_labs-ai-sandbox-frontend_1", fsid="1", bootstrap_at=__import__("time").time())
+    with patch.object(ck, "AsyncSession", lambda **kw: Http()):
+        assert asyncio.run(ck.call_rpc(session, "ogiZ0b", [])) == [1]
+    assert len(posts) == 1
+
+
+def test_fleet_watch_diagnosis():
+    from src.services.fleet_watch import FleetWatch
+    assert FleetWatch.diagnose(total=20, ok=0, active=5)
+    assert FleetWatch.diagnose(total=0, ok=0, active=0)
+    assert FleetWatch.diagnose(total=20, ok=1, active=5) is None
+    assert FleetWatch.diagnose(total=2, ok=0, active=5) is None  # too few requests to judge
+
+
+def test_server_mint_routing_breaker_opens_and_probes():
+    from src.services import flow_page_captcha as fpc
+    svc = fpc.FlowPageCaptchaService.__new__(fpc.FlowPageCaptchaService)
+    assert svc.routing_healthy()
+    svc._consecutive_failures = fpc.ROUTING_BREAKER_FAILURES
+    svc._breaker_probe_at = __import__("time").monotonic() + 100
+    assert not svc.routing_healthy()
+    svc._breaker_probe_at = 0.0
+    assert svc.routing_healthy()       # one probe window
+    assert not svc.routing_healthy()   # then closed again until the next window

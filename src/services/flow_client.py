@@ -1531,6 +1531,14 @@ class FlowClient:
         try:
             payload = await flow_ck.call_rpc(session, rpc_id, argument, source_path=source_path,
                                              timeout=timeout, proxy=proxy_url, user_agent=user_agent)
+        except flow_ck.FlowTransientError as e:
+            api_error = FlowAPIError(503, f"HTTP Error 503: {e}", "")
+            api_error.flow_transient = True
+            api_error.flow_fail_class = "HTTP"
+            debug_logger.op_warning(
+                f"[FLOW_FAIL] class=TRANSIENT rpc={rpc_id} egress={mask_proxy_url(proxy_url or session.proxy)} reason={str(e)[:160]}"
+            )
+            raise api_error from e
         except (flow_ck.FlowCookieAuthError, flow_ck.FlowIdentityError) as e:
             # Forget exactly this session; a newer one of the same account (another handle) stays.
             self._cookie_sessions.drop_session(session)
@@ -1610,7 +1618,9 @@ class FlowClient:
             # No stored tier (new row): Flow's 2nd credits number matched the stored tier on every account
             # seen 2026-10-23 (Pro 51 -> 1, Ultra 55/85 -> 2). Anything else stays unknown.
             raw = result.get("frontendRaw") or []
-            tier = {1: "PAYGATE_TIER_ONE", 2: "PAYGATE_TIER_TWO"}.get(raw[1] if len(raw) > 1 else None, "")
+            second = raw[1] if len(raw) > 1 else None
+            if isinstance(second, int) and not isinstance(second, bool):
+                tier = {1: "PAYGATE_TIER_ONE", 2: "PAYGATE_TIER_TWO"}.get(second, "")
         if tier:
             result["userPaygateTier"] = tier
         debug_logger.log_info(
@@ -2973,6 +2983,10 @@ class FlowClient:
         aspect_ratio: str,
     ) -> None:
         """Run the minimal first-party init/telemetry calls the real page makes before a video submit, in the same order."""
+        if flow_ck.is_session_handle(at):
+            # Cookie sessions (2026-10-23): these are retired labs.google tRPC / Labs-era calls (they 401/404
+            # from every account's proxy). The flow.google.com app needs no warm-up before a video RPC.
+            return
         account_id = at[:16] if at else None
         page_url = self._build_flow_project_page_url(project_id)
         session_create_time = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
@@ -4859,6 +4873,8 @@ class FlowClient:
             return "429 rate limit"
         if self._is_retryable_network_error(error_str):
             return "network/TLS error"
+        if "flow web temporarily unavailable" in error_lower:
+            return "Flow web temporarily unavailable"
         if "recaptcha evaluation failed" in error_lower:
             return "reCAPTCHA verification failed"
         if "recaptcha" in error_lower:

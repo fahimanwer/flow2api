@@ -156,7 +156,7 @@ class LoadBalancer:
         try:
             from .flow_page_captcha import FlowPageCaptchaService
             service = await FlowPageCaptchaService.get_instance()
-            return bool(service.is_available())
+            return bool(service.is_available()) and service.routing_healthy()
         except Exception:
             return False
 

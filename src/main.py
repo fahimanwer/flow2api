@@ -282,6 +282,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠ Ultra browsers coordinator failed to start: {e}")
 
+    # Fleet watch (2026-10-23): Telegram page when no request succeeds fleet-wide (the Labs-login outage
+    # ran 40 h unnoticed). Delivered by the Ultra outbox sender started above.
+    fleet_watch = None
+    try:
+        from .services.fleet_watch import FleetWatch
+        fleet_watch = FleetWatch(db)
+        fleet_watch.start()
+    except Exception as e:
+        print(f"⚠ Fleet watch failed to start: {e}")
+
     # Server-side reCAPTCHA fallback: idle/over-cap/disabled browser sweeper (2026-09-23).
     fallback_sweeper_handle = None
     try:
@@ -295,6 +305,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if fleet_watch is not None:
+            await fleet_watch.stop()
         await ultra_service.stop()
         await suno_service.close()
         if fallback_sweeper_handle is not None:

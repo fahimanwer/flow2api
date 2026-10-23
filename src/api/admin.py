@@ -618,7 +618,7 @@ class AddTokenRequest(BaseModel):
 
 
 class UpdateTokenRequest(BaseModel):
-    st: str  # Session Token (required, used to refresh AT)
+    st: Optional[str] = ""  # Session Token; since 2026-10-23 only the row key (keep it = plain edit, no Google login)
     project_id: Optional[str] = None  # Optional user-supplied project_id
     project_name: Optional[str] = None
     remark: Optional[str] = None
@@ -1047,24 +1047,30 @@ async def update_token(
 ):
     """Update token - auto-refresh AT from ST"""
     try:
-        # Convert ST to AT first
-        result = await token_manager.flow_client.st_to_at(request.st)
-        at = result["access_token"]
-        expires = result.get("expires")
+        existing = await token_manager.get_token(token_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"Token {token_id} not found")
+        st_in = (request.st or "").strip()
+        # Cookie sessions (2026-10-23): the ST is only the row's key now. A save that keeps it is a plain
+        # field edit and must not need a working Google login (an account whose cookies went stale is
+        # exactly the one you want to edit). A changed ST still goes through the login as before.
+        plain_edit = token_manager.flow_client.cookie_rpc_enabled() and (not st_in or st_in == (existing.st or ""))
+        at = at_expires = None
+        if not plain_edit:
+            result = await token_manager.flow_client.st_to_at(st_in)
+            at = result["access_token"]
+            expires = result.get("expires")
+            from datetime import datetime
+            if expires:
+                try:
+                    at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+                except Exception:
+                    pass
 
-        # Parse expiry time
-        from datetime import datetime
-        at_expires = None
-        if expires:
-            try:
-                at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-            except:
-                pass
-
-        # Update token (AT, ST, AT expiry, project_id and project_name)
+        # Update token (AT, ST, AT expiry, project_id and project_name); None = unchanged
         await token_manager.update_token(
             token_id=token_id,
-            st=request.st,
+            st=(None if plain_edit else st_in),
             at=at,
             at_expires=at_expires,  # Update AT expiry time
             project_id=request.project_id,
@@ -1096,6 +1102,8 @@ async def update_token(
                 )
 
         return {"success": True, "message": "Token updated"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3302,7 +3310,8 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
             # alive, API 401 = at_stale) must never overwrite working credentials nor
             # re-enable the account — that loop is what kept 30 accounts flapping hourly.
             outcome = await token_manager.validate_and_promote(
-                existing_token.id, session_token, source="plugin_push", push_route_key=reported_route_key or ""
+                existing_token.id, session_token, source="plugin_push", push_route_key=reported_route_key or "",
+                **({"cookie_seq": cookie_seq} if cookie_mode else {}),
             )
             if not outcome.success and outcome.reason in ("st_expired", "at_stale") and google_cookies and not derived_from_cookies:
                 # The pushed session is dead, or Google stopped renewing its grant: a fresh
@@ -3317,6 +3326,7 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                         reused_outcome = await token_manager.validate_and_promote(
                             existing_token.id, latest_row.st, source="plugin_push_stored",
                             push_route_key=reported_route_key or "",
+                            **({"cookie_seq": cookie_seq} if cookie_mode else {}),
                         )
                     if reused_outcome is not None and reused_outcome.success and reused_outcome.verified:
                         debug_logger.log_info(f"[COOKIE_SYNC] token={existing_token.id} stored session still valid; no Google login needed")
@@ -3334,11 +3344,14 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                             outcome = await token_manager.validate_and_promote(
                                 existing_token.id, session_token, source="plugin_push_cookies",
                                 push_route_key=reported_route_key or "",
+                                **({"cookie_seq": cookie_seq} if cookie_mode else {}),
                             )
             if not outcome.success and outcome.reason == "st_expired":
                 raise HTTPException(status_code=400, detail="Invalid session token (expired)")
             if not outcome.success and outcome.reason == "account_mismatch":
                 raise HTTPException(status_code=409, detail=f"account mismatch: session is not {existing_token.email}")
+            if not outcome.success and outcome.reason == "stale_push":
+                raise HTTPException(status_code=503, detail="stale cookie push (a newer one is stored); the next push carries the current state")
             if not outcome.success and outcome.reason == "ultra_guard":
                 raise HTTPException(status_code=409, detail="refused: this account is owned by an Ultra server browser")
             if not outcome.success and outcome.reason not in ("at_stale",):

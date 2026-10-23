@@ -94,6 +94,12 @@ extended video.
 - Device-bound logins (DBSC): 26 of 36 stored cookie sets on 2026-10-23 carry `__Secure-1PSIDRTS` /
   `__Secure-STRP`. Copied cookies of such a login go stale (Flow shows its signed-out page; seen on
   account 51 about an hour after its last push). The extension re-pushes when Google rotates the
-  login cookie (at most every 10 min) and hourly. UNKNOWN until measured: how long a server session
-  made from fresh cookies keeps working (experiment `tmp/dbsc_lifetime_1023.py`, 2026-10-23).
+  login cookie (at most every 10 min) and hourly. Measured 2026-10-23 (`tmp/dbsc_lifetime_1023.py`, frozen
+  cookie snapshots, through each account's proxy): two DBSC accounts' sessions AND fresh logins still worked
+  28 min after the snapshot (cookies up to ~41 min old); a non-DBSC account's snapshot died 19 min in,
+  exactly when its browser rotated its login cookies and pushed new ones (old OSID session 401, new login →
+  sign-in page), while production moved to the new cookies on that push. So what ends a server session is
+  the BROWSER rotating its login, not a fixed lifetime; the server follows only through the next push.
+  UNVERIFIED: whether the extension's 10-min gap between cookie-triggered pushes (`COOKIE_SYNC_MIN_GAP_MS`)
+  explains account 51 dying with no newer push.
 - Old extensions (≤ 3.6.4) never send cookies, so since 2026-10-23 their accounts cannot work.
