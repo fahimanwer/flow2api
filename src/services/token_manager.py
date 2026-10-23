@@ -734,9 +734,12 @@ class TokenManager:
             next_fingerprint = dict(previous_fingerprint or {})
             next_fingerprint["proxy_url"] = proxy_url
             self.flow_client._set_request_fingerprint(next_fingerprint)
+        # Cookie sessions (2026-10-23): st_to_at / RPCs in this call use THIS row's Google cookies.
+        cookie_reset = self.flow_client.set_cookie_token(token)
         try:
             return await call()
         finally:
+            self.flow_client.reset_cookie_token(cookie_reset)
             self.flow_client._set_request_fingerprint(previous_fingerprint)
 
     async def _st_to_at_for_token(self, token: Token, st: str) -> Dict[str, Any]:
@@ -1664,6 +1667,11 @@ class TokenManager:
         if not (getattr(token, "google_cookies", "") or "").strip():
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: no Google cookies set, skipping protocol refresh")
             return None
+        if self.flow_client.cookie_rpc_enabled():
+            # 2026-10-23: the Labs login this replays is retired (CSRF 410). The stored cookies ARE the
+            # credential now: hand back the row's key so validate-then-promote re-logs in to Flow with them.
+            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: cookie session mode, re-checking the stored Google cookies")
+            return (token.st or "").strip() or None
 
         try:
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: trying protocol ST refresh...")

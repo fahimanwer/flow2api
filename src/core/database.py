@@ -1598,6 +1598,16 @@ class Database:
                 return Token(**dict(row))
             return None
 
+    async def get_token_by_at(self, at: str) -> Optional[Token]:
+        """Get token by AT (cookie-session handles live in this column since 2026-10-23)"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM tokens WHERE at = ? ORDER BY id LIMIT 1", (at,))
+            row = await cursor.fetchone()
+            if row:
+                return Token(**dict(row))
+            return None
+
     async def get_token_by_email(self, email: str) -> Optional[Token]:
         """Get token by email"""
         async with self._connect() as db:
