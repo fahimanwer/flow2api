@@ -26,7 +26,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from http.cookiejar import Cookie, CookieJar
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode, urljoin, urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -48,7 +48,6 @@ BOOTSTRAP_TTL_SECONDS = 600
 SESSION_TTL_SECONDS = 2 * 3600
 MAX_SESSIONS = 500
 
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _BL_RE = re.compile(r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+")
 _FSID_RE = re.compile(r'"FdrFJe":"(-?[0-9]+)"')
 _XSRF_PAGE_RE = re.compile(r'"SNlM0e"\s*:\s*"((?:\\.|[^"\\])+)"')
@@ -65,6 +64,10 @@ class FlowCookieAuthError(Exception):
         super().__init__(f"UNAUTHENTICATED: {message}")
         self.status_code = 401
         self.reason = "UNAUTHENTICATED"
+
+
+class FlowIdentityError(Exception):
+    """The cookies log in to a different Google account than the session / row expects."""
 
 
 class FlowRpcError(Exception):
@@ -249,83 +252,107 @@ class FlowCookieSession:
 
 
 class FlowCookieSessions:
-    """In-memory registry of logged-in Flow cookie sessions, keyed by handle."""
+    """In-memory registry of logged-in Flow cookie sessions, keyed by handle.
+
+    Every session has its OWN handle. A session built while checking a push is therefore not used by
+    any request until the guarded DB write puts its handle in `tokens.at` (Ultra ownership, account
+    match); a refused push leaves a session nobody points at, which ages out. Old-process handles found
+    in the DB are aliased onto a rebuilt session; the cap counts aliases too.
+    """
 
     def __init__(self):
         self._by_handle: Dict[str, FlowCookieSession] = {}
-        self._nonce = uuid.uuid4().hex[:10]
+
+    def _expired(self, session: FlowCookieSession) -> bool:
+        return time.time() - session.last_used_at > SESSION_TTL_SECONDS
 
     def get(self, handle: str) -> Optional[FlowCookieSession]:
         session = self._by_handle.get(handle)
-        if session and time.time() - session.last_used_at > SESSION_TTL_SECONDS:
-            self._by_handle.pop(handle, None)
+        if session and self._expired(session):
+            self._forget(session)
             return None
         return session
 
+    def sessions(self) -> List[FlowCookieSession]:
+        unique: Dict[int, FlowCookieSession] = {}
+        for session in self._by_handle.values():
+            unique[id(session)] = session
+        return list(unique.values())
+
     def find(self, email: str, source_fingerprint: str, proxy: Optional[str]) -> Optional[FlowCookieSession]:
-        session = self.get(self.handle_for(email))
-        if session and session.source_fingerprint == source_fingerprint and session.proxy == proxy:
-            return session
+        email = (email or "").strip().lower()
+        for session in self.sessions():
+            if (session.email == email and session.source_fingerprint == source_fingerprint
+                    and session.proxy == proxy and not self._expired(session)):
+                return session
         return None
 
-    def handle_for(self, email: str) -> str:
-        # One handle per account per process: the DB `at` column stays stable between refreshes.
-        return f"{HANDLE_PREFIX}{email_hash(email)}.{self._nonce}"
+    @staticmethod
+    def new_handle(email: str) -> str:
+        return f"{HANDLE_PREFIX}{email_hash(email)}.{uuid.uuid4().hex[:16]}"
+
+    def _make_room(self) -> None:
+        if len(self._by_handle) < MAX_SESSIONS:
+            return
+        for session in self.sessions():
+            if self._expired(session):
+                self._forget(session)
+        if len(self._by_handle) >= MAX_SESSIONS:
+            for session in sorted(self.sessions(), key=lambda s: s.last_used_at)[: max(1, len(self.sessions()) // 10)]:
+                self._forget(session)
 
     def put(self, session: FlowCookieSession) -> None:
-        if len(self._by_handle) >= MAX_SESSIONS:
-            oldest = sorted(self._by_handle.values(), key=lambda s: s.last_used_at)[: MAX_SESSIONS // 10]
-            for item in oldest:
-                self._by_handle.pop(item.handle, None)
+        self._make_room()
         self._by_handle[session.handle] = session
 
     def alias(self, handle: str, session: FlowCookieSession) -> None:
         """A handle stored by an earlier process (DB `at`) now points at this live session."""
+        self._make_room()
         self._by_handle[handle] = session
 
-    def drop(self, handle: str) -> None:
-        session = self._by_handle.pop(handle, None)
-        if session is not None:
-            for key in [k for k, v in self._by_handle.items() if v is session]:
-                self._by_handle.pop(key, None)
+    def _forget(self, session: FlowCookieSession) -> None:
+        for key in [k for k, v in self._by_handle.items() if v is session]:
+            self._by_handle.pop(key, None)
+
+    def drop_session(self, session: FlowCookieSession) -> None:
+        """Forget exactly this session (and its aliases); a newer session of the account stays."""
+        self._forget(session)
 
     def drop_email(self, email: str) -> None:
-        self.drop(self.handle_for((email or "").strip().lower()))
+        """The account's cookies were cleared: no session of it may serve another request."""
+        email = (email or "").strip().lower()
+        for session in self.sessions():
+            if session.email == email:
+                self._forget(session)
 
 
 _ACCOUNT_EMAIL_RE = re.compile(r'"oPEP7c"\s*:\s*("(?:[^"\\]|\\.)*")')
 
 
-def _find_email(text: str, expected: Optional[str]) -> str:
-    """The signed-in account: Flow's bootstrap field oPEP7c (upstream's identity source); a page-wide
-    email scan is only the fallback, preferring the expected account when it is among them."""
+def _find_email(text: str) -> str:
+    """The signed-in account, from Flow's bootstrap field oPEP7c ONLY (upstream's identity source;
+    checked live 2026-10-23 on 3 accounts). Any other email on the page proves nothing."""
     match = _ACCOUNT_EMAIL_RE.search(text or "")
-    if match:
-        try:
-            value = json.loads(match.group(1))
-        except ValueError:
-            value = ""
-        if isinstance(value, str) and "@" in value:
-            return value.strip().lower()
-    found = []
-    for match in _EMAIL_RE.findall(text or ""):
-        lowered = match.lower()
-        if lowered.endswith(("@google.com", "@example.com")) or lowered in found:
-            continue
-        found.append(lowered)
-    if expected and expected.strip().lower() in found:
-        return expected.strip().lower()
-    return found[0] if found else ""
+    if not match:
+        return ""
+    try:
+        value = json.loads(match.group(1))
+    except ValueError:
+        return ""
+    return value.strip().lower() if isinstance(value, str) and "@" in value else ""
 
 
 async def load_bootstrap(
     session: FlowCookieSession,
     timeout: int = 30,
-    expected_email: Optional[str] = None,
     impersonate: str = "chrome",
 ) -> None:
     """Load flow.google.com/projects with the session jar (bouncing through accounts.google.com when
-    the jar has no OSID yet) and store bl / f.sid / xsrf / email on the session."""
+    the jar has no OSID yet) and store bl / f.sid / xsrf / email on the session.
+
+    Only a Google sign-in page (accounts.google.com answering 2xx) or a 401 means the login is dead;
+    server errors, a 403 and an unexpected page are NOT a verdict on the login (they must never
+    disable an account). A session's account can never change on a later reload."""
     if not session.proxy:
         raise RuntimeError("Flow cookie login refused: no proxy for this account (never log in direct)")
     url = f"{FLOW_ORIGIN}{BOOTSTRAP_PATH}"
@@ -351,21 +378,31 @@ async def load_bootstrap(
         _merge_jar(session.jar, http.cookies.jar)
     final_host = (urlparse(url).hostname or "").lower()
     text = response.text if response is not None else ""
-    if response is None or response.status_code in (401, 403) or final_host != FLOW_HOST:
-        raise FlowCookieAuthError(
-            f"Google did not sign this account in to Flow (landed on {final_host}, HTTP "
-            f"{getattr(response, 'status_code', '?')}); the browser must push fresh cookies"
-        )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Flow bootstrap failed: HTTP {response.status_code}")
+    status = getattr(response, "status_code", 0) or 0
+    if response is None:
+        raise RuntimeError("Flow bootstrap got no response")
+    if final_host != FLOW_HOST:
+        if status < 400:
+            raise FlowCookieAuthError(
+                f"Google showed a sign-in page ({final_host}) instead of Flow; the browser must push fresh cookies"
+            )
+        raise RuntimeError(f"Flow login bounce failed on {final_host}: HTTP {status}")
+    if status == 401:
+        raise FlowCookieAuthError("Flow answered HTTP 401 to the login")
+    if status >= 400:
+        raise RuntimeError(f"Flow bootstrap failed: HTTP {status}")
     bl = _BL_RE.search(text)
     fsid = _FSID_RE.search(text)
+    email = _find_email(text)
     if not bl or not fsid:
-        raise FlowCookieAuthError("Flow page loaded without its signed-in bootstrap data")
-    xsrf = _XSRF_PAGE_RE.search(text)
-    email = _find_email(text, expected_email or session.email)
+        raise RuntimeError("Flow page loaded without its bootstrap data (bl / f.sid); Google may have changed the page")
     if not email:
-        raise FlowCookieAuthError("Flow page shows no signed-in account")
+        # The full Flow app, but signed OUT (no login bounce, no account). Seen 2026-10-23 on device-bound
+        # (DBSC, __Secure-1PSIDRTS) logins whose copied cookies went stale: a real "log in again" verdict.
+        raise FlowCookieAuthError("Flow shows the signed-out page; the copied Google cookies are stale (the browser must push again)")
+    if session.email and email != session.email:
+        raise FlowIdentityError(f"these cookies now sign in as {email}, not {session.email}")
+    xsrf = _XSRF_PAGE_RE.search(text)
     session.bl = bl.group(0)
     session.fsid = fsid.group(1)
     session.xsrf = _json_unescape(xsrf.group(1)) if xsrf else ""
@@ -427,7 +464,12 @@ async def call_rpc(
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
     }
-    async with AsyncSession(trust_env=False, cookies=session.jar, impersonate=impersonate) as http:
+    # The RPC runs on a COPY of the jar: cookie changes are taken only from the locked page load, so
+    # parallel RPCs of one account cannot write an older cookie value over a newer one.
+    jar_copy = CookieJar()
+    for cookie in list(session.jar):
+        jar_copy.set_cookie(cookie)
+    async with AsyncSession(trust_env=False, cookies=jar_copy, impersonate=impersonate) as http:
         response = await http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout)
         text = response.text
         xsrf = _XSRF_RPC_RE.search(text or "")
@@ -437,10 +479,10 @@ async def call_rpc(
             fields["at"] = session.xsrf
             response = await http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout)
             text = response.text
-        _merge_jar(session.jar, http.cookies.jar)
-    if response.status_code in (401, 403) and "wrb.fr" not in (text or ""):
+    if response.status_code == 401 and "wrb.fr" not in (text or ""):
+        # Reload the page next time: if the login is really dead the reload lands on accounts.google.com.
         session.bootstrap_at = 0.0
-        raise FlowCookieAuthError(f"Flow RPC {rpc_id} answered HTTP {response.status_code}")
+        raise FlowCookieAuthError(f"Flow RPC {rpc_id} answered HTTP 401")
     if response.status_code >= 400:
         session.bootstrap_at = 0.0
         raise FlowRpcError(rpc_id, f"HTTP {response.status_code}: {(text or '')[:160]}", status_code=response.status_code)
@@ -456,36 +498,36 @@ async def establish(
     user_agent: Optional[str] = None,
     timeout: int = 30,
 ) -> FlowCookieSession:
-    """Reuse a live session for these exact cookies + proxy, else log in to Flow with them."""
+    """Reuse a live session for these exact cookies + proxy, else log in to Flow with them.
+
+    The session's email is whatever Flow says (oPEP7c); the CALLER compares it with the row
+    (account_mismatch). token_id is attached only when the account matches the expected email."""
     if not has_login_cookies(google_cookies):
         raise FlowCookieAuthError("no Google login cookies stored for this account")
     fingerprint = cookies_fingerprint(google_cookies)
-    if expected_email:
-        existing = registry.find(expected_email.strip().lower(), fingerprint, proxy)
+    expected = (expected_email or "").strip().lower()
+    if expected:
+        existing = registry.find(expected, fingerprint, proxy)
         if existing and existing.bootstrap_fresh():
             existing.last_used_at = time.time()
-            if token_id is not None:
+            if token_id is not None and existing.token_id is None:
                 existing.token_id = token_id
             return existing
     session = FlowCookieSession(
         handle="",
-        email=(expected_email or "").strip().lower(),
+        email="",
         proxy=proxy,
         jar=build_cookie_jar(google_cookies),
         source_fingerprint=fingerprint,
-        token_id=token_id,
         user_agent=user_agent or DEFAULT_USER_AGENT,
     )
-    await load_bootstrap(session, timeout=timeout, expected_email=expected_email)
-    session.handle = registry.handle_for(session.email)
+    await load_bootstrap(session, timeout=timeout)
+    if token_id is not None and (not expected or session.email == expected):
+        session.token_id = token_id
+    session.handle = registry.new_handle(session.email)
     registry.put(session)
     return session
 
 
 def session_summary(session: FlowCookieSession) -> Dict[str, Any]:
     return {"email": session.email, "token_id": session.token_id, "bootstrap_age_s": int(time.time() - session.bootstrap_at)}
-
-
-def split_handle(handle: str) -> Tuple[str, str]:
-    parts = (handle or "").split(".")
-    return (parts[1], parts[2]) if len(parts) >= 3 else ("", "")

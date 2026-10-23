@@ -3637,6 +3637,9 @@ async def _apply_cookie_sync(token_row, google_cookies: Optional[str], cookie_se
         return out
     if google_cookies == "":
         out["cleared"] = True
+        # The cookies ARE the Flow login now (2026-10-23): no live session of this account may serve on.
+        if token_manager is not None:
+            token_manager.flow_client._cookie_sessions.drop_email(email or getattr(token_row, "email", ""))
         debug_logger.event(f"[COOKIE_SYNC] token={token_row.id} ({email}) Google login deleted (switch OFF)")
         return out
     out["stored"] = True
