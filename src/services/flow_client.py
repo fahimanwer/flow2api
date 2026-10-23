@@ -1546,17 +1546,44 @@ class FlowClient:
                                   timeout: int) -> Dict[str, Any]:
         try:
             call = translate_request(method, url, json_data)
-        except CookieModeUnsupported as e:
+        except (CookieModeUnsupported, NotImplementedError) as e:
             raise FlowAPIError(501, f"Not supported on the new Flow API yet: {e}", "COOKIE_MODE_UNSUPPORTED") from e
+        except ValueError as e:
+            raise FlowAPIError(400, f"Request cannot be sent to the new Flow API: {e}", "COOKIE_MODE_BAD_REQUEST") from e
         session = await self._cookie_session_for_handle(handle)
+        rpc_timeout = max(int(timeout or 60), call.timeout_floor)
         payload = await self._cookie_rpc_call(
             session, call.rpc_id, call.argument, call.source_path,
-            timeout=max(int(timeout or 60), call.timeout_floor), proxy_url=proxy_url, user_agent=user_agent,
+            timeout=rpc_timeout, proxy_url=proxy_url, user_agent=user_agent,
         )
         result = call.normalize(payload)
         if call.rpc_id == "nzlxg":
             await self._echo_stored_tier(session, result)
+        elif call.rpc_id == "jwpduf":
+            await self._cookie_video_followups(session, result, proxy_url, user_agent)
         return result
+
+    async def _cookie_video_followups(self, session, status_result: Dict[str, Any],
+                                      proxy_url: Optional[str], user_agent: Optional[str]) -> None:
+        """jwpduf does not always carry the finished video's link: look each unfinished job up with as29s,
+        as the Flow web app (and upstream check_video_status) does. A failed lookup only means "still running"."""
+        try:
+            from .flow_rpc_video import video_status_followups
+        except ImportError:
+            return
+        for item in video_status_followups(status_result):
+            try:
+                payload = await self._cookie_rpc_call(
+                    session, item["rpc_id"], item["argument"], item["source_path"],
+                    timeout=30, proxy_url=proxy_url, user_agent=user_agent,
+                )
+                item["apply"](payload)
+            except FlowAPIError as e:
+                if e.status_code == 401:
+                    raise
+                debug_logger.log_warning(f"[COOKIE_RPC] as29s lookup failed (job still counted as running): {str(e)[:120]}")
+            except Exception as e:
+                debug_logger.log_warning(f"[COOKIE_RPC] as29s lookup failed (job still counted as running): {str(e)[:120]}")
 
     async def _echo_stored_tier(self, session, result: Dict[str, Any]) -> None:
         """Credits callers write userPaygateTier verbatim (None would wipe it to Free), and Flow's new

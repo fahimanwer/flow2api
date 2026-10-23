@@ -10,7 +10,6 @@ and flow_current.py, 2026-09-27 .. 2026-10-23), which captured them from the liv
 Videos live in flow_rpc_video.py.
 """
 
-import base64
 import random
 import re
 import uuid
@@ -184,7 +183,8 @@ def build_image_argument(project_id: str, body: Dict[str, Any]) -> tuple:
         None, None, refs or None, seed, IMAGE_ASPECT[aspect_key], model, None, context,
         [[[_prompt_text(request)]]], None, None, None, session_id, str(uuid.uuid4()).upper(),
     ]
-    return [None, [rpc_request], 1, context, [session_id]], session_id
+    # The Flow web app sends its own batch id here, not the request's session id (HAR 2026-10-23).
+    return [None, [rpc_request], 1, context, [str(uuid.uuid4()).upper()]], session_id
 
 
 def normalize_image_response(payload: Any) -> Dict[str, Any]:
@@ -307,10 +307,3 @@ def translate_request(method: str, url: str, body: Optional[Dict[str, Any]]) -> 
         raise CookieModeUnsupported(f"video call {path} is not mapped to the new Flow API yet")
     raise CookieModeUnsupported(f"{method.upper()} {path} has no new Flow API mapping")
 
-
-def decode_b64_ok(value: str) -> bool:
-    try:
-        base64.b64decode(value[:64] + "=" * (-len(value[:64]) % 4))
-        return True
-    except Exception:
-        return False
