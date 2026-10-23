@@ -37,10 +37,11 @@ def test_has_login_cookies():
     assert not ck.has_login_cookies("")
 
 
-def test_email_prefers_oPEP7c():
+def test_email_comes_only_from_oPEP7c():
     page = 'x "oPEP7c":"Someone@Gmail.com" y other@gmail.com'
-    assert ck._find_email(page, None) == "someone@gmail.com"
-    assert ck._find_email("a@gmail.com b@gmail.com", "b@gmail.com") == "b@gmail.com"
+    assert ck._find_email(page) == "someone@gmail.com"
+    # Any other email on the page proves nothing (Codex 2026-10-23).
+    assert ck._find_email("a@gmail.com b@gmail.com") == ""
 
 
 def test_payload_and_errors():
@@ -124,7 +125,128 @@ def test_unmapped_calls_fail_loudly():
         flow_rpc.translate_request("POST", "https://aisandbox-pa.googleapis.com/v1/flow/entities", {})
 
 
-def test_registry_handle_is_stable_per_account():
+def _session(email, fp="f", proxy="p"):
+    return ck.FlowCookieSession(handle=ck.FlowCookieSessions.new_handle(email), email=email, proxy=proxy,
+                                jar=ck.CookieJar(), source_fingerprint=fp)
+
+
+def test_each_session_has_its_own_handle_and_drop_is_exact():
     reg = ck.FlowCookieSessions()
-    assert reg.handle_for("A@x.com") == reg.handle_for("a@x.com")
-    assert ck.is_session_handle(reg.handle_for("a@x.com"))
+    old, new = _session("a@x.com"), _session("a@x.com", fp="g")
+    assert old.handle != new.handle and ck.is_session_handle(old.handle)
+    reg.put(old)
+    reg.put(new)
+    reg.alias("FLOWCK.legacy.1", old)
+    reg.drop_session(old)  # a failure of the OLD session must not remove the newer one
+    assert reg.get(old.handle) is None and reg.get("FLOWCK.legacy.1") is None
+    assert reg.get(new.handle) is new
+    assert reg.find("A@x.com", "g", "p") is new and reg.find("a@x.com", "f", "p") is None
+    reg.drop_email("a@x.com")
+    assert reg.get(new.handle) is None
+
+
+def test_registry_cap_counts_aliases():
+    reg = ck.FlowCookieSessions()
+    for i in range(ck.MAX_SESSIONS + 50):
+        session = _session(f"u{i}@x.com")
+        reg.put(session)
+        reg.alias(f"FLOWCK.alias.{i}", session)
+    assert len(reg._by_handle) <= ck.MAX_SESSIONS + 1
+
+
+def test_empty_credits_answer_is_an_error_not_zero():
+    with pytest.raises(RuntimeError):
+        flow_rpc._normalize_credits(None)
+
+
+def test_signed_out_flow_page_is_a_login_verdict_but_a_changed_page_is_not():
+    import asyncio
+    from unittest.mock import patch
+
+    class Resp:
+        def __init__(self, text, status=200):
+            self.text, self.status_code, self.headers = text, status, {}
+
+    class Http:
+        def __init__(self, resp):
+            self.resp, self.cookies = resp, type("C", (), {"jar": ck.CookieJar()})()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, *a, **k):
+            return self.resp
+
+    def run(text, status=200):
+        session = ck.FlowCookieSession(handle="h", email="", proxy="http://p", jar=ck.CookieJar(), source_fingerprint="f")
+        with patch.object(ck, "AsyncSession", lambda **kw: Http(Resp(text, status))):
+            asyncio.run(ck.load_bootstrap(session))
+        return session
+
+    app = 'boq_labs-ai-sandbox-frontend_20261021.10 "FdrFJe":"-123"'
+    assert run(app + ' "oPEP7c":"a@x.com"').email == "a@x.com"
+    with pytest.raises(ck.FlowCookieAuthError):
+        run(app)  # signed-out Flow app (stale device-bound cookies)
+    with pytest.raises(RuntimeError) as err:
+        run("<html>new page</html>")
+    assert not isinstance(err.value, ck.FlowCookieAuthError)
+    with pytest.raises(RuntimeError) as err:
+        run("busy", status=503)
+    assert not isinstance(err.value, ck.FlowCookieAuthError)
+
+
+def test_reuse_never_crosses_rows_with_the_same_email():
+    reg = ck.FlowCookieSessions()
+    bound = _session("a@x.com")
+    bound.token_id = 17
+    reg.put(bound)
+    assert reg.find("a@x.com", "f", "p", token_id=17) is bound
+    assert reg.find("a@x.com", "f", "p", token_id=18) is None
+
+
+def test_reply_cookies_are_kept_but_never_overwrite_a_newer_value():
+    def jar(**values):
+        j = ck.CookieJar()
+        for name, value in values.items():
+            j.set_cookie(ck._cookie(name, value, "flow.google.com"))
+        return j
+
+    shared = jar(OSID="v1", NID="n1")
+    before = ck._jar_values(shared)
+    # This reply rotated OSID and NID; meanwhile another reply already rotated NID to n2.
+    shared.set_cookie(ck._cookie("NID", "n2", "flow.google.com"))
+    ck._merge_changed(shared, before, jar(OSID="v2", NID="n-old-reply"))
+    values = {c.name: c.value for c in shared}
+    assert values == {"OSID": "v2", "NID": "n2"}
+
+
+def test_transient_flow_errors_carry_the_marker():
+    err = ck.FlowTransientError("Flow bootstrap answered HTTP 503")
+    assert ck.TRANSIENT_MARKER in str(err) and not isinstance(err, ck.FlowCookieAuthError)
+
+
+def test_session_built_before_a_cookie_clear_never_serves():
+    import time as _t
+    reg = ck.FlowCookieSessions()
+    in_flight = _session("a@x.com")          # an ON push started building this...
+    _t.sleep(0.01)
+    reg.drop_email("a@x.com")                 # ...then the OFF landed
+    reg.put(in_flight)                        # the ON push finishes afterwards
+    assert reg.get(in_flight.handle) is None
+    reg.alias("FLOWCK.db.handle", in_flight)
+    assert reg.get("FLOWCK.db.handle") is None
+    _t.sleep(0.01)
+    fresh = _session("a@x.com")               # a later ON works again
+    reg.put(fresh)
+    assert reg.get(fresh.handle) is fresh
+
+
+def test_network_failures_become_transient_and_keep_their_text():
+    import asyncio
+
+    async def boom():
+        raise OSError("curl: (56) Recv failure: Connection reset by peer")
+
+    with pytest.raises(ck.FlowTransientError) as err:
+        asyncio.run(ck._network(boom()))
+    assert "curl: (56)" in str(err.value) and ck.TRANSIENT_MARKER in str(err.value)

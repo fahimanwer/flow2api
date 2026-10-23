@@ -127,7 +127,10 @@ def _recaptcha_token(body: Dict[str, Any]) -> Optional[str]:
 # ---------- credits ----------
 
 def _normalize_credits(payload: Any) -> Dict[str, Any]:
-    values = payload if isinstance(payload, list) else []
+    if not isinstance(payload, list) or not payload:
+        # Never read "no answer" as "0 credits, verified".
+        raise RuntimeError("Flow credits RPC returned no data")
+    values = payload
     credits = next((int(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)), 0)
     # The tier is NOT returned on purpose: Flow's numeric tier fields are not mapped yet (seen on an
     # Ultra account: [25050, 2, 3, 3, null, 25050, [ts]]), and a guessed tier would re-route accounts.

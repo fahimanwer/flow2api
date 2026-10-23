@@ -1502,16 +1502,24 @@ class FlowClient:
             token = await self.db.get_token_by_at(handle)
         if token is None:
             raise FlowAPIError(401, "UNAUTHENTICATED: unknown cookie session; refresh the account", "UNAUTHENTICATED")
+        proxy = self._token_cookie_proxy(token)
+        if not proxy:
+            raise RuntimeError("Flow cookie login skipped: no proxy known for this account (never log in direct)")
+        row_email = str(getattr(token, "email", "") or "").strip().lower()
         try:
             session = await flow_ck.establish(
                 self._cookie_sessions, str(getattr(token, "google_cookies", "") or ""),
-                self._token_cookie_proxy(token), expected_email=getattr(token, "email", None),
+                proxy, expected_email=row_email or None,
                 token_id=getattr(token, "id", None),
                 user_agent=(getattr(token, "browser_user_agent", "") or None),
                 timeout=self._get_control_plane_timeout(),
             )
         except flow_ck.FlowCookieAuthError as e:
             raise FlowAPIError(401, str(e), "UNAUTHENTICATED") from e
+        if row_email and session.email != row_email:
+            # The row's stored cookies sign in as someone else: never serve this row with them.
+            raise FlowAPIError(401, f"UNAUTHENTICATED: stored Google cookies belong to {session.email}, not {row_email}",
+                               "UNAUTHENTICATED")
         self._cookie_sessions.alias(handle, session)
         return session
 
@@ -1523,15 +1531,18 @@ class FlowClient:
         try:
             payload = await flow_ck.call_rpc(session, rpc_id, argument, source_path=source_path,
                                              timeout=timeout, proxy=proxy_url, user_agent=user_agent)
-        except flow_ck.FlowCookieAuthError as e:
-            self._cookie_sessions.drop(session.handle)
-            raise FlowAPIError(401, str(e), "UNAUTHENTICATED") from e
+        except (flow_ck.FlowCookieAuthError, flow_ck.FlowIdentityError) as e:
+            # Forget exactly this session; a newer one of the same account (another handle) stays.
+            self._cookie_sessions.drop_session(session)
+            raise FlowAPIError(401, f"UNAUTHENTICATED: {e}" if isinstance(e, flow_ck.FlowIdentityError) else str(e),
+                               "UNAUTHENTICATED") from e
         except flow_ck.FlowRpcError as e:
             reason = e.code if e.code.startswith(("PUBLIC_ERROR_", "ERROR_")) else ""
             message = f"HTTP Error {e.status_code}: {e.code}"
             if "UNUSUAL_ACTIVITY" in e.code:
                 message += ": reCAPTCHA evaluation failed"
             api_error = FlowAPIError(e.status_code, message, reason)
+            api_error.flow_transient = bool(e.transient)
             api_error.flow_fail_class = self._classify_flow_fail(e.status_code, message)
             debug_logger.op_warning(
                 f"[FLOW_FAIL] class={api_error.flow_fail_class} rpc={rpc_id} http={e.status_code} "
@@ -1595,6 +1606,11 @@ class FlowClient:
             if token is None and session.email:
                 token = await self.db.get_token_by_email(session.email)
         tier = (getattr(token, "user_paygate_tier", None) or "").strip() if token else ""
+        if not tier:
+            # No stored tier (new row): Flow's 2nd credits number matched the stored tier on every account
+            # seen 2026-10-23 (Pro 51 -> 1, Ultra 55/85 -> 2). Anything else stays unknown.
+            raw = result.get("frontendRaw") or []
+            tier = {1: "PAYGATE_TIER_ONE", 2: "PAYGATE_TIER_TWO"}.get(raw[1] if len(raw) > 1 else None, "")
         if tier:
             result["userPaygateTier"] = tier
         debug_logger.log_info(
@@ -1607,11 +1623,19 @@ class FlowClient:
         if not project_id:
             raise RuntimeError("Image upload on the new Flow API needs a project id")
         session = await self._cookie_session_for_handle(at)
+        token_id = session.token_id
+        if token_id is None and self.db is not None and session.email:
+            row = await self.db.get_token_by_email(session.email)
+            token_id = getattr(row, "id", None) if row else None
+            session.token_id = token_id
+        if token_id is None:
+            # Without the account id the extension pool could mint on ANOTHER person's browser/IP.
+            raise RuntimeError("Image upload refused: this cookie session is not bound to an account yet")
         max_retries = max(1, int(config.flow_max_retries or 1))
         last_error: Optional[Exception] = None
         for retry_attempt in range(max_retries):
             recaptcha_token, browser_id = await self._get_recaptcha_token(
-                project_id, action="UPLOAD_IMAGE", token_id=session.token_id
+                project_id, action="UPLOAD_IMAGE", token_id=token_id
             )
             try:
                 if not recaptcha_token:
@@ -1670,11 +1694,13 @@ class FlowClient:
             await asyncio.sleep(1)
         raise last_error or RuntimeError("Flow createProject failed")
 
-    async def _download_signed_media(self, url: str) -> bytes:
-        """Fetch a signed flow-content.google link (no cookies needed) through the media proxy."""
-        proxy_url = None
-        if self.proxy_manager and hasattr(self.proxy_manager, "get_media_proxy_url"):
+    async def _download_signed_media(self, url: str, proxy_url: Optional[str] = None) -> bytes:
+        """Fetch a signed flow-content.google link (no cookies needed) through the account's proxy,
+        else the media proxy; never from the server's own IP."""
+        if not proxy_url and self.proxy_manager and hasattr(self.proxy_manager, "get_media_proxy_url"):
             proxy_url = await self.proxy_manager.get_media_proxy_url()
+        if not proxy_url:
+            raise RuntimeError("Signed media download refused: no account or media proxy (never fetch direct)")
         async with AsyncSession(trust_env=False) as http:
             response = await http.get(url, proxy=proxy_url, timeout=max(60, int(self.timeout or 60)),
                                       impersonate="chrome", allow_redirects=True)
@@ -2348,7 +2374,10 @@ class FlowClient:
                 encoded = result.get("encodedImage", "")
                 if not encoded and result.get("fifeUrl"):
                     # Flow web upsample (SPrCad) may answer with a signed link instead of bytes.
-                    encoded = base64.b64encode(await self._download_signed_media(result["fifeUrl"])).decode("ascii")
+                    session = self._cookie_sessions.get(at) if flow_ck.is_session_handle(at) else None
+                    encoded = base64.b64encode(await self._download_signed_media(
+                        result["fifeUrl"], proxy_url=(session.proxy if session else None)
+                    )).decode("ascii")
                 return encoded
             except Exception as e:
                 last_error = e

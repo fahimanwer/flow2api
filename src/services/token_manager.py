@@ -1470,6 +1470,9 @@ class TokenManager:
             return "st_expired"
         if self.flow_client._is_timeout_error(error) or self.flow_client._is_proxy_connection_error(error):
             return "network"
+        if getattr(error, "flow_transient", False) or "flow web temporarily unavailable" in str(error).lower():
+            # Cookie sessions (2026-10-23): Flow 5xx/403/changed page is an outage, not the login.
+            return "network"
         if self._is_auth_error(error):
             return "st_expired"
         return "unknown"
@@ -2009,6 +2012,14 @@ class TokenManager:
         not token validity. Counting them would auto-disable an otherwise-valid
         (often paid) token after a burst of transient reCAPTCHA rejections.
         """
+        if error_message and ("not supported on the new flow api" in error_message.lower()
+                              or "cannot be sent to the new flow api" in error_message.lower()
+                              or "flow web temporarily unavailable" in error_message.lower()):
+            # 2026-10-23 cookie sessions: a feature not mapped to the Flow web RPCs yet (Characters,
+            # video stitching), or Flow's web front end itself failing. Never the account.
+            debug_logger.log_info(f"[TOKEN] Token {token_id}: unsupported on the new Flow API (not counted): {str(error_message)[:120]}")
+            return
+
         if _is_capacity_or_solver_error(error_message):
             # Flow capacity / captcha-solver outage: not the account's fault and not its
             # IP reputation — no disable count, and no reCAPTCHA cooldown either.
