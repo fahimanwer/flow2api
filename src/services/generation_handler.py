@@ -1229,6 +1229,11 @@ UPSAMPLE_TRAFFIC_ATTEMPTS = 2
 UPSAMPLE_TRAFFIC_RETRY_DELAY_S = 10
 UPSAMPLE_TRAFFIC_COOLDOWN_MIN = 15
 
+
+CHARACTERS_UNAVAILABLE = (
+    "Flow Characters are not available since Google's Flow change of 2026-10-21 (the character API our server used was retired with the Labs login). Send the request without \"characters\", or describe the person in the prompt."
+)
+
 class GenerationHandler:
     """Unified generation handler"""
 
@@ -1956,6 +1961,11 @@ class GenerationHandler:
         # Flow Characters: validated and created BEFORE any upload or generation, so a bad
         # request or a Google-side setup failure costs nothing and is never an account strike.
         character_entities: Dict[str, str] = {}
+        if characters and str(getattr(token, "at", "") or "").startswith("FLOWCK."):
+            # Cookie sessions (2026-10-23): no Flow web RPC for characters yet; say so before any work.
+            self._mark_generation_failed(generation_result, CHARACTERS_UNAVAILABLE, caller_fault=True)
+            yield self._create_error_response(CHARACTERS_UNAVAILABLE, status_code=501)
+            return
         if characters:
             char_error = validate_characters(characters, MAX_CHARACTERS_IMAGE)
             if char_error:
@@ -2419,6 +2429,10 @@ class GenerationHandler:
                     yield self._create_error_response(error_msg, status_code=400)
                     return
 
+            if characters and str(getattr(token, "at", "") or "").startswith("FLOWCK."):
+                self._mark_generation_failed(generation_result, CHARACTERS_UNAVAILABLE, caller_fault=True)
+                yield self._create_error_response(CHARACTERS_UNAVAILABLE, status_code=501)
+                return
             if characters:
                 try:
                     characters_started_at = time.time()
@@ -2925,7 +2939,13 @@ class GenerationHandler:
                             )
 
                     # ========== Extend video concatenation ==========
-                    if extend_source_media_id and video_media_id:
+                    if extend_source_media_id and video_media_id and str(token.at or "").startswith("FLOWCK."):
+                        # Cookie sessions (2026-10-23): Flow's web app has no stitching RPC we know of
+                        # (upstream disables it too). Return the extension clip and say so.
+                        debug_logger.log_info("[CONCAT] stitching is not available on the new Flow API; returning the extension clip")
+                        if stream:
+                            yield self._create_stream_chunk("ℹ️ Stitching is not available since Google's Flow change; returning the extension clip\n")
+                    elif extend_source_media_id and video_media_id:
                         try:
                             if stream:
                                 yield self._create_stream_chunk("\nVideo extension complete, stitching full video...\n")

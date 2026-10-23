@@ -334,5 +334,49 @@ def test_server_mint_routing_breaker_opens_and_probes():
     svc._breaker_probe_at = __import__("time").monotonic() + 100
     assert not svc.routing_healthy()
     svc._breaker_probe_at = 0.0
-    assert svc.routing_healthy()       # one probe window
-    assert not svc.routing_healthy()   # then closed again until the next window
+    assert svc.routing_healthy()       # probe window open...
+    assert svc.routing_healthy()       # ...and filtering candidates does not use it up
+
+
+def test_fleet_watch_needs_a_success_to_report_recovery():
+    import asyncio
+    from src.services.fleet_watch import FleetWatch
+
+    pages = []
+    watch = FleetWatch(db=None)
+    numbers = iter([(20, 0, 5), (0, 0, 5), (3, 1, 5)])
+
+    async def fake_numbers():
+        return next(numbers)
+
+    async def fake_page(kind, text):
+        pages.append(kind)
+
+    watch._numbers, watch._page = fake_numbers, fake_page
+    asyncio.run(watch.check_once())   # 20 finished, none OK -> down
+    asyncio.run(watch.check_once())   # quiet: stays down, no "recovered"
+    asyncio.run(watch.check_once())   # a real success -> recovered
+    assert pages == ["fleet_down", "fleet_ok"]
+
+
+def test_signed_in_page_without_account_field_is_transient():
+    import asyncio
+    from unittest.mock import patch
+
+    class Resp:
+        status_code, headers = 200, {}
+        text = 'boq_labs-ai-sandbox-frontend_1 "FdrFJe":"-1" "SNlM0e":"tok"'
+
+    class Http:
+        cookies = type("C", (), {"jar": ck.CookieJar()})()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, *a, **k):
+            return Resp()
+
+    session = ck.FlowCookieSession(handle="h", email="", proxy="http://p", jar=ck.CookieJar(), source_fingerprint="f")
+    with patch.object(ck, "AsyncSession", lambda **kw: Http()):
+        with pytest.raises(ck.FlowTransientError):
+            asyncio.run(ck.load_bootstrap(session))

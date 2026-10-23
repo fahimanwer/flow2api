@@ -31,9 +31,11 @@ class FleetWatch:
 
     async def _numbers(self) -> Tuple[int, int, int]:
         async with self.db.connect() as conn:
+            # FINISHED requests by completion time (102 = still running: a burst of fresh video jobs is
+            # not an outage, and a job that started earlier but finished now is evidence).
             total, ok = await (await conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END), 0) "
-                "FROM request_logs WHERE created_at > datetime('now', ?)",
+                "FROM request_logs WHERE status_code != 102 AND COALESCE(updated_at, created_at) > datetime('now', ?)",
                 (f"-{WINDOW_MINUTES} minutes",),
             )).fetchone()
             active = (await (await conn.execute("SELECT COUNT(*) FROM tokens WHERE is_active = 1")).fetchone())[0]
@@ -65,14 +67,17 @@ class FleetWatch:
         total, ok, active = await self._numbers()
         problem = self.diagnose(total, ok, active)
         now = time.monotonic()
-        if problem and (self._problem is None or now - self._last_page_at >= REMIND_SECONDS):
-            await self._page("fleet_down", ("STILL DOWN: " if self._problem else "") + problem)
-            self._last_page_at = now
-        elif problem is None and self._problem is not None:
-            await self._page("fleet_ok", f"flow2api recovered: {ok} of {total} requests OK in the last "
+        if problem:
+            if self._problem is None or now - self._last_page_at >= REMIND_SECONDS:
+                await self._page("fleet_down", ("STILL DOWN: " if self._problem else "") + problem)
+                self._last_page_at = now
+            self._problem = problem
+        elif self._problem is not None and ok > 0 and active > 0:
+            # Recovery needs evidence (a real success); quiet traffic keeps the outage open, silently.
+            await self._page("fleet_ok", f"flow2api recovered: {ok} of {total} finished requests OK in the last "
                                          f"{WINDOW_MINUTES} min, {active} active accounts.")
-        self._problem = problem
-        return problem
+            self._problem = None
+        return self._problem
 
     def start(self) -> None:
         async def _loop():

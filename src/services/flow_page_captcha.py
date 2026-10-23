@@ -194,16 +194,12 @@ class FlowPageCaptchaService:
     # ------------------------------------------------------------ capability
     def routing_healthy(self) -> bool:
         """May the load balancer pick an account ONLY because this service could mint for it? False after
-        ROUTING_BREAKER_FAILURES failed mints in a row; every ROUTING_BREAKER_PROBE_SECONDS one window opens
-        again so a recovered minter is noticed (a successful mint closes the breaker)."""
-        failures = getattr(self, "_consecutive_failures", 0)
-        if failures < ROUTING_BREAKER_FAILURES:
+        ROUTING_BREAKER_FAILURES failed mints in a row, until the probe time; then True until a mint actually
+        STARTS (mint() moves the probe time), so filtering candidates never uses up the probe window.
+        A successful mint closes the breaker."""
+        if getattr(self, "_consecutive_failures", 0) < ROUTING_BREAKER_FAILURES:
             return True
-        now = time.monotonic()
-        if now >= getattr(self, "_breaker_probe_at", 0.0):
-            self._breaker_probe_at = now + ROUTING_BREAKER_PROBE_SECONDS
-            return True
-        return False
+        return time.monotonic() >= getattr(self, "_breaker_probe_at", 0.0)
 
     def is_available(self) -> bool:
         """Cheap, cached: can this process mint at all? Never launches a browser."""
@@ -285,6 +281,9 @@ class FlowPageCaptchaService:
             debug_logger.op_warning(f"[FALLBACK_MINT] token={token_id} no usable proxy; refusing to mint from the server IP")
             return None
         started = time.monotonic()
+        if getattr(self, "_consecutive_failures", 0) >= ROUTING_BREAKER_FAILURES:
+            # Breaker open: this mint is the probe; the next window opens only after the probe period.
+            self._breaker_probe_at = started + ROUTING_BREAKER_PROBE_SECONDS
         deadline = deadline_at if deadline_at is not None else started + DEFAULT_MINT_DEADLINE_SECONDS
         egress = mask_proxy_url(proxy_url)
         outcome = "fail"
