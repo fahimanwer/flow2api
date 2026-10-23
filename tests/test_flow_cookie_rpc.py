@@ -223,3 +223,30 @@ def test_reply_cookies_are_kept_but_never_overwrite_a_newer_value():
 def test_transient_flow_errors_carry_the_marker():
     err = ck.FlowTransientError("Flow bootstrap answered HTTP 503")
     assert ck.TRANSIENT_MARKER in str(err) and not isinstance(err, ck.FlowCookieAuthError)
+
+
+def test_session_built_before_a_cookie_clear_never_serves():
+    import time as _t
+    reg = ck.FlowCookieSessions()
+    in_flight = _session("a@x.com")          # an ON push started building this...
+    _t.sleep(0.01)
+    reg.drop_email("a@x.com")                 # ...then the OFF landed
+    reg.put(in_flight)                        # the ON push finishes afterwards
+    assert reg.get(in_flight.handle) is None
+    reg.alias("FLOWCK.db.handle", in_flight)
+    assert reg.get("FLOWCK.db.handle") is None
+    _t.sleep(0.01)
+    fresh = _session("a@x.com")               # a later ON works again
+    reg.put(fresh)
+    assert reg.get(fresh.handle) is fresh
+
+
+def test_network_failures_become_transient_and_keep_their_text():
+    import asyncio
+
+    async def boom():
+        raise OSError("curl: (56) Recv failure: Connection reset by peer")
+
+    with pytest.raises(ck.FlowTransientError) as err:
+        asyncio.run(ck._network(boom()))
+    assert "curl: (56)" in str(err.value) and ck.TRANSIENT_MARKER in str(err.value)

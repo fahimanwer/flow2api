@@ -278,8 +278,13 @@ class FlowCookieSessions:
 
     def __init__(self):
         self._by_handle: Dict[str, FlowCookieSession] = {}
+        # email -> when its cookies were cleared. A session created before that (e.g. by an ON push
+        # still in flight when the OFF landed) is dead even if a later write points at it.
+        self._revoked_at: Dict[str, float] = {}
 
     def _expired(self, session: FlowCookieSession) -> bool:
+        if session.created_at <= self._revoked_at.get(session.email, 0.0):
+            return True
         return time.time() - session.last_used_at > SESSION_TTL_SECONDS
 
     def get(self, handle: str) -> Optional[FlowCookieSession]:
@@ -321,6 +326,8 @@ class FlowCookieSessions:
                 self._forget(session)
 
     def put(self, session: FlowCookieSession) -> None:
+        if self._expired(session):
+            return  # built from cookies that were cleared meanwhile
         self._make_room()
         self._by_handle[session.handle] = session
 
@@ -338,8 +345,10 @@ class FlowCookieSessions:
         self._forget(session)
 
     def drop_email(self, email: str) -> None:
-        """The account's cookies were cleared: no session of it may serve another request."""
+        """The account's cookies were cleared: no session of it may serve another request, including
+        one an in-flight push finishes building afterwards."""
         email = (email or "").strip().lower()
+        self._revoked_at[email] = time.time()
         for session in self.sessions():
             if session.email == email:
                 self._forget(session)
@@ -383,8 +392,8 @@ async def load_bootstrap(
     response = None
     async with AsyncSession(trust_env=False, cookies=session.jar, impersonate=impersonate) as http:
         for _ in range(10):
-            response = await http.get(url, headers=headers, proxy=session.proxy,
-                                      timeout=max(10, min(int(timeout or 30), 45)), allow_redirects=False)
+            response = await _network(http.get(url, headers=headers, proxy=session.proxy,
+                                               timeout=max(10, min(int(timeout or 30), 45)), allow_redirects=False))
             location = response.headers.get("location") or ""
             if not (300 <= response.status_code < 400 and location):
                 break
@@ -427,6 +436,16 @@ async def load_bootstrap(
     session.xsrf = _json_unescape(xsrf.group(1)) if xsrf else ""
     session.email = email
     session.bootstrap_at = time.time()
+
+
+async def _network(request):
+    """Await one HTTP call; a transport failure (reset, TLS, proxy, timeout) becomes FlowTransientError
+    with the original text kept, so timeout/retry classifiers still recognise it and no account is
+    struck or disabled for a network blip."""
+    try:
+        return await request
+    except Exception as e:
+        raise FlowTransientError(f"network error talking to Google: {type(e).__name__}: {e}") from e
 
 
 def _json_unescape(value: str) -> str:
@@ -511,14 +530,14 @@ async def call_rpc(
     for cookie in list(session.jar):
         jar_copy.set_cookie(copy.copy(cookie))
     async with AsyncSession(trust_env=False, cookies=jar_copy, impersonate=impersonate) as http:
-        response = await http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout)
+        response = await _network(http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout))
         text = response.text
         xsrf = _XSRF_RPC_RE.search(text or "")
         if xsrf and response.status_code < 500:
             # Google rotated the page token: retry once with the one it handed back.
             session.xsrf = _json_unescape(xsrf.group(1))
             fields["at"] = session.xsrf
-            response = await http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout)
+            response = await _network(http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout))
             text = response.text
         _merge_changed(session.jar, before, http.cookies.jar)
     if response.status_code == 401 and "wrb.fr" not in (text or ""):
