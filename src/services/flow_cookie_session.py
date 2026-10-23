@@ -18,6 +18,7 @@ keeps in the old access-token slot, so routing, health and push logic above the 
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import random
@@ -66,6 +67,19 @@ class FlowCookieAuthError(Exception):
         self.reason = "UNAUTHENTICATED"
 
 
+TRANSIENT_MARKER = "Flow web temporarily unavailable"
+
+
+class FlowTransientError(RuntimeError):
+    """Google/Flow could not be reached properly (5xx, 403, changed page). Never a verdict on the
+    login: it must not disable the account or count as a strike (the marker text is checked)."""
+
+    flow_transient = True
+
+    def __init__(self, message: str):
+        super().__init__(f"{TRANSIENT_MARKER}: {message}")
+
+
 class FlowIdentityError(Exception):
     """The cookies log in to a different Google account than the session / row expects."""
 
@@ -73,10 +87,12 @@ class FlowIdentityError(Exception):
 class FlowRpcError(Exception):
     """A batchexecute call Google answered with an error (not a transport failure)."""
 
-    def __init__(self, rpc_id: str, code: str, status_code: int = 400):
+    def __init__(self, rpc_id: str, code: str, status_code: int = 400, transient: bool = False):
         self.rpc_id = rpc_id
         self.code = str(code)
         self.status_code = status_code
+        # True for an HTTP-level failure (no Google error code): an outage/edge refusal, not the account.
+        self.transient = transient
         super().__init__(f"Flow RPC {rpc_id} rejected: {self.code}")
 
 
@@ -279,11 +295,14 @@ class FlowCookieSessions:
             unique[id(session)] = session
         return list(unique.values())
 
-    def find(self, email: str, source_fingerprint: str, proxy: Optional[str]) -> Optional[FlowCookieSession]:
+    def find(self, email: str, source_fingerprint: str, proxy: Optional[str],
+             token_id: Optional[int] = None) -> Optional[FlowCookieSession]:
+        """A live session for exactly these cookies + proxy (+ row, when the session is bound to one)."""
         email = (email or "").strip().lower()
         for session in self.sessions():
             if (session.email == email and session.source_fingerprint == source_fingerprint
-                    and session.proxy == proxy and not self._expired(session)):
+                    and session.proxy == proxy and not self._expired(session)
+                    and (token_id is None or session.token_id in (None, token_id))):
                 return session
         return None
 
@@ -374,28 +393,28 @@ async def load_bootstrap(
             if urlparse(url).scheme != "https" or host not in BOUNCE_HOSTS:
                 raise FlowCookieAuthError(f"Flow login bounced off Google to {host or 'nowhere'}")
         else:
-            raise RuntimeError("Flow cookie login exceeded the redirect limit")
+            raise FlowTransientError("the Flow login exceeded the redirect limit")
         _merge_jar(session.jar, http.cookies.jar)
     final_host = (urlparse(url).hostname or "").lower()
     text = response.text if response is not None else ""
     status = getattr(response, "status_code", 0) or 0
     if response is None:
-        raise RuntimeError("Flow bootstrap got no response")
+        raise FlowTransientError("Flow bootstrap got no response")
     if final_host != FLOW_HOST:
         if status < 400:
             raise FlowCookieAuthError(
                 f"Google showed a sign-in page ({final_host}) instead of Flow; the browser must push fresh cookies"
             )
-        raise RuntimeError(f"Flow login bounce failed on {final_host}: HTTP {status}")
+        raise FlowTransientError(f"the Flow login bounce failed on {final_host}: HTTP {status}")
     if status == 401:
         raise FlowCookieAuthError("Flow answered HTTP 401 to the login")
     if status >= 400:
-        raise RuntimeError(f"Flow bootstrap failed: HTTP {status}")
+        raise FlowTransientError(f"Flow bootstrap answered HTTP {status}")
     bl = _BL_RE.search(text)
     fsid = _FSID_RE.search(text)
     email = _find_email(text)
     if not bl or not fsid:
-        raise RuntimeError("Flow page loaded without its bootstrap data (bl / f.sid); Google may have changed the page")
+        raise FlowTransientError("Flow page loaded without its bootstrap data (bl / f.sid); Google may have changed the page")
     if not email:
         # The full Flow app, but signed OUT (no login bounce, no account). Seen 2026-10-23 on device-bound
         # (DBSC, __Secure-1PSIDRTS) logins whose copied cookies went stale: a real "log in again" verdict.
@@ -422,6 +441,26 @@ def _merge_jar(target: CookieJar, source: CookieJar) -> None:
         return
     for cookie in source:
         target.set_cookie(cookie)
+
+
+def _cookie_key(cookie) -> tuple:
+    return (cookie.domain, cookie.path, cookie.name)
+
+
+def _jar_values(jar: CookieJar) -> Dict[tuple, str]:
+    return {_cookie_key(c): c.value for c in list(jar)}
+
+
+def _merge_changed(target: CookieJar, before: Dict[tuple, str], after: CookieJar) -> None:
+    """Write back the cookies a reply changed, each only if the shared jar still holds the value
+    this request started with (another request may have rotated it already)."""
+    current = _jar_values(target)
+    for cookie in list(after):
+        key = _cookie_key(cookie)
+        if before.get(key) == cookie.value:
+            continue  # unchanged by this reply
+        if current.get(key) == before.get(key):
+            target.set_cookie(copy.copy(cookie))
 
 
 async def call_rpc(
@@ -464,11 +503,13 @@ async def call_rpc(
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
     }
-    # The RPC runs on a COPY of the jar: cookie changes are taken only from the locked page load, so
-    # parallel RPCs of one account cannot write an older cookie value over a newer one.
+    # The RPC runs on a COPY of the jar; afterwards each cookie Google changed is written back only if
+    # nobody changed that cookie meanwhile (compare-and-set), so a rotation is kept and a slower
+    # parallel reply can never write an older value over a newer one.
+    before = _jar_values(session.jar)
     jar_copy = CookieJar()
     for cookie in list(session.jar):
-        jar_copy.set_cookie(cookie)
+        jar_copy.set_cookie(copy.copy(cookie))
     async with AsyncSession(trust_env=False, cookies=jar_copy, impersonate=impersonate) as http:
         response = await http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout)
         text = response.text
@@ -479,13 +520,15 @@ async def call_rpc(
             fields["at"] = session.xsrf
             response = await http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout)
             text = response.text
+        _merge_changed(session.jar, before, http.cookies.jar)
     if response.status_code == 401 and "wrb.fr" not in (text or ""):
         # Reload the page next time: if the login is really dead the reload lands on accounts.google.com.
         session.bootstrap_at = 0.0
         raise FlowCookieAuthError(f"Flow RPC {rpc_id} answered HTTP 401")
     if response.status_code >= 400:
         session.bootstrap_at = 0.0
-        raise FlowRpcError(rpc_id, f"HTTP {response.status_code}: {(text or '')[:160]}", status_code=response.status_code)
+        raise FlowRpcError(rpc_id, f"{TRANSIENT_MARKER} (HTTP {response.status_code}): {(text or '')[:120]}",
+                           status_code=response.status_code, transient=True)
     return extract_rpc_payload(parse_batchexecute_frames(text), rpc_id)
 
 
@@ -507,7 +550,7 @@ async def establish(
     fingerprint = cookies_fingerprint(google_cookies)
     expected = (expected_email or "").strip().lower()
     if expected:
-        existing = registry.find(expected, fingerprint, proxy)
+        existing = registry.find(expected, fingerprint, proxy, token_id=token_id)
         if existing and existing.bootstrap_fresh():
             existing.last_used_at = time.time()
             if token_id is not None and existing.token_id is None:

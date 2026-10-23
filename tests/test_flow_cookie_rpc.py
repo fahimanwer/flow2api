@@ -193,3 +193,33 @@ def test_signed_out_flow_page_is_a_login_verdict_but_a_changed_page_is_not():
     with pytest.raises(RuntimeError) as err:
         run("busy", status=503)
     assert not isinstance(err.value, ck.FlowCookieAuthError)
+
+
+def test_reuse_never_crosses_rows_with_the_same_email():
+    reg = ck.FlowCookieSessions()
+    bound = _session("a@x.com")
+    bound.token_id = 17
+    reg.put(bound)
+    assert reg.find("a@x.com", "f", "p", token_id=17) is bound
+    assert reg.find("a@x.com", "f", "p", token_id=18) is None
+
+
+def test_reply_cookies_are_kept_but_never_overwrite_a_newer_value():
+    def jar(**values):
+        j = ck.CookieJar()
+        for name, value in values.items():
+            j.set_cookie(ck._cookie(name, value, "flow.google.com"))
+        return j
+
+    shared = jar(OSID="v1", NID="n1")
+    before = ck._jar_values(shared)
+    # This reply rotated OSID and NID; meanwhile another reply already rotated NID to n2.
+    shared.set_cookie(ck._cookie("NID", "n2", "flow.google.com"))
+    ck._merge_changed(shared, before, jar(OSID="v2", NID="n-old-reply"))
+    values = {c.name: c.value for c in shared}
+    assert values == {"OSID": "v2", "NID": "n2"}
+
+
+def test_transient_flow_errors_carry_the_marker():
+    err = ck.FlowTransientError("Flow bootstrap answered HTTP 503")
+    assert ck.TRANSIENT_MARKER in str(err) and not isinstance(err, ck.FlowCookieAuthError)

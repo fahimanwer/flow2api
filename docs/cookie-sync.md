@@ -1,5 +1,11 @@
 # Cookie sync — "Keep working when I'm away" (worker extension 3.7.0, 2026-09-23)
 
+> **Since 2026-10-23 these cookies ARE the Flow login.** Google retired the Labs session API
+> (`labs.google/fx/api/auth/session` → "Authentication endpoint has been deprecated and disabled",
+> `/api/auth/csrf` → 410, from ~2026-10-21 19:35 UTC). The server now logs in to flow.google.com
+> with the pushed `google_cookies` and calls Flow's web RPCs; see "How the server uses it" below.
+> An account whose worker never pushes cookies (switch OFF, extension < 3.7.0) cannot work at all.
+
 ## The problem it solves
 
 To generate on an account the server needs three things: a valid Google Labs session (`st`),
@@ -51,30 +57,43 @@ When the switch is ON the push also repeats whenever Google rotates a login cook
 (`SID`, `HSID`, `SSID`, `LSID`, `__Secure-1PSID/3PSID`, `__Secure-1PSIDTS/3PSIDTS`), debounced
 30 s and at most once per 10 min, on top of the hourly session push.
 
-## How the server uses it
+## How the server uses it (cookie sessions, 2026-10-23)
 
-1. `plugin_update_token`: a valid `session_token` is verified as before (validate-then-promote).
-   If the pushed session is dead (Labs answers 401 or "no session"), missing, or its grant is
-   stale (`at_stale`) and cookies were sent, the server first checks whether the row already
-   holds a newer working session (from an earlier push or the healer) and reuses it; only
-   then does it replay the Google login (one at a time per account, inside a 23 s budget).
-   A transport failure talking to Google is a 503 (the worker retries), never a login replay.
-   Cookies are stored whenever the push proved the account's email, also on `at_stale`; a
-   failed cookie login for a dead session answers 400 and stores nothing.
-2. `TokenManager._try_protocol_refresh_st`: tried first whenever an access-token refresh fails
-   (`_do_refresh_at` recovery attempt 1, before asking the extension). The login goes through
-   `tokens.proxy_url` if set, else the account's `redeem_proxy_url` — never the datacenter IP.
-3. Background healer (`run_protocol_refresh_once`, every 60 s, gated by the admin
-   "protocol refresh" switch and `refresh_interval_minutes`): re-logs in ONLY accounts that are
-   disabled for a dead session (`auto_st_expired` / `auto_at_stale`). Active accounts are healed
-   on demand; a periodic Google login for 36 healthy accounts would only invite risk flags.
-4. If Google refuses the replay (`signin/rejected`, expired cookies), the account behaves as
-   before: it waits for the next extension push. Nothing regresses.
+Code: `src/services/flow_cookie_session.py` (login + transport), `src/services/flow_rpc.py` and
+`flow_rpc_video.py` (REST → RPC translation), hooks in `FlowClient.st_to_at` / `_make_request`.
+
+1. **Login.** The `{name, value}` list is split: `LSID`, `ACCOUNT_CHOOSER`, `OTZ`, `__Host-*` on
+   `accounts.google.com`, the rest on `.google.com`. `GET flow.google.com/projects` through the
+   account's proxy (`proxy_url`, else `redeem_proxy_url`; never direct) bounces through
+   `accounts.google.com/ServiceLogin` and `flow.google.com/accounts/SetOSID`, which gives the
+   server its own `OSID` / `__Secure-OSID`. The account is read from the page's `oPEP7c` field
+   only, and must equal the row's email.
+2. **The account's `at` is a handle** (`FLOWCK.<email hash>.<random>`) onto that in-memory session.
+   Every session has its own handle, so a session built while checking a push serves nothing
+   until the guarded DB write (Ultra ownership, account match) stores it. After a restart the
+   handle in the DB is rebuilt from the stored cookies.
+3. **Calls.** `_make_request` turns each aisandbox REST call into the Flow web RPC: credits
+   `nzlxg`, image `ogiZ0b`, upload `maseQ` (own `UPLOAD_IMAGE` captcha), 2K/4K `SPrCad`, project
+   `jHPbke`, videos `YhhmEf`/`MZZa6b`/`nprQif`/`eb1hJf`/`fZytfe`/`p0UkFb`, status `jwpduf` + `as29s`.
+   The image request was compared slot by slot with a HAR of the real Flow web app (2026-10-23).
+4. **Push** (`plugin_update_token`): cookie-only pushes are validated by a Flow login with the
+   PUSHED cookies; no Labs login is ever replayed. The row keeps its `st` value as a key.
+5. **Logged out** = Google shows a sign-in page, answers 401, or Flow shows its signed-out app
+   page. Server errors, a 403 or a changed page are retry-later errors and never disable an account.
+6. **Tier** is never guessed: the stored tier wins; a new row takes Flow's 2nd credits number
+   (1 = Pro, 2 = Ultra, matching every account seen on 2026-10-23).
+7. `FLOW_COOKIE_RPC=0` restores the retired Labs path (useful only if Google brings it back).
+
+Not on the new API yet (clear 501, never an account strike): Flow Characters, stitching an
+extended video.
 
 ## Limits
 
 - Google can end the login itself (sign-out everywhere, risk engine). Then only a human login
   in Chrome helps; the next push shares the new cookies.
-- The server's login is one HTTP replay per dead session, through the account's proxy. Google
-  may still score it lower than a real browser; the live test on 2026-09-23 is the reference.
-- Old extensions (≤ 3.6.4) keep working unchanged; they simply never send cookies.
+- Device-bound logins (DBSC): 26 of 36 stored cookie sets on 2026-10-23 carry `__Secure-1PSIDRTS` /
+  `__Secure-STRP`. Copied cookies of such a login go stale (Flow shows its signed-out page; seen on
+  account 51 about an hour after its last push). The extension re-pushes when Google rotates the
+  login cookie (at most every 10 min) and hourly. UNKNOWN until measured: how long a server session
+  made from fresh cookies keeps working (experiment `tmp/dbsc_lifetime_1023.py`, 2026-10-23).
+- Old extensions (≤ 3.6.4) never send cookies, so since 2026-10-23 their accounts cannot work.

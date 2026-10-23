@@ -3263,6 +3263,14 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
     else:
         existing_token = await db.get_token_by_email(email)
 
+    if cookie_mode and existing_token is not None and cookie_seq:
+        # The cookies are the credential now: a push older than the stored cookie state (a late retry,
+        # or an ON overtaken by a newer OFF) must not promote a session the cookie write would refuse.
+        stored_seq = int(getattr(existing_token, "google_cookies_seq", 0) or 0)
+        if cookie_seq < stored_seq:
+            debug_logger.log_info(f"[COOKIE_SYNC] token={existing_token.id} stale push ignored (seq {cookie_seq} < {stored_seq})")
+            raise HTTPException(status_code=503, detail="stale cookie push (an older cookie_sync_seq); the next push carries the current state")
+
     if cookie_mode and not session_token:
         # Cookie-only push: tokens.st is UNIQUE NOT NULL and no longer a Google credential. Keep the
         # row's value; a brand-new row gets a per-account placeholder.

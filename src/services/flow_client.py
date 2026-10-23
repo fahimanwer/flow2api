@@ -1542,6 +1542,7 @@ class FlowClient:
             if "UNUSUAL_ACTIVITY" in e.code:
                 message += ": reCAPTCHA evaluation failed"
             api_error = FlowAPIError(e.status_code, message, reason)
+            api_error.flow_transient = bool(e.transient)
             api_error.flow_fail_class = self._classify_flow_fail(e.status_code, message)
             debug_logger.op_warning(
                 f"[FLOW_FAIL] class={api_error.flow_fail_class} rpc={rpc_id} http={e.status_code} "
