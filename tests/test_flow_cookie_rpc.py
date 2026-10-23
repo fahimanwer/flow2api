@@ -82,7 +82,9 @@ def test_image_translation_matches_upstream_layout():
     req = arg[1][0]
     assert req[2] == [["11111111-1111-1111-1111-111111111111", None, None, None, 1]]
     assert req[3] == 42 and req[4] == 2 and req[5] == "BELUGA" and req[7] == context
-    assert req[8] == [[["a cat"]]] and arg[4] == [req[12]]
+    assert req[8] == [[["a cat"]]]
+    # Real Flow web app (HAR 2026-10-23): its own batch id, not the request's session id.
+    assert len(arg[4]) == 1 and flow_rpc.UUID_RE.fullmatch(arg[4][0]) and arg[4][0] != req[12]
 
 
 def test_image_translation_refuses_characters_and_unknown_models():

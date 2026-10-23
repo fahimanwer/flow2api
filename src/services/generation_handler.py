@@ -1293,8 +1293,11 @@ class GenerationHandler:
             or (operation.get("operation") or {}).get("name")
         )
 
-        video_url = ""
-        if media_name and getattr(token, "st", None):
+        # Cookie sessions (2026-10-23): the status RPC already carries the signed flow-content link; the
+        # Labs media redirect below needs the retired Labs session, so it is only the legacy fallback.
+        video_url = str(video_info.get("fifeUrl") or "").strip()
+        cookie_session = str(getattr(token, "at", "") or "").startswith("FLOWCK.")
+        if not video_url and not cookie_session and media_name and getattr(token, "st", None):
             video_url = await self.flow_client.get_media_url_redirect(
                 token.st,
                 media_name,
