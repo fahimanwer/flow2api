@@ -1,8 +1,10 @@
 """Flow API Client for VideoFX (Veo)"""
 import asyncio
 import json
+import os
 import contextvars
 import time
+from datetime import datetime, timedelta, timezone
 import uuid
 import urllib.parse
 import random
@@ -17,6 +19,8 @@ import urllib.request
 from curl_cffi.requests import AsyncSession
 from ..core.logger import debug_logger, mask_proxy_url
 from ..core.config import config, get_yescaptcha_min_score
+from . import flow_cookie_session as flow_ck
+from .flow_rpc import CookieModeUnsupported, build_create_project_argument, extract_project_id, translate_request
 
 try:
     import httpx
@@ -181,6 +185,16 @@ class FlowClient:
             "flow_mint_token_id", default=None
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
+        # 2026-10-23 cookie sessions (flow_cookie_session.py): Google retired the Labs ST->AT API,
+        # so an account's "AT" is now a FLOWCK.* handle onto a flow.google.com cookie session.
+        # hint = cookies a worker just pushed (admin push endpoint); token = the row being worked on.
+        self._cookie_sessions = flow_ck.FlowCookieSessions()
+        self._cookie_hint_ctx: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+            "flow_cookie_hint", default=None
+        )
+        self._cookie_token_ctx: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+            "flow_cookie_token", default=None
+        )
 
         # Minimal browser-style headers only (what current Flow upstream still expects).
         # UA / Accept-Language / UA-CH all come from the runtime fingerprint bound to
@@ -531,6 +545,18 @@ class FlowClient:
     ) -> Dict[str, Any]:
         """Shared HTTP request handler"""
         fingerprint = self._request_fingerprint_ctx.get()
+
+        if use_at and flow_ck.is_session_handle(at_token) and url.startswith(self.api_base_url):
+            # Cookie session (2026-10-23): the REST endpoint is gone for us; run the same call as a
+            # flow.google.com RPC through the captcha fingerprint's proxy (the mint's egress), else the
+            # account's own proxy. Never the global/media proxy: the cookie login lives on the account IP.
+            fp = fingerprint if isinstance(fingerprint, dict) and respect_fingerprint_proxy else {}
+            return await self._cookie_rpc_request(
+                method, url, json_data, at_token,
+                proxy_url=(fp.get("proxy_url") or None),
+                user_agent=(fp.get("user_agent") or None),
+                timeout=timeout or self.timeout,
+            )
 
         proxy_url = None
         if not force_no_proxy:
@@ -1386,6 +1412,254 @@ class FlowClient:
             raise last_error
         raise RuntimeError("Image generation request failed")
 
+    # ========== Cookie sessions (2026-10-23) ==========
+
+    def cookie_rpc_enabled(self) -> bool:
+        """flow.google.com cookie sessions replace the retired Labs ST->AT API. Default ON;
+        FLOW_COOKIE_RPC=0 restores the old path (only useful if Google brings it back)."""
+        return os.environ.get("FLOW_COOKIE_RPC", "1").strip().lower() not in ("0", "false", "off", "no")
+
+    def set_cookie_hint(self, google_cookies: Optional[str], proxy: Optional[str],
+                        user_agent: Optional[str] = None):
+        """Cookies a worker just pushed: used by st_to_at in this request before stored ones."""
+        hint = {"google_cookies": google_cookies, "proxy": proxy, "user_agent": user_agent} if google_cookies else None
+        return self._cookie_hint_ctx.set(hint)
+
+    def reset_cookie_hint(self, reset_token) -> None:
+        self._cookie_hint_ctx.reset(reset_token)
+
+    def set_cookie_token(self, token: Any):
+        return self._cookie_token_ctx.set(token)
+
+    def reset_cookie_token(self, reset_token) -> None:
+        self._cookie_token_ctx.reset(reset_token)
+
+    @staticmethod
+    def _token_cookie_proxy(token: Any) -> Optional[str]:
+        """Same rule as TokenManager.cookie_login_proxy: protocol proxy, else the redeem proxy, never direct."""
+        from .protocol_login import _normalize_proxy_url
+        for candidate in (getattr(token, "proxy_url", None), getattr(token, "redeem_proxy_url", None)):
+            normalized = _normalize_proxy_url(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    async def _cookie_source_for_st(self, st: str) -> Dict[str, Any]:
+        """Which Google cookies / proxy / account a cookie-mode st_to_at(st) must use."""
+        hint = self._cookie_hint_ctx.get()
+        token = self._cookie_token_ctx.get()
+        if token is None and st and self.db is not None:
+            token = await self.db.get_token_by_st(st)
+        source: Dict[str, Any] = {
+            "google_cookies": str(getattr(token, "google_cookies", "") or "") if token else "",
+            "proxy": self._token_cookie_proxy(token) if token else None,
+            "email": (getattr(token, "email", "") or "") if token else "",
+            "token_id": getattr(token, "id", None) if token else None,
+            "user_agent": (getattr(token, "browser_user_agent", "") or None) if token else None,
+        }
+        if hint:
+            from .protocol_login import _normalize_proxy_url
+            source["google_cookies"] = hint["google_cookies"]
+            source["proxy"] = _normalize_proxy_url(hint.get("proxy")) or source["proxy"]
+            source["user_agent"] = hint.get("user_agent") or source["user_agent"]
+            # A pushed login proves its own identity; the row's email is only a preference.
+        return source
+
+    async def _cookie_st_to_at(self, st: str) -> dict:
+        source = await self._cookie_source_for_st(st)
+        if not source["google_cookies"]:
+            raise FlowAPIError(401, "UNAUTHENTICATED: no Google cookies stored for this account; "
+                                    "the worker browser must push its login (cookie sync ON)", "UNAUTHENTICATED")
+        if not source["proxy"]:
+            # Not a verdict on the login (no 401): the worker retries once it reports its proxy.
+            raise RuntimeError("Flow cookie login skipped: no proxy known for this account (never log in direct)")
+        try:
+            session = await flow_ck.establish(
+                self._cookie_sessions, source["google_cookies"], source["proxy"],
+                expected_email=source["email"] or None, token_id=source["token_id"],
+                user_agent=source["user_agent"], timeout=self._get_control_plane_timeout(),
+            )
+        except flow_ck.FlowCookieAuthError as e:
+            debug_logger.op_warning(f"[COOKIE_SESSION] token={source['token_id']} login refused: {str(e)[:160]}")
+            raise FlowAPIError(401, str(e), "UNAUTHENTICATED") from e
+        # 3 h, not 55 min: token_manager refreshes anything under 60 min before its validation cache,
+        # so 55 min would re-login on every check. A dead login still surfaces as 401 on the next RPC.
+        expires = datetime.now(timezone.utc) + timedelta(hours=3)
+        debug_logger.log_info(f"[COOKIE_SESSION] token={source['token_id']} signed in to Flow as {session.email}")
+        return {
+            "access_token": session.handle,
+            "expires": expires.isoformat().replace("+00:00", "Z"),
+            "user": {"email": session.email, "name": session.email},
+            "cookie_session": True,
+        }
+
+    async def _cookie_session_for_handle(self, handle: str) -> "flow_ck.FlowCookieSession":
+        session = self._cookie_sessions.get(handle)
+        if session is not None:
+            return session
+        token = self._cookie_token_ctx.get()
+        if (token is None or getattr(token, "at", None) != handle) and self.db is not None:
+            token = await self.db.get_token_by_at(handle)
+        if token is None:
+            raise FlowAPIError(401, "UNAUTHENTICATED: unknown cookie session; refresh the account", "UNAUTHENTICATED")
+        try:
+            session = await flow_ck.establish(
+                self._cookie_sessions, str(getattr(token, "google_cookies", "") or ""),
+                self._token_cookie_proxy(token), expected_email=getattr(token, "email", None),
+                token_id=getattr(token, "id", None),
+                user_agent=(getattr(token, "browser_user_agent", "") or None),
+                timeout=self._get_control_plane_timeout(),
+            )
+        except flow_ck.FlowCookieAuthError as e:
+            raise FlowAPIError(401, str(e), "UNAUTHENTICATED") from e
+        self._cookie_sessions.alias(handle, session)
+        return session
+
+    async def _cookie_rpc_call(self, session, rpc_id: str, argument: Any, source_path: str,
+                               timeout: int, proxy_url: Optional[str] = None,
+                               user_agent: Optional[str] = None) -> Any:
+        """One RPC with Google's answers mapped onto FlowAPIError (same classes as the REST path)."""
+        started = time.time()
+        try:
+            payload = await flow_ck.call_rpc(session, rpc_id, argument, source_path=source_path,
+                                             timeout=timeout, proxy=proxy_url, user_agent=user_agent)
+        except flow_ck.FlowCookieAuthError as e:
+            self._cookie_sessions.drop(session.handle)
+            raise FlowAPIError(401, str(e), "UNAUTHENTICATED") from e
+        except flow_ck.FlowRpcError as e:
+            reason = e.code if e.code.startswith(("PUBLIC_ERROR_", "ERROR_")) else ""
+            message = f"HTTP Error {e.status_code}: {e.code}"
+            if "UNUSUAL_ACTIVITY" in e.code:
+                message += ": reCAPTCHA evaluation failed"
+            api_error = FlowAPIError(e.status_code, message, reason)
+            api_error.flow_fail_class = self._classify_flow_fail(e.status_code, message)
+            debug_logger.op_warning(
+                f"[FLOW_FAIL] class={api_error.flow_fail_class} rpc={rpc_id} http={e.status_code} "
+                f"egress={mask_proxy_url(proxy_url or session.proxy)} reason={e.code[:160]}"
+            )
+            raise api_error from e
+        debug_logger.log_info(f"[COOKIE_RPC] {rpc_id} ok for {session.email} in {int((time.time() - started) * 1000)}ms")
+        return payload
+
+    async def _cookie_rpc_request(self, method: str, url: str, json_data: Optional[Dict[str, Any]],
+                                  handle: str, proxy_url: Optional[str], user_agent: Optional[str],
+                                  timeout: int) -> Dict[str, Any]:
+        try:
+            call = translate_request(method, url, json_data)
+        except CookieModeUnsupported as e:
+            raise FlowAPIError(501, f"Not supported on the new Flow API yet: {e}", "COOKIE_MODE_UNSUPPORTED") from e
+        session = await self._cookie_session_for_handle(handle)
+        payload = await self._cookie_rpc_call(
+            session, call.rpc_id, call.argument, call.source_path,
+            timeout=max(int(timeout or 60), call.timeout_floor), proxy_url=proxy_url, user_agent=user_agent,
+        )
+        result = call.normalize(payload)
+        if call.rpc_id == "nzlxg":
+            await self._echo_stored_tier(session, result)
+        return result
+
+    async def _echo_stored_tier(self, session, result: Dict[str, Any]) -> None:
+        """Credits callers write userPaygateTier verbatim (None would wipe it to Free), and Flow's new
+        tier numbers are not mapped yet, so hand back the tier already stored for this account."""
+        token = None
+        if self.db is not None:
+            if session.token_id is not None:
+                token = await self.db.get_token(int(session.token_id))
+            if token is None and session.email:
+                token = await self.db.get_token_by_email(session.email)
+        tier = (getattr(token, "user_paygate_tier", None) or "").strip() if token else ""
+        if tier:
+            result["userPaygateTier"] = tier
+        debug_logger.log_info(
+            f"[COOKIE_SESSION] credits {session.email}: raw={result.get('frontendRaw')} stored_tier={tier or '-'}"
+        )
+
+    async def _cookie_upload_image(self, at: str, url: str, json_data: Dict[str, Any], project_id: str) -> str:
+        """Flow web upload (maseQ) needs its own reCAPTCHA (action UPLOAD_IMAGE, upstream flow_current.py),
+        minted for THIS account so extension routing picks its own browser."""
+        if not project_id:
+            raise RuntimeError("Image upload on the new Flow API needs a project id")
+        session = await self._cookie_session_for_handle(at)
+        max_retries = max(1, int(config.flow_max_retries or 1))
+        last_error: Optional[Exception] = None
+        for retry_attempt in range(max_retries):
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id, action="UPLOAD_IMAGE", token_id=session.token_id
+            )
+            try:
+                if not recaptcha_token:
+                    raise Exception("Failed to obtain reCAPTCHA token for image upload")
+                body = dict(json_data)
+                body["clientContext"] = dict(json_data.get("clientContext") or {})
+                body["clientContext"]["recaptchaContext"] = {
+                    "token": recaptcha_token, "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                }
+                result = await self._make_request(method="POST", url=url, json_data=body, use_at=True, at_token=at)
+                media_id = self._extract_media_name(result.get("media")) or (
+                    result.get("mediaGenerationId", {}).get("mediaGenerationId")
+                )
+                if media_id:
+                    return media_id
+                raise Exception(f"Invalid upload response: missing media id, keys={list(result.keys())}")
+            except Exception as e:
+                last_error = e
+                refused = photo_refusal_reason(e)
+                if refused:
+                    debug_logger.event(f"[UPLOAD] Google refused the photo: {refused} (not retried)")
+                    raise FlowPhotoRefusedError(refused, str(e)) from e
+                retry_reason = "network timeout" if self._is_timeout_error(e) else self._get_retry_reason(str(e))
+                if retry_reason and retry_attempt < max_retries - 1:
+                    debug_logger.log_warning(
+                        f"[UPLOAD] Flow web upload hit {retry_reason}, retrying ({retry_attempt + 2}/{max_retries})"
+                    )
+                    await asyncio.sleep(1)
+                    continue
+                raise
+            finally:
+                await self._notify_browser_captcha_request_finished(browser_id)
+        raise last_error or RuntimeError("Failed to upload image")
+
+    async def _cookie_create_project(self, st: str, title: str) -> str:
+        """Labs tRPC project.createProject is retired with the Labs session; Flow web RPC jHPbke."""
+        session = await self._cookie_session_for_st(st)
+        last_error: Optional[Exception] = None
+        for attempt in range(max(1, int(config.flow_max_retries or 1))):
+            try:
+                payload = await self._cookie_rpc_call(
+                    session, "jHPbke", build_create_project_argument(title), "/projects",
+                    timeout=max(self._get_control_plane_timeout(), 20),
+                )
+                project_id = extract_project_id(payload)
+                if not project_id:
+                    raise Exception("Flow createProject RPC returned no project id")
+                debug_logger.log_info(f"[PROJECT] Created Flow project {project_id} for {session.email} (cookie session)")
+                return project_id
+            except FlowAPIError as e:
+                last_error = e
+                if e.status_code == 401:
+                    raise
+            except Exception as e:
+                last_error = e
+            await asyncio.sleep(1)
+        raise last_error or RuntimeError("Flow createProject failed")
+
+    async def _download_signed_media(self, url: str) -> bytes:
+        """Fetch a signed flow-content.google link (no cookies needed) through the media proxy."""
+        proxy_url = None
+        if self.proxy_manager and hasattr(self.proxy_manager, "get_media_proxy_url"):
+            proxy_url = await self.proxy_manager.get_media_proxy_url()
+        async with AsyncSession(trust_env=False) as http:
+            response = await http.get(url, proxy=proxy_url, timeout=max(60, int(self.timeout or 60)),
+                                      impersonate="chrome", allow_redirects=True)
+        if response.status_code >= 400 or not response.content:
+            raise FlowAPIError(response.status_code or 502, f"HTTP Error {response.status_code}: signed media download failed")
+        return response.content
+
+    async def _cookie_session_for_st(self, st: str) -> "flow_ck.FlowCookieSession":
+        """Session for an ST-keyed call (project create/delete): the token's live session."""
+        result = await self._cookie_st_to_at(st)
+        return await self._cookie_session_for_handle(result["access_token"])
+
     # ========== Auth (uses ST) ==========
 
     async def st_to_at(self, st: str) -> dict:
@@ -1401,6 +1675,8 @@ class FlowClient:
                 "user": {...}
             }
         """
+        if self.cookie_rpc_enabled():
+            return await self._cookie_st_to_at(st)
         url = f"{self.labs_base_url}/auth/session"
         try:
             return await self._make_request(
@@ -1438,6 +1714,8 @@ class FlowClient:
         Returns:
             project_id (UUID)
         """
+        if self.cookie_rpc_enabled():
+            return await self._cookie_create_project(st, title)
         url = f"{self.labs_base_url}/trpc/project.createProject"
         json_data = {
             "json": {
@@ -1689,6 +1967,9 @@ class FlowClient:
         }
         max_retries = config.flow_max_retries
         last_error: Optional[Exception] = None
+
+        if flow_ck.is_session_handle(at):
+            return await self._cookie_upload_image(at, new_url, new_json_data, normalized_project_id)
 
         captcha_method = getattr(config, "captcha_method", "personal")
         if captcha_method == "personal":
@@ -2037,7 +2318,11 @@ class FlowClient:
                 )
 
                 # Return the base64-encoded image
-                return result.get("encodedImage", "")
+                encoded = result.get("encodedImage", "")
+                if not encoded and result.get("fifeUrl"):
+                    # Flow web upsample (SPrCad) may answer with a signed link instead of bytes.
+                    encoded = base64.b64encode(await self._download_signed_media(result["fifeUrl"])).decode("ascii")
+                return encoded
             except Exception as e:
                 last_error = e
                 if classify_upsample_error(e) in UPSAMPLE_NO_RETRY_KINDS:

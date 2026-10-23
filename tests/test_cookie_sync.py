@@ -71,12 +71,15 @@ class _FakeDB:
         return 1
 
 
+# These suites guard the Labs cookie-login path (cookie_rpc_enabled() False = FLOW_COOKIE_RPC=0). Since
+# 2026-10-23 the default is the flow.google.com cookie session, which never replays the retired Labs login.
 class PluginPushTests(unittest.TestCase):
     """HTTP-level: the real endpoint with a fake db / token manager."""
 
     def setUp(self):
         self.db = _FakeDB(_token())
         self.tm = MagicMock()
+        self.tm.flow_client.cookie_rpc_enabled = MagicMock(return_value=False)
         self.tm.flow_client.st_to_at = AsyncMock(return_value={"access_token": "at-new", "expires": None, "user": {"email": "me@x.com"}})
         self.tm.validate_and_promote = AsyncMock(return_value=RefreshOutcome(True, "ok", verified=True))
         self.tm.update_token = AsyncMock()
@@ -298,6 +301,7 @@ class TokenManagerCookieLoginTests(unittest.IsolatedAsyncioTestCase):
         tm.db = MagicMock()
         tm.db.update_token = AsyncMock()
         tm.flow_client = MagicMock()
+        tm.flow_client.cookie_rpc_enabled = MagicMock(return_value=False)
         return tm
 
     def test_proxy_resolution_prefers_protocol_proxy_then_redeem_proxy_never_direct(self):

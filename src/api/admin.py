@@ -1,5 +1,6 @@
 """Admin API routes"""
 import asyncio
+import hashlib
 import importlib
 import inspect
 import json
@@ -3147,8 +3148,24 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
     def _remaining() -> float:
         return COOKIE_RECOVERY_BUDGET_SECONDS - (time.monotonic() - request_started)
 
+    # Cookie sessions (2026-10-23): Google retired the Labs session API, so the pushed Google cookies
+    # ARE the credential. st_to_at in this request logs in to flow.google.com with them (through the
+    # worker's reported proxy), never through the retired Labs login. The context var lives in this
+    # request's own task (uvicorn runs each request in a new task), so it cannot leak to another push.
+    cookie_mode = token_manager.flow_client.cookie_rpc_enabled() and bool(google_cookies)
+    if cookie_mode:
+        token_manager.flow_client.set_cookie_hint(
+            google_cookies,
+            reported_proxy_url or (token_manager.cookie_login_proxy(bound_row) if bound_row else None),
+            reported_user_agent,
+        )
+
     async def _derive_st_from_cookies() -> str:
         nonlocal derived_from_cookies
+        if cookie_mode:
+            # No Labs login any more: the row keeps its stored key; a cookie-only push validates as "".
+            derived_from_cookies = True
+            return (bound_row.st if bound_row else "") or ""
         if _remaining() < 6.0:
             raise HTTPException(status_code=503, detail="No time left for a Google login in this push; retry")
         proxy = reported_proxy_url or (token_manager.cookie_login_proxy(bound_row) if bound_row else None)
@@ -3245,6 +3262,11 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
             )
     else:
         existing_token = await db.get_token_by_email(email)
+
+    if cookie_mode and not session_token:
+        # Cookie-only push: tokens.st is UNIQUE NOT NULL and no longer a Google credential. Keep the
+        # row's value; a brand-new row gets a per-account placeholder.
+        session_token = (existing_token.st if existing_token else "") or f"cookie:{hashlib.sha256(email.lower().encode()).hexdigest()[:24]}"
 
     # Ultra browsers (tmp/ultra_browsers_plan.md R3-1): an account owned by a managed server browser takes
     # pushes only from that browser (route key + its own proxy port), and that browser's route key only
