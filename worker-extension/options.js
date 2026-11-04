@@ -24,10 +24,10 @@ function setStatus(kind, text) {
 function refreshStatus() {
   chrome.runtime.sendMessage({ action: "getConnState" }, (r) => {
     if (chrome.runtime.lastError) return;
-    // One place decides the wording (session_state.js): Google signed in ≠ Labs signed in.
+    // One place decides the wording (session_state.js), from the server's verdict on the last push.
     const d = FlowSessionState.describeSignIn(r || {});
     setStatus(d.kind, d.text);
-    $("openLabsBtn").hidden = !d.labsButton;
+    $("openFlowBtn").hidden = !d.flowButton;
   });
 }
 
@@ -88,31 +88,23 @@ function renderSunoState(r) {
   box.innerHTML = text.replace(/</g, "&lt;") + when;
 }
 
-// Away mode (cookie sync): switch + honest status line (what the last push proved).
+// Account sharing (cookie sync): switch + honest status line (what the last push proved;
+// one place decides the wording: session_state.js describeCookieSyncState).
 function renderCookieSyncState(r) {
   const on = !(r && r.enabled === false);
   $("cookieSyncEnabled").checked = on;
   const lab = $("cookieSyncState");
-  lab.textContent = on ? "ON" : "Off";
+  lab.textContent = on ? "ON" : "Stopped";
   lab.className = on ? "on" : "";
+  $("cookieSyncHint").innerHTML = on
+    ? "Flow2API signs in to Flow with this Chrome's Google login, so this must stay ON. This Chrome must stay running; the account pauses about 20–60 min after Chrome stops. Turning it off means: <b>Stop using this account in Flow2API</b>."
+    : "Flow2API does not use this account now. Turn it back ON to use it again (this Chrome must be signed in to Google).";
+  const d = FlowSessionState.describeCookieSyncState(on, (r && r.state) || null);
+  const when = (on && r && r.lastPushAt) ? `<span class="when">Last confirmed: ${fmtAgo(r.lastPushAt)}</span>` : "";
   const box = $("cookieSyncStatus");
-  const st = (r && r.state) || null;
-  let cls = "", text = "";
-  if (!on) {
-    if (st && st.status === "clearing") { cls = "warn"; text = "Off. Deletion pending — Flow2API has not confirmed yet (retrying every minute)."; }
-    else { text = "Off — Flow2API keeps this account working only while this laptop is open."; }
-  } else if (st && st.status === "stored") {
-    const ago = st.at ? Math.max(0, Math.round((Date.now() - st.at) / 60000)) : null;
-    const when = ago == null ? "" : (ago < 1 ? " just now" : ` ${ago} min ago`);
-    cls = "ok"; text = `✅ Server copy updated${when} (${st.count || 0} cookies). Flow2API can sign this account in again while you are away.`;
-  } else if (st && st.status === "signed_out") { cls = "warn"; text = "Not signed in to Google in this Chrome. Sign in, then the next push shares the login on its own."; }
-  else if (st && st.status === "error") { cls = "err"; text = st.message || "The last push failed. It retries every hour."; }
-  else if (st && st.status === "cleared") { text = "Server copy deleted."; }
-  else { text = "Waiting for the next session push…"; }
-  const when = (r && r.lastPushAt) ? `<span class="when">Last confirmed: ${fmtAgo(r.lastPushAt)}</span>` : "";
   box.hidden = false;
-  box.className = cls;
-  box.innerHTML = text.replace(/</g, "&lt;") + when;
+  box.className = d.cls;
+  box.innerHTML = d.text.replace(/</g, "&lt;") + when;
 }
 
 function loadCookieSyncState() {
@@ -149,6 +141,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
   $("cookieSyncEnabled").addEventListener("change", (e) => {
     const on = e.target.checked;
+    // Since 2026-10-23 the shared login IS the account's Flow login: OFF stops the account.
+    if (!on && !confirm("Stop using this account in Flow2API?\n\nFlow2API deletes its copy of this Chrome's Google login, and the account stops working in Flow2API until you turn this back on.")) {
+      e.target.checked = true;
+      return;
+    }
     renderCookieSyncState({ enabled: on, state: { status: on ? "syncing" : "clearing" } });
     chrome.runtime.sendMessage({ action: "cookieSyncSetEnabled", enabled: on }, () => {
       setTimeout(() => { loadCookieSyncState(); renderLogs(); }, 1500);
@@ -184,8 +181,8 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  $("openLabsBtn").addEventListener("click", () => {
-    chrome.runtime.sendMessage({ action: "openLabsSignIn" }, () => {});
+  $("openFlowBtn").addEventListener("click", () => {
+    chrome.runtime.sendMessage({ action: "openFlowSignIn" }, () => {});
   });
 
   $("reconnectBtn").addEventListener("click", () => {

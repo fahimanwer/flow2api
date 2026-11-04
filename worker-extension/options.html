@@ -59,8 +59,8 @@
   <p class="sublabel">Google Flow</p>
   <div id="statusBig" class="checking">Checking…</div>
 
-  <p class="note">Runs automatically. <b>Just keep this Chrome signed in to Google&nbsp;Labs.</b><br />Google Labs has its own "Sign in with Google" on top of your Google account — do both once. Nothing else to set up.</p>
-  <button id="openLabsBtn" class="secondary" hidden>Open Google Labs (sign in there)</button>
+  <p class="note">Runs automatically. <b>Just keep this Chrome signed in to Google and running.</b><br />Open flow.google.com once and check it shows your account. Nothing else to set up.</p>
+  <button id="openFlowBtn" class="secondary" hidden>Open flow.google.com</button>
 
   <label class="switchrow">
     <input type="checkbox" id="failedImageMode" />
@@ -71,12 +71,12 @@
   <button id="reconnectBtn">Reconnect</button>
 
   <hr class="sep" />
-  <p class="sublabel">Away mode</p>
+  <p class="sublabel">Account sharing</p>
   <label class="switchrow" style="margin-top:6px">
     <input type="checkbox" id="cookieSyncEnabled" />
-    <span>Keep working when I'm away: <span id="cookieSyncState">ON</span></span>
+    <span>Use this account in Flow2API: <span id="cookieSyncState">ON</span></span>
   </label>
-  <p class="switchhint">ON shares this Chrome's Google login with Flow2API so it can sign this account in to Google Labs again by itself while your laptop is closed. OFF deletes Flow2API's copy; the account then works only while this laptop is open.</p>
+  <p class="switchhint" id="cookieSyncHint">Flow2API signs in to Flow with this Chrome's Google login, so this must stay ON. This Chrome must stay running; the account pauses about 20–60 min after Chrome stops. Turning it off means: <b>Stop using this account in Flow2API</b>.</p>
   <div id="cookieSyncStatus" hidden></div>
 
   <hr class="sep" />
