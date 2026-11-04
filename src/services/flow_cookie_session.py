@@ -314,6 +314,15 @@ class FlowCookieSessions:
                 return session
         return None
 
+    def newest_for_handle(self, handle: str) -> Optional[FlowCookieSession]:
+        """The account's newest live session for a handle that is no longer registered (a newer push
+        replaced it while a request still held it). The account is the email hash inside the handle."""
+        parts = (handle or "").split(".")
+        if len(parts) < 3 or not parts[1]:
+            return None
+        live = [s for s in self.sessions() if email_hash(s.email) == parts[1] and self.get(s.handle) is s]
+        return max(live, key=lambda s: s.created_at) if live else None
+
     @staticmethod
     def new_handle(email: str) -> str:
         return f"{HANDLE_PREFIX}{email_hash(email)}.{uuid.uuid4().hex[:16]}"
