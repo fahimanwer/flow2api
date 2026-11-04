@@ -1614,6 +1614,13 @@ class Database:
                 return Token(**dict(row))
             return None
 
+    async def count_tokens_by_email(self, email: str) -> int:
+        """Rows that share this email (normally 1)."""
+        async with self._connect() as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM tokens WHERE lower(email) = lower(?)", (email,))
+            row = await cursor.fetchone()
+            return int(row[0] or 0) if row else 0
+
     async def get_token_by_email(self, email: str) -> Optional[Token]:
         """Get token by email"""
         async with self._connect() as db:

@@ -473,8 +473,13 @@ def test_stale_handle_follows_the_rows_current_promoted_handle():
     client._cookie_sessions.put(new)
     client._cookie_sessions.drop_session(old)
     client.db = SimpleNamespace(get_token_by_at=AsyncMock(return_value=None),
-                                get_token=AsyncMock(return_value=SimpleNamespace(id=17, at=new.handle)))
+                                get_token=AsyncMock(return_value=SimpleNamespace(id=17, at=new.handle, email="a@x.com")),
+                                count_tokens_by_email=AsyncMock(return_value=1))
     assert asyncio.run(client._cookie_session_for_handle(old.handle)) is new
-    client.db.get_token = AsyncMock(return_value=SimpleNamespace(id=17, at=old.handle))  # row not promoted yet
+    client.db.count_tokens_by_email = AsyncMock(return_value=2)          # two rows share the email: no guessing
+    with pytest.raises(FlowAPIError):
+        asyncio.run(client._cookie_session_for_handle(old.handle))
+    client.db.count_tokens_by_email = AsyncMock(return_value=1)
+    client.db.get_token = AsyncMock(return_value=SimpleNamespace(id=17, at=old.handle, email="a@x.com"))  # not re-pushed yet
     with pytest.raises(FlowAPIError):
         asyncio.run(client._cookie_session_for_handle(old.handle))
