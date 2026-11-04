@@ -1,4 +1,4 @@
-# Cookie sync — "Keep working when I'm away" (worker extension 3.7.0, 2026-09-23)
+# Cookie sync — the account's Google login on the server (worker extension 3.7.0+, cookie sessions since 2026-10-23)
 
 > **Since 2026-10-23 these cookies ARE the Flow login.** Google retired the Labs session API
 > (`labs.google/fx/api/auth/session` → "Authentication endpoint has been deprecated and disabled",
@@ -6,19 +6,20 @@
 > with the pushed `google_cookies` and calls Flow's web RPCs; see "How the server uses it" below.
 > An account whose worker never pushes cookies (switch OFF, extension < 3.7.0) cannot work at all.
 
-## The problem it solves
+## What it does
 
-To generate on an account the server needs three things: a valid Google Labs session (`st`),
-a reCAPTCHA token, and the account's residential proxy. Since 2026-09-23 the captcha is minted
-on the server when the worker is away (`docs/…` server fallback, `src/services/flow_page_captcha.py`)
-and the proxy is stored per account. The Labs session was the last thing only the staff
-laptop could renew: when Google let it expire, the account failed with `AUTH/ST_EXPIRED` until
-that person's Chrome pushed a fresh one.
+To generate on an account the server needs three things: a Google login for Flow, a reCAPTCHA
+token, and the account's residential proxy. The captcha is minted by the worker browser (or by
+the server fallback, `src/services/flow_page_captcha.py`, when the worker is away) and the proxy
+is stored per account. The Google login comes from cookie sync: the extension shares the Google
+login cookies of its Chrome profile, and the server logs in to Flow with them through the
+account's own proxy.
 
-With cookie sync the extension also shares the Google login cookies of that Chrome profile.
-When the Labs session dies, the server signs in to Labs again itself, replaying NextAuth's
-"Sign in with Google" with those cookies through the account's own proxy
-(`src/services/protocol_login.py`), and stores the new session. The laptop can be closed.
+What it does NOT do any more (corrected 2026-10-23): keep an account working for long with the
+laptop closed. Until 2026-10-21 the server replayed the Labs "Sign in with Google" and got a
+long-lived Labs session; that login is retired. A server session now lasts only until the
+browser rotates its Google login (measured: 10–30 min after a push, see Limits), and the next
+push carries the rotated cookies. With the browser gone, the account stops within the hour.
 
 ## What is shared, and where it goes
 

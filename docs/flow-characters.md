@@ -1,5 +1,10 @@
 # Flow Characters (consistent people / objects) — flow2api
 
+> **Not available since 2026-10-21 (checked 2026-10-23).** These endpoints lived on aisandbox-pa REST, which
+> needs the retired Labs login. On cookie sessions a request with `characters` gets an immediate 501 with a
+> plain message (`generation_handler.CHARACTERS_UNAVAILABLE`), never an account strike. Bringing it back needs
+> the Flow web app's character RPC ids, captured from a HAR of the real app (none captured yet).
+
 A character is a named person or thing built from 1–2 photos. In the prompt you write `@Name`
 and Flow keeps that face/object consistent. flow2api creates the character on the account that
 serves the request, caches it, and passes it to Google as a reference entity.

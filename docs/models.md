@@ -53,6 +53,11 @@ names above. Ids without a duration (`omni`, `omni_r2v`) are the 8 s ones.
 
 Characters take at most **2 photos each** (Flow refuses a third slot, 2026-10-11). See `docs/flow-characters.md`.
 
+**Since 2026-10-21 (Google's Flow login change): characters are not available** (immediate 501), and an
+extended video comes back as the extension clip only, without stitching. Everything else in these tables
+was re-checked on the new Flow web API on 2026-10-23 (images incl. 2K and reference photos, a 4 s video);
+Omni and the other video modes are mapped but not yet proven live.
+
 ## Accounts (the `accounts` field)
 
 - **Images:** any account. 2K enlarge works on every tier; 4K enlarge needs Ultra, otherwise the image
