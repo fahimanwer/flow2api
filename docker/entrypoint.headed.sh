@@ -51,7 +51,7 @@ if [ -n "${BROWSER_EXECUTABLE_PATH:-}" ] && [ -x "${BROWSER_EXECUTABLE_PATH}" ];
     echo "[entrypoint] browser executable: ${BROWSER_EXECUTABLE_PATH}"
     "${BROWSER_EXECUTABLE_PATH}" --version || true
 else
-    echo "[entrypoint] warning: no valid browser executable found for personal/browser captcha" >&2
+    echo "[entrypoint] warning: no valid browser executable found for the server captcha fallback" >&2
 fi
 
 exec python main.py

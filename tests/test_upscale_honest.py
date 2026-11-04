@@ -192,20 +192,17 @@ class FlowClientNoNestedRetryTests(unittest.IsolatedAsyncioTestCase):
         client._get_recaptcha_token = AsyncMock(return_value=("tok", None))
         client._make_request = AsyncMock(side_effect=QUOTA)
         client._maybe_switch_to_server_mint = AsyncMock()
-        client._notify_browser_captcha_request_finished = AsyncMock()
         client._handle_retryable_generation_error = AsyncMock(return_value=True)
         with self.assertRaises(FlowAPIError):
             await client.upsample_image("at", "project", "media", "UPSAMPLE_IMAGE_RESOLUTION_2K")
         self.assertEqual(client._make_request.await_count, 1)
         client._handle_retryable_generation_error.assert_not_awaited()
-        client._notify_browser_captcha_request_finished.assert_awaited()
 
     async def test_network_error_keeps_the_inner_retry(self):
         client = FlowClient.__new__(FlowClient)
         client.api_base_url = "https://x"
         client._get_recaptcha_token = AsyncMock(return_value=("tok", None))
         client._make_request = AsyncMock(side_effect=[Exception("HTTP Error 500: internal"), {"encodedImage": "abc"}])
-        client._notify_browser_captcha_request_finished = AsyncMock()
         client._handle_retryable_generation_error = AsyncMock(return_value=True)
         self.assertEqual(await client.upsample_image("at", "project", "media", "UPSAMPLE_IMAGE_RESOLUTION_2K"), "abc")
         self.assertEqual(client._make_request.await_count, 2)
@@ -239,10 +236,12 @@ class SelectTokenPreferenceTests(unittest.TestCase):
         from tests.test_tier_order import FakeTokenManager, _token, FREE, PRO, ULT
         self.cp, self.FTM, self._token = cp, FakeTokenManager, _token
         self.PRO, self.ULT = PRO, ULT
-        self._saved = (config.tier_order, config.call_logic_mode, config.captcha_method)
+        self._saved = (config.tier_order, config.call_logic_mode)
         config.set_tier_order("save_ultra")
         config.set_call_logic_mode("default")
-        config.set_captcha_method("yescaptcha")
+        route_patch = patch.object(LoadBalancer, "_check_extension_route", AsyncMock(return_value=(True, "")))  # no extension route checks
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
         self._store = cp.client_policy_store._policies
         cp.client_policy_store.replace([{"client": "default", "image_tier": "any", "video_tier": "any"}])
 
@@ -250,7 +249,6 @@ class SelectTokenPreferenceTests(unittest.TestCase):
         self.cp.client_policy_store._policies = self._store
         config.set_tier_order(self._saved[0])
         config.set_call_logic_mode(self._saved[1])
-        config.set_captcha_method(self._saved[2])
 
     def _pick(self, tokens, model, cooled=(), load=None):
         import asyncio

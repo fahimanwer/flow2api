@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
-from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
 from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig, LogCleanupConfig, TokenRefreshConfig
 
 
@@ -306,82 +305,22 @@ class Database:
         cursor = await db.execute("SELECT COUNT(*) FROM captcha_config")
         count = await cursor.fetchone()
         if count[0] == 0:
-            captcha_method = "browser"
-            yescaptcha_api_key = ""
-            yescaptcha_base_url = "https://api.yescaptcha.com"
-            yescaptcha_task_type = DEFAULT_YESCAPTCHA_TASK_TYPE
-            remote_browser_base_url = ""
-            remote_browser_api_key = ""
-            remote_browser_timeout = 60
-            browser_count = 1
+            captcha_method = "extension"
             personal_project_pool_size = 4
-            personal_max_resident_tabs = 5
-            browser_personal_fresh_restart_every_n_solves = 10
-            personal_idle_tab_ttl_seconds = 600
 
             if config_dict:
                 captcha_config = config_dict.get("captcha", {})
-                captcha_method = captcha_config.get("captcha_method", "browser")
-                yescaptcha_api_key = captcha_config.get("yescaptcha_api_key", "")
-                yescaptcha_base_url = captcha_config.get("yescaptcha_base_url", "https://api.yescaptcha.com")
-                yescaptcha_task_type = normalize_yescaptcha_task_type(captcha_config.get("yescaptcha_task_type"))
-                remote_browser_base_url = captcha_config.get("remote_browser_base_url", "")
-                remote_browser_api_key = captcha_config.get("remote_browser_api_key", "")
-                remote_browser_timeout = captcha_config.get("remote_browser_timeout", 60)
-                browser_count = captcha_config.get("browser_count", 1)
+                captcha_method = captcha_config.get("captcha_method", "extension")
                 personal_project_pool_size = captcha_config.get("personal_project_pool_size", 4)
-                personal_max_resident_tabs = captcha_config.get("personal_max_resident_tabs", 5)
-                browser_personal_fresh_restart_every_n_solves = captcha_config.get("browser_personal_fresh_restart_every_n_solves", 10)
-                personal_idle_tab_ttl_seconds = captcha_config.get("personal_idle_tab_ttl_seconds", 600)
-            try:
-                remote_browser_timeout = max(5, int(remote_browser_timeout))
-            except Exception:
-                remote_browser_timeout = 60
-            try:
-                browser_count = max(1, int(browser_count))
-            except Exception:
-                browser_count = 1
             try:
                 personal_project_pool_size = max(1, min(50, int(personal_project_pool_size)))
             except Exception:
                 personal_project_pool_size = 4
-            try:
-                personal_max_resident_tabs = max(1, min(50, int(personal_max_resident_tabs)))
-            except Exception:
-                personal_max_resident_tabs = 5
-            try:
-                browser_personal_fresh_restart_every_n_solves = max(0, int(browser_personal_fresh_restart_every_n_solves))
-            except Exception:
-                browser_personal_fresh_restart_every_n_solves = 10
-            try:
-                personal_idle_tab_ttl_seconds = max(60, int(personal_idle_tab_ttl_seconds))
-            except Exception:
-                personal_idle_tab_ttl_seconds = 600
 
             await db.execute("""
-                INSERT INTO captcha_config (
-                    id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
-                    yescaptcha_task_type,
-                    remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
-                    browser_count, personal_project_pool_size,
-                    personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
-                    personal_idle_tab_ttl_seconds
-                )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                captcha_method,
-                yescaptcha_api_key,
-                yescaptcha_base_url,
-                yescaptcha_task_type,
-                remote_browser_base_url,
-                remote_browser_api_key,
-                remote_browser_timeout,
-                browser_count,
-                personal_project_pool_size,
-                personal_max_resident_tabs,
-                browser_personal_fresh_restart_every_n_solves,
-                personal_idle_tab_ttl_seconds,
-            ))
+                INSERT INTO captcha_config (id, captcha_method, personal_project_pool_size)
+                VALUES (1, ?, ?)
+            """, (captcha_method, personal_project_pool_size))
 
         # Ensure plugin_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM plugin_config")
@@ -501,7 +440,7 @@ class Database:
                 await db.execute("""
                     CREATE TABLE captcha_config (
                         id INTEGER PRIMARY KEY DEFAULT 1,
-                        captcha_method TEXT DEFAULT 'browser',
+                        captcha_method TEXT DEFAULT 'extension',
                         yescaptcha_api_key TEXT DEFAULT '',
                         yescaptcha_base_url TEXT DEFAULT 'https://api.yescaptcha.com',
                         yescaptcha_task_type TEXT DEFAULT 'RecaptchaV3TaskProxylessM1S9',
@@ -1015,7 +954,7 @@ class Database:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS captcha_config (
                     id INTEGER PRIMARY KEY DEFAULT 1,
-                    captcha_method TEXT DEFAULT 'browser',
+                    captcha_method TEXT DEFAULT 'extension',
                     yescaptcha_api_key TEXT DEFAULT '',
                     yescaptcha_base_url TEXT DEFAULT 'https://api.yescaptcha.com',
                     yescaptcha_task_type TEXT DEFAULT 'RecaptchaV3TaskProxylessM1S9',
@@ -1613,6 +1552,13 @@ class Database:
             if row:
                 return Token(**dict(row))
             return None
+
+    async def count_tokens_by_email(self, email: str) -> int:
+        """Rows that share this email (normally 1)."""
+        async with self._connect() as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM tokens WHERE lower(email) = lower(?)", (email,))
+            row = await cursor.fetchone()
+            return int(row[0] or 0) if row else 0
 
     async def get_token_by_email(self, email: str) -> Optional[Token]:
         """Get token by email"""
@@ -3115,25 +3061,7 @@ class Database:
         captcha_config = await self.get_captcha_config()
         if captcha_config:
             config.set_captcha_method(captcha_config.captcha_method)
-            config.set_yescaptcha_api_key(captcha_config.yescaptcha_api_key)
-            config.set_yescaptcha_base_url(captcha_config.yescaptcha_base_url)
-            config.set_yescaptcha_task_type(captcha_config.yescaptcha_task_type)
-            config.set_capmonster_api_key(captcha_config.capmonster_api_key)
-            config.set_capmonster_base_url(captcha_config.capmonster_base_url)
-            config.set_ezcaptcha_api_key(captcha_config.ezcaptcha_api_key)
-            config.set_ezcaptcha_base_url(captcha_config.ezcaptcha_base_url)
-            config.set_capsolver_api_key(captcha_config.capsolver_api_key)
-            config.set_capsolver_base_url(captcha_config.capsolver_base_url)
-            config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
-            config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
-            config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
-            config.set_browser_count(captcha_config.browser_count)
             config.set_personal_project_pool_size(captcha_config.personal_project_pool_size)
-            config.set_personal_max_resident_tabs(captcha_config.personal_max_resident_tabs)
-            config.set_browser_personal_fresh_restart_every_n_solves(
-                captcha_config.browser_personal_fresh_restart_every_n_solves
-            )
-            config.set_personal_idle_tab_ttl_seconds(captcha_config.personal_idle_tab_ttl_seconds)
             config.set_captcha_server_fallback_enabled(captcha_config.server_fallback_enabled)
             config.set_captcha_server_fallback_max_browsers(captcha_config.server_fallback_max_browsers)
 
@@ -3254,146 +3182,54 @@ class Database:
     async def update_captcha_config(
         self,
         captcha_method: str = None,
-        yescaptcha_api_key: str = None,
-        yescaptcha_base_url: str = None,
-        yescaptcha_task_type: str = None,
-        capmonster_api_key: str = None,
-        capmonster_base_url: str = None,
-        ezcaptcha_api_key: str = None,
-        ezcaptcha_base_url: str = None,
-        capsolver_api_key: str = None,
-        capsolver_base_url: str = None,
-        remote_browser_base_url: str = None,
-        remote_browser_api_key: str = None,
-        remote_browser_timeout: int = None,
-        browser_proxy_enabled: bool = None,
-        browser_proxy_url: str = None,
-        browser_count: int = None,
         personal_project_pool_size: int = None,
-        personal_max_resident_tabs: int = None,
-        browser_personal_fresh_restart_every_n_solves: int = None,
-        personal_idle_tab_ttl_seconds: int = None,
         server_fallback_enabled: bool = None,
         server_fallback_max_browsers: int = None,
     ):
-        """Update captcha configuration"""
+        """Update captcha configuration (the dead-mode columns stay in the table, untouched)"""
         async with self._connect(write=True) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM captcha_config WHERE id = 1")
             row = await cursor.fetchone()
+            current = dict(row) if row else {}
+
+            new_method = captcha_method if captcha_method is not None else current.get("captcha_method", "extension")
+            new_pool_size = (
+                personal_project_pool_size
+                if personal_project_pool_size is not None
+                else current.get("personal_project_pool_size", 4)
+            )
+            new_fallback_enabled = (
+                server_fallback_enabled
+                if server_fallback_enabled is not None
+                else current.get("server_fallback_enabled", 1)
+            )
+            new_fallback_max = (
+                server_fallback_max_browsers
+                if server_fallback_max_browsers is not None
+                else current.get("server_fallback_max_browsers", 3)
+            )
+            values = (
+                new_method,
+                max(1, min(50, int(new_pool_size))),
+                1 if bool(new_fallback_enabled) else 0,
+                max(1, min(6, int(new_fallback_max or 3))),
+            )
 
             if row:
-                current = dict(row)
-                new_method = captcha_method if captcha_method is not None else current.get("captcha_method", "yescaptcha")
-                new_yes_key = yescaptcha_api_key if yescaptcha_api_key is not None else current.get("yescaptcha_api_key", "")
-                new_yes_url = yescaptcha_base_url if yescaptcha_base_url is not None else current.get("yescaptcha_base_url", "https://api.yescaptcha.com")
-                new_yes_task_type = normalize_yescaptcha_task_type(
-                    yescaptcha_task_type if yescaptcha_task_type is not None else current.get("yescaptcha_task_type")
-                )
-                new_cap_key = capmonster_api_key if capmonster_api_key is not None else current.get("capmonster_api_key", "")
-                new_cap_url = capmonster_base_url if capmonster_base_url is not None else current.get("capmonster_base_url", "https://api.capmonster.cloud")
-                new_ez_key = ezcaptcha_api_key if ezcaptcha_api_key is not None else current.get("ezcaptcha_api_key", "")
-                new_ez_url = ezcaptcha_base_url if ezcaptcha_base_url is not None else current.get("ezcaptcha_base_url", "https://api.ez-captcha.com")
-                new_cs_key = capsolver_api_key if capsolver_api_key is not None else current.get("capsolver_api_key", "")
-                new_cs_url = capsolver_base_url if capsolver_base_url is not None else current.get("capsolver_base_url", "https://api.capsolver.com")
-                new_remote_base_url = remote_browser_base_url if remote_browser_base_url is not None else current.get("remote_browser_base_url", "")
-                new_remote_api_key = remote_browser_api_key if remote_browser_api_key is not None else current.get("remote_browser_api_key", "")
-                new_remote_timeout = remote_browser_timeout if remote_browser_timeout is not None else current.get("remote_browser_timeout", 60)
-                new_proxy_enabled = browser_proxy_enabled if browser_proxy_enabled is not None else current.get("browser_proxy_enabled", False)
-                new_proxy_url = browser_proxy_url if browser_proxy_url is not None else current.get("browser_proxy_url")
-                new_browser_count = browser_count if browser_count is not None else current.get("browser_count", 1)
-                new_personal_project_pool_size = personal_project_pool_size if personal_project_pool_size is not None else current.get("personal_project_pool_size", 4)
-                new_personal_max_tabs = personal_max_resident_tabs if personal_max_resident_tabs is not None else current.get("personal_max_resident_tabs", 5)
-                new_personal_fresh_restart_every = (
-                    browser_personal_fresh_restart_every_n_solves
-                    if browser_personal_fresh_restart_every_n_solves is not None
-                    else current.get("browser_personal_fresh_restart_every_n_solves", 10)
-                )
-                new_personal_idle_ttl = personal_idle_tab_ttl_seconds if personal_idle_tab_ttl_seconds is not None else current.get("personal_idle_tab_ttl_seconds", 600)
-                new_fallback_enabled = server_fallback_enabled if server_fallback_enabled is not None else current.get("server_fallback_enabled", 1)
-                new_fallback_max = server_fallback_max_browsers if server_fallback_max_browsers is not None else current.get("server_fallback_max_browsers", 3)
-                new_remote_timeout = max(5, int(new_remote_timeout)) if new_remote_timeout is not None else 60
-                new_browser_count = max(1, min(20, int(new_browser_count)))
-                new_personal_project_pool_size = max(1, min(50, int(new_personal_project_pool_size)))
-                new_personal_max_tabs = max(1, min(50, int(new_personal_max_tabs)))  # Clamp to 1-50
-                new_personal_fresh_restart_every = max(0, int(new_personal_fresh_restart_every))
-                new_personal_idle_ttl = max(60, int(new_personal_idle_ttl))  # At least 60 seconds
-
                 await db.execute("""
                     UPDATE captcha_config
-                    SET captcha_method = ?, yescaptcha_api_key = ?, yescaptcha_base_url = ?,
-                        yescaptcha_task_type = ?,
-                        capmonster_api_key = ?, capmonster_base_url = ?,
-                        ezcaptcha_api_key = ?, ezcaptcha_base_url = ?,
-                        capsolver_api_key = ?, capsolver_base_url = ?,
-                        remote_browser_base_url = ?, remote_browser_api_key = ?, remote_browser_timeout = ?,
-                        browser_proxy_enabled = ?, browser_proxy_url = ?, browser_count = ?,
-                        personal_project_pool_size = ?,
-                        personal_max_resident_tabs = ?,
-                        browser_personal_fresh_restart_every_n_solves = ?,
-                        personal_idle_tab_ttl_seconds = ?,
+                    SET captcha_method = ?, personal_project_pool_size = ?,
                         server_fallback_enabled = ?, server_fallback_max_browsers = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = 1
-                """, (new_method, new_yes_key, new_yes_url, new_yes_task_type,
-                      new_cap_key, new_cap_url,
-                      new_ez_key, new_ez_url, new_cs_key, new_cs_url,
-                      (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
-                      new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
-                      new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl,
-                      1 if bool(new_fallback_enabled) else 0, max(1, min(6, int(new_fallback_max or 3)))))
+                """, values)
             else:
-                new_method = captcha_method if captcha_method is not None else "yescaptcha"
-                new_yes_key = yescaptcha_api_key if yescaptcha_api_key is not None else ""
-                new_yes_url = yescaptcha_base_url if yescaptcha_base_url is not None else "https://api.yescaptcha.com"
-                new_yes_task_type = normalize_yescaptcha_task_type(yescaptcha_task_type)
-                new_cap_key = capmonster_api_key if capmonster_api_key is not None else ""
-                new_cap_url = capmonster_base_url if capmonster_base_url is not None else "https://api.capmonster.cloud"
-                new_ez_key = ezcaptcha_api_key if ezcaptcha_api_key is not None else ""
-                new_ez_url = ezcaptcha_base_url if ezcaptcha_base_url is not None else "https://api.ez-captcha.com"
-                new_cs_key = capsolver_api_key if capsolver_api_key is not None else ""
-                new_cs_url = capsolver_base_url if capsolver_base_url is not None else "https://api.capsolver.com"
-                new_remote_base_url = remote_browser_base_url if remote_browser_base_url is not None else ""
-                new_remote_api_key = remote_browser_api_key if remote_browser_api_key is not None else ""
-                new_remote_timeout = remote_browser_timeout if remote_browser_timeout is not None else 60
-                new_proxy_enabled = browser_proxy_enabled if browser_proxy_enabled is not None else False
-                new_proxy_url = browser_proxy_url
-                new_browser_count = browser_count if browser_count is not None else 1
-                new_personal_project_pool_size = personal_project_pool_size if personal_project_pool_size is not None else 4
-                new_personal_max_tabs = personal_max_resident_tabs if personal_max_resident_tabs is not None else 5
-                new_personal_fresh_restart_every = (
-                    browser_personal_fresh_restart_every_n_solves
-                    if browser_personal_fresh_restart_every_n_solves is not None
-                    else 10
-                )
-                new_personal_idle_ttl = personal_idle_tab_ttl_seconds if personal_idle_tab_ttl_seconds is not None else 600
-                new_fallback_enabled = server_fallback_enabled if server_fallback_enabled is not None else True
-                new_fallback_max = server_fallback_max_browsers if server_fallback_max_browsers is not None else 3
-                new_remote_timeout = max(5, int(new_remote_timeout))
-                new_browser_count = max(1, min(20, int(new_browser_count)))
-                new_personal_project_pool_size = max(1, min(50, int(new_personal_project_pool_size)))
-                new_personal_max_tabs = max(1, min(50, int(new_personal_max_tabs)))
-                new_personal_fresh_restart_every = max(0, int(new_personal_fresh_restart_every))
-                new_personal_idle_ttl = max(60, int(new_personal_idle_ttl))
-
                 await db.execute("""
-                    INSERT INTO captcha_config (id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
-                        yescaptcha_task_type,
-                        capmonster_api_key, capmonster_base_url, ezcaptcha_api_key, ezcaptcha_base_url,
-                        capsolver_api_key, capsolver_base_url,
-                        remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
-                        browser_proxy_enabled, browser_proxy_url, browser_count,
-                        personal_project_pool_size,
-                        personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
-                        personal_idle_tab_ttl_seconds, server_fallback_enabled, server_fallback_max_browsers)
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (new_method, new_yes_key, new_yes_url, new_yes_task_type,
-                      new_cap_key, new_cap_url,
-                      new_ez_key, new_ez_url, new_cs_key, new_cs_url,
-                      (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
-                      new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
-                      new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl,
-                      1 if bool(new_fallback_enabled) else 0, max(1, min(6, int(new_fallback_max or 3)))))
+                    INSERT INTO captcha_config (id, captcha_method, personal_project_pool_size,
+                        server_fallback_enabled, server_fallback_max_browsers)
+                    VALUES (1, ?, ?, ?, ?)
+                """, values)
 
             await db.commit()
 

@@ -63,11 +63,7 @@ The platform offers several selectable groups and a public status page, so devel
 - Docker and Docker Compose (recommended)
 - Or Python 3.8+
 
-- Flow added an extra captcha, so you can choose browser-based solving or a third-party solver:
-Sign up at [YesCaptcha](https://yescaptcha.com/i/13Xd8K), get an API key, and enter it in the ```YesCaptcha API key``` field on the system settings page
-- YesCaptcha `type` can be switched in the admin panel: `RecaptchaV3TaskProxyless`, `RecaptchaV3TaskProxylessM1`, `RecaptchaV3TaskProxylessM1S7`, `RecaptchaV3TaskProxylessM1S9`; `M1S9` is the current default recommendation. S7/S9 force `minScore` 0.7/0.9.
-- The default `docker-compose.yml` is meant to be used with a third-party solver (yescaptcha/capmonster/ezcaptcha/capsolver).
-For headed browser solving inside Docker (browser/personal), use `docker-compose.headed.yml` below.
+- Captchas: each account's worker browser (the extension) mints its own reCAPTCHA tokens (captcha method `extension`). When it cannot, the server mints one on flow.google.com through the account's proxy (server fallback, needs `docker-compose.headed.yml` below). Since 2026-11-04 that is the only captcha method; the browser / personal / remote_browser modes and the paid solvers (YesCaptcha, CapMonster, EzCaptcha, CapSolver) were removed.
 
 - Our worker extension is in `worker-extension/` (pushes the Google login cookies; upstream's ST updater no longer applies to this fork)
 
@@ -99,12 +95,11 @@ docker-compose -f docker-compose.proxy.yml up -d
 docker-compose -f docker-compose.proxy.yml logs -f
 ```
 
-#### Docker headed captcha mode (browser / personal)
+#### Docker headed mode (server captcha fallback)
 
-> For when you need a virtual desktop and want headed browser captcha solving inside the container.  
+> Gives the container a virtual desktop so the server captcha fallback can run its Chromium.  
 > This mode starts `Xvfb + Fluxbox` for an in-container display and sets `ALLOW_DOCKER_HEADED_CAPTCHA=true`.  
 > Only the app port is exposed; no remote desktop port is provided.
-> The built-in `personal` browser now starts headed by default; to switch back to headless temporarily, set the env var `PERSONAL_BROWSER_HEADLESS=true`.
 
 ```bash
 # Start headed mode (use --build the first time)
@@ -115,7 +110,7 @@ docker compose -f docker-compose.headed.yml logs -f
 ```
 
 - API port: `8000`
-- In the admin panel, set the captcha method to `browser` or `personal`
+- In the admin panel, Captcha Settings: keep the method on `extension`; the server fallback switch is there too
 
 ### Option 2: Local install
 

@@ -39,7 +39,6 @@ class UploadImageRefusalTests(unittest.IsolatedAsyncioTestCase):
         client._make_request = AsyncMock(side_effect=fake_make_request)
         with patch("src.services.flow_client.config") as cfg, patch("asyncio.sleep", AsyncMock()):
             cfg.flow_max_retries = 3
-            cfg.captcha_method = "api"
             try:
                 await client.upload_image("at", JPEG_BYTES, "IMAGE_ASPECT_RATIO_PORTRAIT", project_id=project_id)
             except Exception as exc:  # the result under test
@@ -169,7 +168,6 @@ class HandlerPhotoRefusalTests(unittest.IsolatedAsyncioTestCase):
         )
         self.handler._log_request = AsyncMock(return_value=1)
         self.handler._update_request_log_progress = AsyncMock()
-        self.handler.flow_client.prefill_remote_browser_pool = AsyncMock()
         self.handler.flow_client.generate_video_reference_images = AsyncMock(side_effect=AssertionError("must not submit"))
         self.handler.flow_client.generate_image = AsyncMock(side_effect=AssertionError("must not submit"))
 

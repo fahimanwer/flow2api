@@ -65,20 +65,6 @@ interval_minutes = 60
 vacuum_after_cleanup = false  # VACUUM needs ~1x DB size in free disk; opt-in only
 
 [captcha]
-captcha_method = "extension"  # Captcha method: extension/yescaptcha/browser/personal/remote_browser
-browser_recaptcha_settle_seconds = 3.0  # Extra settle wait after reload/clr is ready
-browser_count = 1  # Number of headed browser instances in browser mode
-browser_captcha_max_retries = 5  # Max retries per captcha fetch in browser mode
+captcha_method = "extension"  # The only captcha method since 2026-11-04 (worker extension + server fallback)
 browser_captcha_generation_retries = 2  # Total retries when the generate endpoint hits reCAPTCHA evaluation failed
-personal_project_pool_size = 4  # Default project pool size per token in personal mode (only affects project rotation, not the number of captcha tabs)
-personal_max_resident_tabs = 5  # Max shared captcha tabs in personal mode; all tokens/projects share these tabs
-browser_personal_fresh_restart_every_n_solves = 10  # In personal mode, clean up and restart the browser after this many successful solves; 0 disables
-personal_idle_tab_ttl_seconds = 600  # Idle tab reclaim time in personal mode (seconds)
-yescaptcha_api_key = ""  # YesCaptcha API key
-yescaptcha_base_url = "https://api.yescaptcha.com"
-yescaptcha_task_type = "RecaptchaV3TaskProxylessM1S9"  # Options: RecaptchaV3TaskProxyless/RecaptchaV3TaskProxylessM1/RecaptchaV3TaskProxylessM1S7/RecaptchaV3TaskProxylessM1S9
-remote_browser_base_url = ""  # Remote headed captcha service URL
-remote_browser_api_key = ""   # Remote headed captcha service API key
-remote_browser_timeout = 60   # Remote headed captcha request timeout (seconds)
-capsolver_api_key = ""
-capsolver_base_url = "https://api.capsolver.com"
+personal_project_pool_size = 4  # Default project pool size per token (only affects project rotation)

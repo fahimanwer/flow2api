@@ -217,10 +217,7 @@ class VeoLiteGenerationHandlerTests(unittest.TestCase):
 class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = FlowClient(proxy_manager=None)
-        self.client._acquire_video_launch_gate = AsyncMock(return_value=(True, None, None))
-        self.client._release_video_launch_gate = AsyncMock()
-        self.client._get_recaptcha_token = AsyncMock(return_value=("recaptcha-token", "browser-1"))
-        self.client._notify_browser_captcha_request_finished = AsyncMock()
+        self.client._get_recaptcha_token = AsyncMock(return_value=("recaptcha-token", None))
 
     async def test_generate_video_text_uses_v2_payload_for_lite(self):
         captured = {}
@@ -309,10 +306,7 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
 class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = FlowClient(proxy_manager=None)
-        self.client._acquire_video_launch_gate = AsyncMock(return_value=(True, None, None))
-        self.client._release_video_launch_gate = AsyncMock()
-        self.client._get_recaptcha_token = AsyncMock(return_value=("recaptcha-token", "browser-1"))
-        self.client._notify_browser_captcha_request_finished = AsyncMock()
+        self.client._get_recaptcha_token = AsyncMock(return_value=("recaptcha-token", None))
 
     async def test_openai_history_reference_image_can_drive_aspect_ratio(self):
         portrait_image = _make_image_bytes((900, 1600))

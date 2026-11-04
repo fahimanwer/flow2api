@@ -284,6 +284,8 @@ class FlowCookieSessions:
         # email -> when its cookies were cleared. A session created before that (e.g. by an ON push
         # still in flight when the OFF landed) is dead even if a later write points at it.
         self._revoked_at: Dict[str, float] = {}
+        # handle -> token id of sessions forgotten while bound to a row (bounded, oldest first out)
+        self._retired: Dict[str, int] = {}
 
     def _expired(self, session: FlowCookieSession) -> bool:
         if session.created_at <= self._revoked_at.get(session.email, 0.0):
@@ -313,6 +315,11 @@ class FlowCookieSessions:
                     and (token_id is None or session.token_id in (None, token_id))):
                 return session
         return None
+
+    def retired_token_id(self, handle: str) -> Optional[int]:
+        """The account row a forgotten handle belonged to (None when unknown), so a request still holding
+        it can follow that row's CURRENT handle in the database, which only a guarded promotion writes."""
+        return self._retired.get(handle)
 
     @staticmethod
     def new_handle(email: str) -> str:
@@ -345,6 +352,10 @@ class FlowCookieSessions:
     def _forget(self, session: FlowCookieSession) -> None:
         for key in [k for k, v in self._by_handle.items() if v is session]:
             self._by_handle.pop(key, None)
+            if session.token_id is not None:
+                self._retired[key] = int(session.token_id)
+        while len(self._retired) > MAX_SESSIONS:
+            self._retired.pop(next(iter(self._retired)))
 
     def drop_session(self, session: FlowCookieSession) -> None:
         """Forget exactly this session (and its aliases); a newer session of the account stays."""

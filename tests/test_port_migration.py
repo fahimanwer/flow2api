@@ -5,7 +5,7 @@ import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.api import admin
 from src.core.database import Database, proxy_port, with_proxy_port
@@ -307,11 +307,12 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
 class PickerGateTests(unittest.TestCase):
     def test_blocked_account_gets_no_new_work(self):
         from src.core import client_policy as cp
-        from src.core.config import config
         from tests.test_tier_order import FakeTokenManager, _token, ULT
-        saved = (config.captcha_method, cp.client_policy_store._policies)
-        config.set_captcha_method("yescaptcha")
+        saved = cp.client_policy_store._policies
         cp.client_policy_store.replace([{"client": "default", "image_tier": "any", "video_tier": "any"}])
+        route_patch = patch.object(LoadBalancer, "_check_extension_route", AsyncMock(return_value=(True, "")))  # no extension route checks
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
         try:
             tm = FakeTokenManager([_token(1, ULT), _token(2, ULT)])
             tm.db = MagicMock()
@@ -332,8 +333,7 @@ class PickerGateTests(unittest.TestCase):
             tm.db.get_ip_move_blocked_token_ids = late_block
             self.assertIsNone(asyncio.run(lb.select_token(for_image_generation=True, reserve=False, enforce_concurrency_filter=False)))
         finally:
-            config.set_captcha_method(saved[0])
-            cp.client_policy_store._policies = saved[1]
+            cp.client_policy_store._policies = saved
 
 
 if __name__ == "__main__":

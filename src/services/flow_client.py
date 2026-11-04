@@ -18,14 +18,9 @@ import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
 from ..core.logger import debug_logger, mask_proxy_url
-from ..core.config import config, get_yescaptcha_min_score
+from ..core.config import config
 from . import flow_cookie_session as flow_ck
 from .flow_rpc import CookieModeUnsupported, build_create_project_argument, extract_project_id, translate_request
-
-try:
-    import httpx
-except ImportError:
-    httpx = None
 
 
 class FlowAPIError(Exception):
@@ -156,7 +151,6 @@ class FlowClient:
         "106225453,106131447,1706538,119157484,106243706,105746691,"
         "106151974,106125249,106001691,106077941"
     )
-    YESCAPTCHA_SLOT_BACKOFF_SECONDS = (3, 5, 8, 13, 20)
 
     def __init__(self, proxy_manager, db=None):
         self.proxy_manager = proxy_manager
@@ -184,7 +178,6 @@ class FlowClient:
         self._current_token_id_ctx: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
             "flow_mint_token_id", default=None
         )
-        self._remote_browser_prefill_last_sent: Dict[str, float] = {}
         # 2026-10-23 cookie sessions (flow_cookie_session.py): Google retired the Labs ST->AT API,
         # so an account's "AT" is now a FLOWCK.* handle onto a flow.google.com cookie session.
         # hint = cookies a worker just pushed (admin push endpoint); token = the row being worked on.
@@ -1252,30 +1245,6 @@ class FlowClient:
         except asyncio.TimeoutError as exc:
             raise Exception(f"Flow video API request timed out after {timeout}s") from exc
 
-    async def _acquire_image_launch_gate(
-        self,
-        token_id: Optional[int],
-        token_image_concurrency: Optional[int],
-    ) -> tuple[bool, int, int]:
-        """Image requests are not queued locally; go straight to token fetch and upstream submit."""
-        return True, 0, 0
-
-    async def _release_image_launch_gate(self, token_id: Optional[int]):
-        """Kept for interface shape; there is no local dispatch state to release."""
-        return
-
-    async def _acquire_video_launch_gate(
-        self,
-        token_id: Optional[int],
-        token_video_concurrency: Optional[int],
-    ) -> tuple[bool, int, int]:
-        """Video requests are not queued locally; go straight to token fetch and upstream submit."""
-        return True, 0, 0
-
-    async def _release_video_launch_gate(self, token_id: Optional[int]):
-        """Kept for interface shape; there is no local dispatch state to release."""
-        return
-
     async def _make_image_generation_request(
         self,
         url: str,
@@ -1283,14 +1252,13 @@ class FlowClient:
         at: str,
         attempt_trace: Optional[Dict[str, Any]] = None,
         project_id: Optional[str] = None,
-        token_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Image generation uses a shorter timeout and retries fast on network timeout."""
         request_timeout = config.flow_image_request_timeout
         total_attempts = max(1, config.flow_image_timeout_retry_count + 1)
         retry_delay = config.flow_image_timeout_retry_delay
 
-        # For browser/remote-browser captcha, prefer the same egress used for the captcha.
+        # With a captcha fingerprint bound (extension or server mint), prefer the egress used for the captcha.
         # Otherwise switching to the media proxy on the first try tends to fail reCAPTCHA and worsen tail latency.
         fingerprint = self._request_fingerprint_ctx.get()
         has_fingerprint_context = bool(isinstance(fingerprint, dict) and fingerprint)
@@ -1334,57 +1302,17 @@ class FlowClient:
                     "used_media_proxy": bool(prefer_media_proxy),
                 }
             try:
-                if config.captcha_method == "browser" and project_id:
-                    from .browser_captcha import BrowserCaptchaService
-
-                    service = await BrowserCaptchaService.get_instance(self.db)
-                    response_payload, _browser_ref, fingerprint = await service.submit_flow_request(
-                        project_id=project_id,
-                        action="IMAGE_GENERATION",
-                        token_id=token_id,
-                        url=url,
-                        at_token=at,
-                        json_data=json_data,
-                        timeout=request_timeout,
-                    )
-                    self._set_request_fingerprint(fingerprint if fingerprint else None)
-
-                    status_code = int(response_payload.get("status") or 0)
-                    response_text = response_payload.get("text") or ""
-                    if status_code >= 400:
-                        error_reason = f"HTTP Error {status_code}"
-                        parsed_body = None
-                        try:
-                            parsed_body = json.loads(response_text) if response_text else None
-                        except Exception:
-                            parsed_body = None
-                        if isinstance(parsed_body, dict) and "error" in parsed_body:
-                            error_info = parsed_body["error"] or {}
-                            error_message = error_info.get("message", "")
-                            details = error_info.get("details", [])
-                            for detail in details or []:
-                                if isinstance(detail, dict) and detail.get("reason"):
-                                    error_reason = detail.get("reason")
-                                    break
-                            if error_message:
-                                error_reason = f"{error_reason}: {error_message}"
-                        elif response_text:
-                            error_reason = f"HTTP Error {status_code}: {response_text[:200]}"
-                        raise Exception(error_reason)
-
-                    result = json.loads(response_text) if response_text else {}
-                else:
-                    result = await self._make_request(
-                        method="POST",
-                        url=url,
-                        headers=self._build_labs_request_context_headers(project_id),
-                        json_data=json_data,
-                        use_at=True,
-                        at_token=at,
-                        timeout=request_timeout,
-                        use_media_proxy=prefer_media_proxy,
-                        respect_fingerprint_proxy=not prefer_media_proxy,
-                    )
+                result = await self._make_request(
+                    method="POST",
+                    url=url,
+                    headers=self._build_labs_request_context_headers(project_id),
+                    json_data=json_data,
+                    use_at=True,
+                    at_token=at,
+                    timeout=request_timeout,
+                    use_media_proxy=prefer_media_proxy,
+                    respect_fingerprint_proxy=not prefer_media_proxy,
+                )
                 if http_attempt_info is not None:
                     http_attempt_info["duration_ms"] = int((time.time() - http_attempt_started_at) * 1000)
                     http_attempt_info["success"] = True
@@ -1509,6 +1437,15 @@ class FlowClient:
         if (token is None or getattr(token, "at", None) != handle) and self.db is not None:
             token = await self.db.get_token_by_at(handle)
         if token is None:
+            # A push replaced this account's handle while this request still held the old one: follow the
+            # row's current handle (written only by a guarded promotion), never another session by guess.
+            retired_for = self._cookie_sessions.retired_token_id(handle)
+            current = await self.db.get_token(retired_for) if (retired_for is not None and self.db is not None) else None
+            current_at = str(getattr(current, "at", "") or "") if current is not None else ""
+            # Only for an email held by exactly one row: with two rows a session's row binding can be wrong.
+            single_row = current is not None and await self.db.count_tokens_by_email(current.email or "") == 1
+            if single_row and current_at and current_at != handle and flow_ck.is_session_handle(current_at):
+                return await self._cookie_session_for_handle(current_at)
             raise FlowAPIError(401, "UNAUTHENTICATED: unknown cookie session; refresh the account", "UNAUTHENTICATED")
         proxy = self._token_cookie_proxy(token)
         if not proxy:
@@ -1652,7 +1589,7 @@ class FlowClient:
         max_retries = max(1, int(config.flow_max_retries or 1))
         last_error: Optional[Exception] = None
         for retry_attempt in range(max_retries):
-            recaptcha_token, browser_id = await self._get_recaptcha_token(
+            recaptcha_token, _ = await self._get_recaptcha_token(
                 project_id, action="UPLOAD_IMAGE", token_id=token_id
             )
             try:
@@ -1684,8 +1621,6 @@ class FlowClient:
                     await asyncio.sleep(1)
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
         raise last_error or RuntimeError("Failed to upload image")
 
     async def _cookie_create_project(self, st: str, title: str) -> str:
@@ -2042,19 +1977,6 @@ class FlowClient:
         if flow_ck.is_session_handle(at):
             return await self._cookie_upload_image(at, new_url, new_json_data, normalized_project_id)
 
-        captcha_method = getattr(config, "captcha_method", "personal")
-        if captcha_method == "personal":
-            try:
-                from .browser_captcha_personal import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
-                fingerprint = service.get_last_fingerprint()
-                if not fingerprint:
-                    await service.get_token(project_id, "uploadUserImage")
-                    fingerprint = service.get_last_fingerprint()
-                self._set_request_fingerprint(fingerprint)
-            except Exception as e:
-                debug_logger.log_error(f"[UPLOAD] Failed to pre-fetch fingerprint: {e}")
-
         for retry_attempt in range(max_retries):
             try:
                 new_result = await self._make_request(
@@ -2149,7 +2071,6 @@ class FlowClient:
         aspect_ratio: str,
         image_inputs: Optional[List[Dict]] = None,
         token_id: Optional[int] = None,
-        token_image_concurrency: Optional[int] = None,
         progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
         prompt_parts: Optional[List[Dict[str, Any]]] = None,
         reference_entities: Optional[List[str]] = None,
@@ -2190,31 +2111,11 @@ class FlowClient:
             recaptcha_started_at = time.time()
             if progress_callback is not None:
                 await progress_callback("solving_image_captcha", 38)
-            launch_gate_acquired = False
-            launch_ok, launch_queue_ms, launch_stagger_ms = await self._acquire_image_launch_gate(
-                token_id=token_id,
-                token_image_concurrency=token_image_concurrency,
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id,
+                action="IMAGE_GENERATION",
+                token_id=token_id
             )
-            attempt_trace["launch_queue_ms"] = launch_queue_ms
-            attempt_trace["launch_stagger_ms"] = launch_stagger_ms
-            if not launch_ok:
-                last_error = Exception("Image launch queue wait timeout")
-                attempt_trace["success"] = False
-                attempt_trace["error"] = str(last_error)
-                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
-                perf_trace["generation_attempts"].append(attempt_trace)
-                raise last_error
-
-            launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="IMAGE_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_image_launch_gate(token_id)
             attempt_trace["recaptcha_ms"] = int((time.time() - recaptcha_started_at) * 1000)
             attempt_trace["recaptcha_ok"] = bool(recaptcha_token)
             if not recaptcha_token:
@@ -2281,7 +2182,6 @@ class FlowClient:
                     at=at,
                     attempt_trace=attempt_trace,
                     project_id=project_id,
-                    token_id=token_id,
                 )
                 attempt_trace["success"] = True
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
@@ -2305,8 +2205,6 @@ class FlowClient:
                 if should_retry:
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
         
         # All retries failed
         perf_trace["final_success_attempt"] = None
@@ -2416,8 +2314,6 @@ class FlowClient:
                 if should_retry:
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
 
         raise last_error
 
@@ -2449,12 +2345,6 @@ class FlowClient:
             }
         }
 
-    def _build_video_media_generation_context(self, batch_id: Optional[str] = None) -> Dict[str, Any]:
-        return {
-            "batchId": batch_id or str(uuid.uuid4()),
-            "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
-        }
-
     def _find_nested_string(self, value: Any, keys: tuple[str, ...]) -> Optional[str]:
         if isinstance(value, dict):
             for key in keys:
@@ -2471,19 +2361,6 @@ class FlowClient:
                 if found:
                     return found
         return None
-
-    def _truncate_large_debug_value(self, data: Any, max_length: int = 240) -> Any:
-        """Truncate very long fields in debug output to keep the console readable."""
-        if isinstance(data, dict):
-            return {
-                key: self._truncate_large_debug_value(value, max_length=max_length)
-                for key, value in data.items()
-            }
-        if isinstance(data, list):
-            return [self._truncate_large_debug_value(item, max_length=max_length) for item in data]
-        if isinstance(data, str) and len(data) > max_length:
-            return f"{data[:max_length]}... (truncated, total {len(data)} chars)"
-        return data
 
     def _extract_video_status_from_media(self, media: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
         status_block = (
@@ -2715,7 +2592,6 @@ class FlowClient:
         use_v2_model_config: bool = False,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
-        token_video_concurrency: Optional[int] = None,
         output_resolution: Optional[str] = None,
     ) -> dict:
         """Text-to-video; returns task_id
@@ -2752,25 +2628,11 @@ class FlowClient:
         video_context_warmed = False
         while retry_attempt < max_retries:
             # Get a fresh reCAPTCHA token on every retry - video uses VIDEO_GENERATION action
-            launch_gate_acquired = False
-            launch_ok, _, _ = await self._acquire_video_launch_gate(
-                token_id=token_id,
-                token_video_concurrency=token_video_concurrency,
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id,
+                action="VIDEO_GENERATION",
+                token_id=token_id
             )
-            if not launch_ok:
-                last_error = Exception("Video launch queue wait timeout")
-                raise last_error
-
-            launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="VIDEO_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_video_launch_gate(token_id)
             if not recaptcha_token:
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
@@ -2850,8 +2712,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
             retry_attempt += 1
         
         # All retries failed
@@ -3314,9 +3174,6 @@ class FlowClient:
         at: str,
         payload: Dict[str, Any],
         *,
-        project_id: Optional[str] = None,
-        token_id: Optional[int] = None,
-        action: str = "VIDEO_GENERATION",
         account_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         url = f"{self.api_base_url}/flowCreationAgent:streamChat?alt=sse"
@@ -3329,55 +3186,17 @@ class FlowClient:
         )
         headers["Accept"] = "text/event-stream, text/event-stream"
 
-        if config.captcha_method == "browser" and project_id:
-            from .browser_captcha import BrowserCaptchaService
-
-            service = await BrowserCaptchaService.get_instance(self.db)
-            response_payload, _browser_ref, fingerprint = await service.submit_flow_request(
-                project_id=project_id,
-                action=action,
-                token_id=token_id,
-                url=url,
-                at_token=at,
-                json_data=payload,
-                timeout=self._get_video_submit_timeout(),
-            )
-            self._set_request_fingerprint(fingerprint if fingerprint else None)
-
-            status_code = int(response_payload.get("status") or 0)
-            raw_text = response_payload.get("text") or ""
-            if status_code >= 400:
-                error_reason = f"HTTP Error {status_code}"
-                parsed_body = None
-                try:
-                    parsed_body = json.loads(raw_text) if raw_text else None
-                except Exception:
-                    parsed_body = None
-                if isinstance(parsed_body, dict) and "error" in parsed_body:
-                    error_info = parsed_body["error"] or {}
-                    error_message = error_info.get("message", "")
-                    details = error_info.get("details", [])
-                    for detail in details or []:
-                        if isinstance(detail, dict) and detail.get("reason"):
-                            error_reason = detail.get("reason")
-                            break
-                    if error_message:
-                        error_reason = f"{error_reason}: {error_message}"
-                elif raw_text:
-                    error_reason = f"HTTP Error {status_code}: {raw_text[:200]}"
-                raise Exception(error_reason)
-        else:
-            raw_text = await self._make_text_request(
-                method="POST",
-                url=url,
-                headers=headers,
-                json_data=payload,
-                use_at=True,
-                at_token=at,
-                timeout=self._get_video_submit_timeout(),
-                apply_default_client_headers=False,
-                impersonate=self._resolve_runtime_impersonate(),
-            )
+        raw_text = await self._make_text_request(
+            method="POST",
+            url=url,
+            headers=headers,
+            json_data=payload,
+            use_at=True,
+            at_token=at,
+            timeout=self._get_video_submit_timeout(),
+            apply_default_client_headers=False,
+            impersonate=self._resolve_runtime_impersonate(),
+        )
         return self._parse_sse_json_events(raw_text)
 
     async def generate_omni_reference_video(
@@ -3393,7 +3212,6 @@ class FlowClient:
         duration: int = 10,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
-        token_video_concurrency: Optional[int] = None,
     ) -> Dict[str, Any]:
         if not st:
             raise RuntimeError("Omni reference video needs an ST token, but this account has no ST")
@@ -3416,27 +3234,11 @@ class FlowClient:
         )
 
         while retry_attempt < max_retries:
-            launch_gate_acquired = False
-            approve_browser_id = None
-            launch_ok, _, _ = await self._acquire_video_launch_gate(
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id,
+                action="VIDEO_GENERATION",
                 token_id=token_id,
-                token_video_concurrency=token_video_concurrency,
             )
-            if not launch_ok:
-                last_error = Exception("Video launch queue wait timeout")
-                raise last_error
-
-            launch_gate_acquired = True
-            browser_id = None
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="VIDEO_GENERATION",
-                    token_id=token_id,
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_video_launch_gate(token_id)
 
             if not recaptcha_token:
                 last_error = Exception("Failed to obtain reCAPTCHA token")
@@ -3525,14 +3327,12 @@ class FlowClient:
                 prompt_events = await self.stream_flow_creation_agent(
                     at=at,
                     payload=prompt_payload,
-                    project_id=project_id,
-                    token_id=token_id,
                     account_id=account_id,
                 )
                 tool_result = self._extract_generate_video_with_references_result(prompt_events)
 
                 if not tool_result:
-                    approve_recaptcha_token, approve_browser_id = await self._get_recaptcha_token(
+                    approve_recaptcha_token, _ = await self._get_recaptcha_token(
                         project_id,
                         action="VIDEO_GENERATION",
                         token_id=token_id,
@@ -3561,13 +3361,9 @@ class FlowClient:
                     approve_events = await self.stream_flow_creation_agent(
                         at=at,
                         payload=approve_payload,
-                        project_id=project_id,
-                        token_id=token_id,
                         account_id=account_id,
                     )
                     tool_result = self._extract_generate_video_with_references_result(approve_events)
-                    await self._notify_browser_captcha_request_finished(approve_browser_id)
-                    approve_browser_id = None
 
                 if not tool_result:
                     raise RuntimeError("Omni reference video did not return a generate_video_with_references toolResult")
@@ -3613,10 +3409,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
-                if approve_browser_id:
-                    await self._notify_browser_captcha_request_finished(approve_browser_id)
 
             retry_attempt += 1
 
@@ -3632,7 +3424,6 @@ class FlowClient:
         reference_images: List[Dict],
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
-        token_video_concurrency: Optional[int] = None,
         prompt_parts: Optional[List[Dict[str, Any]]] = None,
         reference_entities: Optional[List[str]] = None,
     ) -> dict:
@@ -3661,25 +3452,11 @@ class FlowClient:
         video_context_warmed = False
         while retry_attempt < max_retries:
             # Get a fresh reCAPTCHA token on every retry - video uses VIDEO_GENERATION action
-            launch_gate_acquired = False
-            launch_ok, _, _ = await self._acquire_video_launch_gate(
-                token_id=token_id,
-                token_video_concurrency=token_video_concurrency,
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id,
+                action="VIDEO_GENERATION",
+                token_id=token_id
             )
-            if not launch_ok:
-                last_error = Exception("Video launch queue wait timeout")
-                raise last_error
-
-            launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="VIDEO_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_video_launch_gate(token_id)
             if not recaptcha_token:
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
@@ -3757,8 +3534,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
             retry_attempt += 1
         
         # All retries failed
@@ -3776,7 +3551,6 @@ class FlowClient:
         use_v2_model_config: bool = False,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
-        token_video_concurrency: Optional[int] = None,
     ) -> dict:
         """Video from start and end frames; returns task_id
 
@@ -3804,25 +3578,11 @@ class FlowClient:
         video_context_warmed = False
         while retry_attempt < max_retries:
             # Get a fresh reCAPTCHA token on every retry - video uses VIDEO_GENERATION action
-            launch_gate_acquired = False
-            launch_ok, _, _ = await self._acquire_video_launch_gate(
-                token_id=token_id,
-                token_video_concurrency=token_video_concurrency,
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id,
+                action="VIDEO_GENERATION",
+                token_id=token_id
             )
-            if not launch_ok:
-                last_error = Exception("Video launch queue wait timeout")
-                raise last_error
-
-            launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="VIDEO_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_video_launch_gate(token_id)
             if not recaptcha_token:
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
@@ -3906,8 +3666,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
             retry_attempt += 1
         
         # All retries failed
@@ -3924,7 +3682,6 @@ class FlowClient:
         use_v2_model_config: bool = False,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
-        token_video_concurrency: Optional[int] = None,
     ) -> dict:
         """Video from start frame only; returns task_id
 
@@ -3951,25 +3708,11 @@ class FlowClient:
         video_context_warmed = False
         while retry_attempt < max_retries:
             # Get a fresh reCAPTCHA token on every retry - video uses VIDEO_GENERATION action
-            launch_gate_acquired = False
-            launch_ok, _, _ = await self._acquire_video_launch_gate(
-                token_id=token_id,
-                token_video_concurrency=token_video_concurrency,
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id,
+                action="VIDEO_GENERATION",
+                token_id=token_id
             )
-            if not launch_ok:
-                last_error = Exception("Video launch queue wait timeout")
-                raise last_error
-
-            launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="VIDEO_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_video_launch_gate(token_id)
             if not recaptcha_token:
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
@@ -4051,8 +3794,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
             retry_attempt += 1
         
         # All retries failed
@@ -4070,7 +3811,6 @@ class FlowClient:
         video_media_id: str,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
-        token_video_concurrency: Optional[int] = None,
     ) -> dict:
         """Extend a generated video by 7 seconds
 
@@ -4097,25 +3837,11 @@ class FlowClient:
         batch_id = str(uuid.uuid4())
         video_context_warmed = False
         while retry_attempt < max_retries:
-            launch_gate_acquired = False
-            launch_ok, _, _ = await self._acquire_video_launch_gate(
-                token_id=token_id,
-                token_video_concurrency=token_video_concurrency,
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id,
+                action="VIDEO_GENERATION",
+                token_id=token_id
             )
-            if not launch_ok:
-                last_error = Exception("Video launch queue wait timeout")
-                raise last_error
-
-            launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="VIDEO_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_video_launch_gate(token_id)
             if not recaptcha_token:
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
@@ -4206,8 +3932,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
             retry_attempt += 1
 
         # All retries failed
@@ -4371,7 +4095,6 @@ class FlowClient:
         model_key: str,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
-        token_video_concurrency: Optional[int] = None,
     ) -> dict:
         """Upscale a video to 4K/1080P; returns task_id
 
@@ -4397,25 +4120,11 @@ class FlowClient:
         scene_id = str(uuid.uuid4())
         video_context_warmed = False
         while retry_attempt < max_retries:
-            launch_gate_acquired = False
-            launch_ok, _, _ = await self._acquire_video_launch_gate(
-                token_id=token_id,
-                token_video_concurrency=token_video_concurrency,
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
+                project_id,
+                action="VIDEO_GENERATION",
+                token_id=token_id
             )
-            if not launch_ok:
-                last_error = Exception("Video launch queue wait timeout")
-                raise last_error
-
-            launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="VIDEO_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_video_launch_gate(token_id)
             if not recaptcha_token:
                 last_error = Exception("Failed to obtain reCAPTCHA token")
                 should_retry = await self._handle_missing_recaptcha_token(
@@ -4497,8 +4206,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise
-            finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
             retry_attempt += 1
         
         raise last_error
@@ -4541,25 +4248,6 @@ class FlowClient:
                     at=at,
                     timeout=self._get_video_poll_timeout()
                 )
-                try:
-                    media_preview = result.get("media") if isinstance(result, dict) else None
-                    operations_preview = result.get("operations") if isinstance(result, dict) else None
-                    preview_payload = {
-                        "top_keys": list(result.keys()) if isinstance(result, dict) else [],
-                        "media_count": len(media_preview) if isinstance(media_preview, list) else 0,
-                        "operations_count": len(operations_preview) if isinstance(operations_preview, list) else 0,
-                        "first_media": media_preview[0] if isinstance(media_preview, list) and media_preview else None,
-                        "first_operation": operations_preview[0] if isinstance(operations_preview, list) and operations_preview else None,
-                    }
-                    print(
-                        "[VIDEO POLL RAW] "
-                        + json.dumps(
-                            self._truncate_large_debug_value(preview_payload),
-                            ensure_ascii=False,
-                        )[:4000]
-                    )
-                except Exception:
-                    pass
                 return self._normalize_video_generation_response(result)
             except Exception as e:
                 last_error = e
@@ -4841,7 +4529,6 @@ class FlowClient:
         if should_notify_browser:
             notify_reason = retry_reason or error_str[:120] or type(error).__name__
             await self._notify_browser_captcha_error(
-                browser_id=browser_id,
                 project_id=project_id,
                 error_reason=notify_reason,
                 error_message=error_str,
@@ -4883,10 +4570,6 @@ class FlowClient:
     def _get_retry_reason(self, error_str: str) -> Optional[str]:
         """Decide whether to retry; returns the reason text for logs"""
         error_lower = error_str.lower()
-        if "error_no_slot_available_block" in error_lower:
-            return "captcha solver blocked (no slot)"
-        if "error_no_slot_available" in error_lower:
-            return "captcha solver out of slots"
         if "403" in error_lower:
             return "403 error"
         if "429" in error_lower or "too many requests" in error_lower:
@@ -4914,149 +4597,29 @@ class FlowClient:
 
     def _get_retry_delay_seconds(self, error_str: str, retry_attempt: int) -> int:
         error_lower = str(error_str or "").lower()
-        if "error_no_slot_available_block" in error_lower:
-            return 20
-        if "error_no_slot_available" in error_lower:
-            index = max(0, min(retry_attempt, len(self.YESCAPTCHA_SLOT_BACKOFF_SECONDS) - 1))
-            return self.YESCAPTCHA_SLOT_BACKOFF_SECONDS[index]
         if "recaptcha evaluation failed" in error_lower:
             return 2
         if "recaptcha" in error_lower:
             return 2
         return 1
 
-    def _resolve_recaptcha_runtime_settings(
-        self,
-        method: str,
-        action: str,
-    ) -> Dict[str, Any]:
-        normalized_action = str(action or "IMAGE_GENERATION").strip() or "IMAGE_GENERATION"
-        website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
-
-        if method == "yescaptcha":
-            page_action = normalized_action
-            task_type = config.yescaptcha_task_type
-            min_score = get_yescaptcha_min_score(task_type)
-        elif method == "capmonster":
-            page_action = normalized_action
-            task_type = "RecaptchaV3TaskProxyless"
-            min_score = None
-        elif method == "ezcaptcha":
-            page_action = normalized_action
-            task_type = "ReCaptchaV3TaskProxylessS9"
-            min_score = None
-        elif method == "capsolver":
-            page_action = normalized_action
-            task_type = "ReCaptchaV3EnterpriseTaskProxyLess"
-            min_score = None
-        else:
-            page_action = normalized_action
-            task_type = None
-            min_score = None
-
-        return {
-            "website_key": website_key,
-            "page_action": page_action,
-            "task_type": task_type,
-            "min_score": min_score,
-        }
-
-    def _merge_request_fingerprint(self, patch: Optional[Dict[str, Any]]):
-        if not isinstance(patch, dict) or not patch:
-            return
-        current = self.get_request_fingerprint() or {}
-        merged = dict(current)
-        for key, value in patch.items():
-            if value is None:
-                continue
-            if isinstance(value, str):
-                normalized = value.strip()
-                if not normalized:
-                    continue
-                merged[key] = normalized
-            else:
-                merged[key] = value
-        self._set_request_fingerprint(merged if merged else None)
-
     async def _notify_browser_captcha_error(
         self,
-        browser_id: Optional[Union[int, str]] = None,
         project_id: Optional[str] = None,
         error_reason: Optional[str] = None,
         error_message: Optional[str] = None,
     ):
-        """Tell the browser captcha service to self-heal after a failure.
-        
-        Args:
-            browser_id: browser ID (browser mode)
-            project_id: project_id (personal mode)
-            error_reason: classified error reason
-            error_message: raw error text
-        """
-        if config.captcha_method == "browser":
-            try:
-                from .browser_captcha import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
-                await service.report_error(
-                    browser_id,
-                    error_reason=error_reason or error_message or "upstream_error"
-                )
-            except Exception:
-                pass
-        elif config.captcha_method == "extension":
-            try:
-                from .browser_captcha_extension import ExtensionCaptchaService
-                service = await ExtensionCaptchaService.get_instance()
-                await service.report_flow_error(
-                    project_id=project_id,
-                    error_reason=error_reason or "",
-                    error_message=error_message or "",
-                )
-            except Exception:
-                pass
-        elif config.captcha_method == "personal" and project_id:
-            try:
-                from .browser_captcha_personal import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
-                await service.report_flow_error(
-                    project_id=project_id,
-                    error_reason=error_reason or "",
-                    error_message=error_message or "",
-                )
-            except Exception:
-                pass
-        elif config.captcha_method == "remote_browser" and browser_id:
-            try:
-                session_id = quote(str(browser_id), safe="")
-                await self._call_remote_browser_service(
-                    method="POST",
-                    path=f"/api/v1/sessions/{session_id}/error",
-                    json_data={"error_reason": error_reason or error_message or "upstream_error"},
-                    timeout_override=2,
-                )
-            except Exception as e:
-                debug_logger.log_warning(f"[reCAPTCHA RemoteBrowser] Failed to report error: {e}")
-
-    async def _notify_browser_captcha_request_finished(self, browser_id: Optional[Union[int, str]] = None):
-        """Tell the headed browser the upstream image/video request is done, so its captcha browser can close."""
-        if config.captcha_method == "browser":
-            try:
-                from .browser_captcha import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
-                await service.report_request_finished(browser_id)
-            except Exception:
-                pass
-        elif config.captcha_method == "remote_browser" and browser_id:
-            try:
-                session_id = quote(str(browser_id), safe="")
-                await self._call_remote_browser_service(
-                    method="POST",
-                    path=f"/api/v1/sessions/{session_id}/finish",
-                    json_data={"status": "success"},
-                    timeout_override=2,
-                )
-            except Exception as e:
-                debug_logger.log_warning(f"[reCAPTCHA RemoteBrowser] Failed to report finish: {e}")
+        """Tell the worker extension a Flow request failed, so it can self-heal."""
+        try:
+            from .browser_captcha_extension import ExtensionCaptchaService
+            service = await ExtensionCaptchaService.get_instance()
+            await service.report_flow_error(
+                project_id=project_id,
+                error_reason=error_reason or "",
+                error_message=error_message or "",
+            )
+        except Exception:
+            pass
 
     def _generate_session_id(self) -> str:
         """Build sessionId: ;timestamp"""
@@ -5065,234 +4628,6 @@ class FlowClient:
     def _generate_scene_id(self) -> str:
         """Build sceneId: UUID"""
         return str(uuid.uuid4())
-
-    def _get_remote_browser_service_config(self) -> tuple[str, str, int]:
-        base_url = (config.remote_browser_base_url or "").strip().rstrip("/")
-        api_key = (config.remote_browser_api_key or "").strip()
-        timeout = max(5, int(config.remote_browser_timeout or 60))
-
-        if not base_url:
-            raise RuntimeError("remote_browser service URL is not configured")
-        if not api_key:
-            raise RuntimeError("remote_browser API Key is not configured")
-
-        if not (base_url.startswith("http://") or base_url.startswith("https://")):
-            raise RuntimeError("remote_browser service URL is malformed")
-
-        return base_url, api_key, timeout
-
-    @staticmethod
-    def _build_remote_browser_http_timeout(read_timeout: float) -> Any:
-        read_value = max(3.0, float(read_timeout))
-        write_value = min(10.0, max(3.0, read_value))
-        if httpx is None:
-            return read_value
-        return httpx.Timeout(
-            connect=2.5,
-            read=read_value,
-            write=write_value,
-            pool=2.5,
-        )
-
-    @staticmethod
-    def _parse_json_response_text(text: str) -> Optional[Any]:
-        if not text:
-            return None
-        try:
-            return json.loads(text)
-        except Exception:
-            return None
-
-    @staticmethod
-    async def _stdlib_json_http_request(
-        method: str,
-        url: str,
-        headers: Dict[str, str],
-        payload: Optional[Dict[str, Any]],
-        timeout: int,
-    ) -> tuple[int, Optional[Any], str]:
-        req_headers = dict(headers or {})
-        req_headers.setdefault("Accept", "application/json")
-        request_method = (method or "GET").upper()
-        request_data: Optional[bytes] = None
-
-        if payload is not None:
-            req_headers["Content-Type"] = "application/json; charset=utf-8"
-            if request_method != "GET":
-                request_data = json.dumps(payload).encode("utf-8")
-
-        def do_request() -> tuple[int, str]:
-            request = urllib.request.Request(
-                url=url,
-                data=request_data,
-                headers=req_headers,
-                method=request_method,
-            )
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            try:
-                with opener.open(request, timeout=max(1.0, float(timeout))) as response:
-                    status_code = int(getattr(response, "status", 0) or response.getcode() or 0)
-                    body = response.read()
-                    charset = response.headers.get_content_charset() or "utf-8"
-                    return status_code, body.decode(charset, errors="replace")
-            except urllib.error.HTTPError as exc:
-                body = exc.read()
-                charset = exc.headers.get_content_charset() if exc.headers else None
-                return int(getattr(exc, "code", 0) or 0), body.decode(charset or "utf-8", errors="replace")
-
-        try:
-            status_code, text = await asyncio.to_thread(do_request)
-        except Exception as e:
-            raise RuntimeError(f"remote_browser request failed: {e}") from e
-
-        return status_code, FlowClient._parse_json_response_text(text), text
-
-    @staticmethod
-    async def _sync_json_http_request(
-        method: str,
-        url: str,
-        headers: Dict[str, str],
-        payload: Optional[Dict[str, Any]],
-        timeout: int,
-    ) -> tuple[int, Optional[Any], str]:
-        req_headers = dict(headers or {})
-        req_headers.setdefault("Accept", "application/json")
-        request_method = (method or "GET").upper()
-        request_kwargs: Dict[str, Any] = {
-            "headers": req_headers,
-            "timeout": FlowClient._build_remote_browser_http_timeout(timeout),
-        }
-
-        if payload is not None:
-            req_headers["Content-Type"] = "application/json; charset=utf-8"
-            if request_method != "GET":
-                request_kwargs["json"] = payload
-
-        if httpx is None:
-            return await FlowClient._stdlib_json_http_request(
-                method=method,
-                url=url,
-                headers=req_headers,
-                payload=payload,
-                timeout=timeout,
-            )
-
-        try:
-            # The remote_browser control plane only needs reliable JSON, no fingerprint spoofing.
-            # httpx avoids curl_cffi dropping the POST body in this environment.
-            async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as session:
-                response = await session.request(
-                    method=request_method,
-                    url=url,
-                    **request_kwargs,
-                )
-        except Exception as e:
-            raise RuntimeError(f"remote_browser request failed: {e}") from e
-
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        text = response.text or ""
-        parsed = FlowClient._parse_json_response_text(text)
-
-        return status_code, parsed, text
-
-    async def _call_remote_browser_service(
-        self,
-        method: str,
-        path: str,
-        json_data: Optional[Dict[str, Any]] = None,
-        timeout_override: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        base_url, api_key, timeout = self._get_remote_browser_service_config()
-        url = f"{base_url}{path}"
-        effective_timeout = max(5, int(timeout_override or timeout))
-
-        status_code, payload, response_text = await self._sync_json_http_request(
-            method=method,
-            url=url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            payload=json_data,
-            timeout=effective_timeout,
-        )
-
-        if status_code >= 400:
-            detail = ""
-            if isinstance(payload, dict):
-                detail = payload.get("detail") or payload.get("message") or str(payload)
-            if not detail:
-                detail = (response_text or "").strip() or f"HTTP {status_code}"
-            raise RuntimeError(f"remote_browser request failed: {detail}")
-
-        if not isinstance(payload, dict):
-            raise RuntimeError("remote_browser returned an invalid format")
-
-        return payload
-
-    async def prefill_remote_browser_pool(
-        self,
-        project_id: str,
-        action: str = "IMAGE_GENERATION",
-        token_id: Optional[int] = None,
-        *,
-        cooldown_seconds: float = 8.0,
-    ) -> bool:
-        """Ask the local remote_browser service to refill its pool early, so token wait happens sooner."""
-        if config.captcha_method != "remote_browser":
-            return False
-
-        normalized_project = str(project_id or "").strip()
-        normalized_action = str(action or "IMAGE_GENERATION").strip() or "IMAGE_GENERATION"
-        if not normalized_project:
-            return False
-
-        cache_key = f"{normalized_project}|{normalized_action}|{int(token_id or 0)}"
-        now_value = time.monotonic()
-        last_sent = float(self._remote_browser_prefill_last_sent.get(cache_key, 0.0) or 0.0)
-        if (now_value - last_sent) < max(0.5, float(cooldown_seconds)):
-            return False
-
-        try:
-            await self._call_remote_browser_service(
-                method="POST",
-                path="/api/v1/prefill",
-                json_data={
-                    "project_id": normalized_project,
-                    "action": normalized_action,
-                    "token_id": token_id,
-                },
-                timeout_override=3,
-            )
-            self._remote_browser_prefill_last_sent[cache_key] = now_value
-            return True
-        except Exception as e:
-            debug_logger.log_warning(f"[reCAPTCHA RemoteBrowser] prefill failed: {e}")
-            return False
-
-    async def prefill_remote_browser_for_tokens(self, tokens: List[Any], action: str = "IMAGE_GENERATION") -> int:
-        if config.captcha_method != "remote_browser":
-            return 0
-
-        unique_projects: List[str] = []
-        seen_projects = set()
-        for token in tokens or []:
-            project_id = str(getattr(token, "current_project_id", "") or "").strip()
-            if not project_id or project_id in seen_projects:
-                continue
-            seen_projects.add(project_id)
-            unique_projects.append(project_id)
-
-        warmed = 0
-        for project_id in unique_projects:
-            if await self.prefill_remote_browser_pool(project_id, action=action):
-                warmed += 1
-        return warmed
-
-    def _resolve_remote_browser_solve_timeout(self, action: str) -> int:
-        base_timeout = max(5, int(config.remote_browser_timeout or 60))
-        action_name = str(action or "").strip().upper()
-
-        # This only fetches a reCAPTCHA token; it should not share the generation timeout of hundreds of seconds.
-        target_timeout = 45 if action_name == "VIDEO_GENERATION" else 35
-        return max(12, min(base_timeout, target_timeout))
 
     async def _server_fallback_can_serve(self, token_id: Optional[int]) -> bool:
         """Flag on, this image has Chromium, and the account has its own proxy."""
@@ -5371,427 +4706,70 @@ class FlowClient:
         project_id: str,
         action: str = "IMAGE_GENERATION",
         token_id: Optional[int] = None
-    ) -> tuple[Optional[str], Optional[Union[int, str]]]:
-        """Get a reCAPTCHA token - supports several captcha methods
-        
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Get a reCAPTCHA token from the account's worker extension, else the server fallback.
+
         Args:
             project_id: project ID
             action: reCAPTCHA action type
                 - IMAGE_GENERATION: image generation and 2K/4K image upscale (default)
                 - VIDEO_GENERATION: video generation and video upscale
-            token_id: current token id (browser mode uses it to read the per-token captcha proxy)
-        
+            token_id: current token id (routes the mint to that account's worker browser)
+
         Returns:
-            (token, browser_id) tuple.
-            - browser mode: browser_id is the local browser ID
-            - remote_browser mode: browser_id is the remote session_id
-            - other modes: browser_id is None
+            (token, source) tuple; source is "server" when the fallback minted, else None.
         """
         captcha_method = config.captcha_method
         debug_logger.log_info(f"[reCAPTCHA] Getting token: method={captcha_method}, project_id={project_id}, action={action}")
 
-        if captcha_method == "extension":
-            token = None
-            extension_error: Optional[str] = None
-            if token_id:
-                self._current_token_id_ctx.set(token_id)
-            if self._mint_override_ctx.get() != "server":
-                try:
-                    from .browser_captcha_extension import ExtensionCaptchaService
-                    service = await ExtensionCaptchaService.get_instance(self.db)
-                    # Video mints take longer in the browser (extension waits up to 60 s for
-                    # VIDEO_GENERATION since ext 3.3.6); give the server side headroom.
-                    extension_timeout = 75 if action == "VIDEO_GENERATION" else 25
-                    token = await service.get_token(
-                        project_id,
-                        action,
-                        timeout=extension_timeout,
-                        token_id=token_id
-                    )
-                except Exception as e:
-                    extension_error = str(e)
-                    debug_logger.log_error(f"[reCAPTCHA Extension] Error: {extension_error}")
-                if token:
-                    # Slice B — align REDEEM with MINT: make the generate request exit the SAME
-                    # residential IP + use the SAME browser UA that the extension used to mint the
-                    # reCAPTCHA. If the account hasn't reported them, this is None and the redeem
-                    # falls back to the global request proxy (WARP) exactly as before (no regression).
-                    redeem_fp = await self._build_extension_redeem_fingerprint(token_id)
-                    self._set_request_fingerprint(redeem_fp)
-                    self._mint_source_ctx.set("extension")
-                    if redeem_fp:
-                        debug_logger.event(
-                            f"[REDEEM_ALIGN] token={token_id} egress={mask_proxy_url(redeem_fp.get('proxy_url'))} "
-                            f"ua_set={bool(redeem_fp.get('user_agent'))}"
-                        )
-                    return token, None
-            # 2026-09-23 server-side fallback: the worker is offline, could not mint, or
-            # its token was refused earlier in this request. Mint on flow.google.com in a
-            # server Chromium that egresses through the account's own proxy; redeem must
-            # then use THAT Chromium's UA (a mismatched UA is refused).
-            fallback = await self._server_fallback_mint(action, token_id, why=extension_error or "extension mint failed")
-            if fallback:
-                return fallback, "server"
+        # 2026-11-04: only the worker extension mints; the other captcha modes were removed.
+        if captcha_method != "extension":
             self._set_request_fingerprint(None)
-            return None, None
+            raise RuntimeError(
+                f"Failed to obtain reCAPTCHA token: captcha method {captcha_method!r} is no longer supported; "
+                "set it to 'extension' in the admin Captcha Settings"
+            )
 
-        # Built-in browser captcha (nodriver)
-        if captcha_method == "personal":
-            debug_logger.log_info(f"[reCAPTCHA] Using personal mode")
+        token = None
+        extension_error: Optional[str] = None
+        if token_id:
+            self._current_token_id_ctx.set(token_id)
+        if self._mint_override_ctx.get() != "server":
             try:
-                from .browser_captcha_personal import BrowserCaptchaService
-                debug_logger.log_info(f"[reCAPTCHA] Imported BrowserCaptchaService")
-                service = await BrowserCaptchaService.get_instance(self.db)
-                debug_logger.log_info(f"[reCAPTCHA] Got service instance, calling get_token")
-                solve_bundle = None
-                get_token_bundle = getattr(service, "get_token_bundle", None)
-                if callable(get_token_bundle):
-                    solve_bundle = await get_token_bundle(
-                        project_id,
-                        action,
-                        token_id=token_id,
-                    )
-                    token = str((solve_bundle or {}).get("token") or "").strip() or None
-                else:
-                    get_token_with_metadata = getattr(service, "get_token_with_metadata", None)
-                    if callable(get_token_with_metadata):
-                        token, _slot_id, _cookie_source_token_id = await get_token_with_metadata(
-                            project_id,
-                            action,
-                            token_id=token_id,
-                        )
-                    else:
-                        token = await service.get_token(project_id, action, token_id=token_id)
-                    solve_bundle = {
-                        "token": token,
-                        "fingerprint": service.get_last_fingerprint() if token else None,
-                    } if token else None
-                debug_logger.log_info(f"[reCAPTCHA] get_token returned: {token[:50] if token else None}...")
-                fingerprint = (
-                    solve_bundle.get("fingerprint")
-                    if isinstance(solve_bundle, dict) and isinstance(solve_bundle.get("fingerprint"), dict)
-                    else None
+                from .browser_captcha_extension import ExtensionCaptchaService
+                service = await ExtensionCaptchaService.get_instance(self.db)
+                # Video mints take longer in the browser (extension waits up to 60 s for
+                # VIDEO_GENERATION since ext 3.3.6); give the server side headroom.
+                extension_timeout = 75 if action == "VIDEO_GENERATION" else 25
+                token = await service.get_token(
+                    project_id,
+                    action,
+                    timeout=extension_timeout,
+                    token_id=token_id
                 )
-                if isinstance(solve_bundle, dict) and token:
-                    session_cookies = solve_bundle.get("session_cookies")
-                    proxy_url = str(solve_bundle.get("proxy_url") or "").strip()
-                    next_fingerprint = dict(fingerprint or {})
-                    if isinstance(session_cookies, dict) and session_cookies:
-                        next_fingerprint["session_cookies"] = dict(session_cookies)
-                    if proxy_url and not str(next_fingerprint.get("proxy_url") or "").strip():
-                        next_fingerprint["proxy_url"] = proxy_url
-                    next_fingerprint["project_id"] = project_id
-                    next_fingerprint.setdefault("origin", "https://labs.google")
-                    next_fingerprint.setdefault("referer", self._build_flow_project_page_url(project_id))
-                    fingerprint = next_fingerprint or None
-                if token:
-                    effective_ua = str((fingerprint or {}).get("user_agent") or "").strip()
-                    effective_lang = str((fingerprint or {}).get("accept_language") or "").strip()
-                    if not effective_ua:
-                        debug_logger.log_warning(
-                            "[reCAPTCHA Personal] Got a token but no browser fingerprint UA; "
-                            "dropping this token and retrying so submit and captcha environments match"
-                        )
-                        self._set_request_fingerprint(None)
-                        return None, None
-                    debug_logger.log_info(
-                        "[reCAPTCHA Personal] Using browser fingerprint: "
-                        f"UA={effective_ua[:120]}, Accept-Language={effective_lang or '<empty>'}"
+            except Exception as e:
+                extension_error = str(e)
+                debug_logger.log_error(f"[reCAPTCHA Extension] Error: {extension_error}")
+            if token:
+                # Slice B — align REDEEM with MINT: make the generate request exit the SAME
+                # residential IP + use the SAME browser UA that the extension used to mint the
+                # reCAPTCHA. If the account hasn't reported them, this is None and the redeem
+                # falls back to the global request proxy (WARP) exactly as before (no regression).
+                redeem_fp = await self._build_extension_redeem_fingerprint(token_id)
+                self._set_request_fingerprint(redeem_fp)
+                self._mint_source_ctx.set("extension")
+                if redeem_fp:
+                    debug_logger.event(
+                        f"[REDEEM_ALIGN] token={token_id} egress={mask_proxy_url(redeem_fp.get('proxy_url'))} "
+                        f"ua_set={bool(redeem_fp.get('user_agent'))}"
                     )
-                self._set_request_fingerprint(fingerprint if token else None)
                 return token, None
-            except RuntimeError as e:
-                # Catch clear errors from Docker or missing dependencies
-                error_msg = str(e)
-                debug_logger.log_error(f"[reCAPTCHA Personal] {error_msg}")
-                print(f"[reCAPTCHA] ❌ Built-in browser captcha failed: {error_msg}")
-                self._set_request_fingerprint(None)
-                return None, None
-            except ImportError as e:
-                debug_logger.log_error(f"[reCAPTCHA Personal] Import failed: {str(e)}")
-                print(f"[reCAPTCHA] ❌ nodriver is not installed, run: pip install nodriver")
-                self._set_request_fingerprint(None)
-                return None, None
-            except Exception as e:
-                debug_logger.log_error(f"[reCAPTCHA Personal] Error: {str(e)}")
-                self._set_request_fingerprint(None)
-                return None, None
-        # Headed browser captcha (playwright)
-        elif captcha_method == "browser":
-            try:
-                from .browser_captcha import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
-                token, browser_id = await service.get_token(project_id, action, token_id=token_id)
-                fingerprint = await service.get_fingerprint(browser_id) if token else None
-                self._set_request_fingerprint(fingerprint if token else None)
-                return token, browser_id
-            except RuntimeError as e:
-                # Catch clear errors from Docker or missing dependencies
-                error_msg = str(e)
-                debug_logger.log_error(f"[reCAPTCHA Browser] {error_msg}")
-                print(f"[reCAPTCHA] ❌ Headed browser captcha failed: {error_msg}")
-                self._set_request_fingerprint(None)
-                return None, None
-            except ImportError as e:
-                debug_logger.log_error(f"[reCAPTCHA Browser] Import failed: {str(e)}")
-                print(f"[reCAPTCHA] ❌ playwright is not installed, run: pip install playwright && python -m playwright install chromium")
-                self._set_request_fingerprint(None)
-                return None, None
-            except Exception as e:
-                debug_logger.log_error(f"[reCAPTCHA Browser] Error: {str(e)}")
-                self._set_request_fingerprint(None)
-                return None, None
-        elif captcha_method == "remote_browser":
-            try:
-                solve_timeout = self._resolve_remote_browser_solve_timeout(action)
-                payload = await self._call_remote_browser_service(
-                    method="POST",
-                    path="/api/v1/solve",
-                    json_data={
-                        "project_id": project_id,
-                        "action": action,
-                        "token_id": token_id,
-                    },
-                    timeout_override=solve_timeout,
-                )
-                token = payload.get("token")
-                session_id = payload.get("session_id")
-                fingerprint = payload.get("fingerprint") if isinstance(payload.get("fingerprint"), dict) else None
-                self._set_request_fingerprint(fingerprint if token else None)
-                if not token or not session_id:
-                    raise RuntimeError(f"remote_browser response missing token/session_id: {payload}")
-                return token, str(session_id)
-            except Exception as e:
-                debug_logger.log_error(f"[reCAPTCHA RemoteBrowser] Error: {str(e)}")
-                self._set_request_fingerprint(None)
-                return None, None
-        # API captcha services
-        elif captcha_method in ["yescaptcha", "capmonster", "ezcaptcha", "capsolver"]:
-            proxy_url = None
-            if self.proxy_manager:
-                try:
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                except Exception as e:
-                    debug_logger.log_warning(f"[reCAPTCHA] Failed to get proxy for API captcha: {e}")
-
-            api_captcha_ua = self._generate_user_agent(str(token_id or project_id or captcha_method))
-            self._set_request_fingerprint(
-                self._build_fingerprint_from_user_agent(
-                    api_captcha_ua,
-                    accept_language=self._get_primary_accept_language(),
-                    proxy_url=proxy_url,
-                )
-            )
-            self._merge_request_fingerprint(
-                {
-                    "project_id": project_id,
-                    "origin": "https://labs.google",
-                    "referer": self._build_flow_project_page_url(project_id),
-                }
-            )
-
-            api_result = await self._get_api_captcha_token(
-                captcha_method,
-                project_id,
-                action,
-                proxy_url=proxy_url,
-                user_agent=api_captcha_ua,
-            )
-            if api_result is None:
-                return None, None
-            token, captcha_user_agent = api_result
-            # Merge the solver's userAgent into the fingerprint so Flow API submits use the same UA.
-            # Otherwise Google reCAPTCHA V3 flags the UA mismatch as UNUSUAL_ACTIVITY and returns
-            # "reCAPTCHA evaluation failed". Other Client Hints (sec-ch-ua-platform, etc.)
-            # are inferred from the UA by _make_request (Windows → "Windows", etc.).
-            if captcha_user_agent:
-                existing_fp = self._request_fingerprint_ctx.get()
-                merged_fp = dict(existing_fp) if isinstance(existing_fp, dict) else {}
-                merged_fp["user_agent"] = captcha_user_agent
-                self._set_request_fingerprint(merged_fp)
-                debug_logger.log_info(
-                    f"[reCAPTCHA {captcha_method}] Injected captcha UA into request fingerprint: "
-                    f"{captcha_user_agent[:80]}"
-                )
-            return token, None
-        else:
-            debug_logger.log_info(f"[reCAPTCHA] Unknown captcha method: {captcha_method}")
-            self._set_request_fingerprint(None)
-            return None, None
-
-    async def _get_api_captcha_token(
-        self,
-        method: str,
-        project_id: str,
-        action: str = "IMAGE_GENERATION",
-        proxy_url: Optional[str] = None,
-        user_agent: Optional[str] = None,
-    ) -> Optional[tuple[str, str]]:
-        """Generic API captcha service
-
-        Args:
-            method: captcha service type
-            project_id: project ID
-            action: reCAPTCHA action type (IMAGE_GENERATION or VIDEO_GENERATION)
-            proxy_url: pre-resolved proxy URL, so captcha and submit use the same egress
-            user_agent: UA passed to the solver, so solve and submit environments match
-
-        Returns:
-            (gRecaptchaResponse, userAgent) tuple, or None on failure.
-            userAgent is returned so later Flow API requests reuse the solve UA
-            and reCAPTCHA V3 does not flag a UA mismatch as UNUSUAL_ACTIVITY.
-        """
-        # Load config
-        if method == "yescaptcha":
-            client_key = config.yescaptcha_api_key
-            base_url = config.yescaptcha_base_url
-        elif method == "capmonster":
-            client_key = config.capmonster_api_key
-            base_url = config.capmonster_base_url
-        elif method == "ezcaptcha":
-            client_key = config.ezcaptcha_api_key
-            base_url = config.ezcaptcha_base_url
-        elif method == "capsolver":
-            client_key = config.capsolver_api_key
-            base_url = config.capsolver_base_url
-        else:
-            debug_logger.log_error(f"[reCAPTCHA] Unknown API method: {method}")
-            return None
-
-        if not client_key:
-            debug_logger.log_info(f"[reCAPTCHA] {method} API key not configured, skipping")
-            return None
-
-        runtime_settings = self._resolve_recaptcha_runtime_settings(method, action)
-        task_type = runtime_settings["task_type"]
-        min_score = runtime_settings["min_score"]
-        website_key = runtime_settings["website_key"]
-        website_url = self._build_flow_project_page_url(project_id)
-        page_action = runtime_settings["page_action"]
-
-        try:
-            # Load proxy config so captcha API calls also use the proxy
-            # Note: curl_cffi uses the proxy param for SOCKS5 and proxies for HTTP
-            proxy = None
-            proxies = None
-            resolved_proxy_url = str(proxy_url or "").strip()
-            if not resolved_proxy_url and self.proxy_manager:
-                try:
-                    resolved_proxy_url = str(await self.proxy_manager.get_request_proxy_url() or "").strip()
-                    if resolved_proxy_url:
-                        if resolved_proxy_url.startswith("socks5://"):
-                            # curl_cffi uses the proxy param for SOCKS5
-                            proxy = resolved_proxy_url
-                        else:
-                            # HTTP/HTTPS proxies use the proxies dict
-                            proxies = {"http": resolved_proxy_url, "https": resolved_proxy_url}
-                except Exception as e:
-                    debug_logger.log_warning(f"[reCAPTCHA {method}] Failed to get proxy: {e}")
-            elif resolved_proxy_url:
-                if resolved_proxy_url.startswith("socks5://"):
-                    proxy = resolved_proxy_url
-                else:
-                    proxies = {"http": resolved_proxy_url, "https": resolved_proxy_url}
-            
-            async with AsyncSession() as session:
-                create_url = f"{base_url}/createTask"
-                create_data = {
-                    "clientKey": client_key,
-                    "task": {
-                        "websiteURL": website_url,
-                        "websiteKey": website_key,
-                        "type": task_type,
-                        "pageAction": page_action
-                    }
-                }
-                effective_user_agent = str(
-                    user_agent
-                    or (self.get_request_fingerprint() or {}).get("user_agent")
-                    or self._generate_user_agent(str(project_id or method))
-                ).strip()
-                if effective_user_agent:
-                    create_data["task"]["userAgent"] = effective_user_agent
-                if min_score is not None:
-                    create_data["task"]["minScore"] = min_score
-
-                task_id = None
-                last_create_error = None
-                max_create_attempts = len(self.YESCAPTCHA_SLOT_BACKOFF_SECONDS) if method == "yescaptcha" else 1
-                for create_attempt in range(max_create_attempts):
-                    if proxy:
-                        result = await session.post(create_url, json=create_data, impersonate="chrome124", proxy=proxy)
-                    else:
-                        result = await session.post(create_url, json=create_data, impersonate="chrome124", proxies=proxies)
-
-                    debug_logger.log_info(f"[reCAPTCHA {method}] createTask response status: {result.status_code}")
-                    result_json = result.json()
-                    task_id = result_json.get('taskId')
-
-                    debug_logger.log_info(f"[reCAPTCHA {method}] created task_id: {task_id}, response: {result_json}")
-
-                    if task_id:
-                        break
-
-                    error_code = str(result_json.get("errorCode") or "").strip()
-                    error_desc = result_json.get('errorDescription', 'Unknown error')
-                    last_create_error = result_json
-                    if method == "yescaptcha" and error_code in {"ERROR_NO_SLOT_AVAILABLE", "ERROR_NO_SLOT_AVAILABLE_BLOCK"}:
-                        delay = self._get_retry_delay_seconds(error_code, create_attempt)
-                        if create_attempt < max_create_attempts - 1:
-                            debug_logger.log_warning(
-                                f"[reCAPTCHA {method}] createTask out of slots ({error_code}), retrying in {delay}s "
-                                f"({create_attempt + 2}/{max_create_attempts})"
-                            )
-                            await asyncio.sleep(delay)
-                            continue
-                    debug_logger.log_error(f"[reCAPTCHA {method}] Failed to create task: {error_desc}")
-                    return None
-
-                if not task_id:
-                    error_desc = (last_create_error or {}).get('errorDescription', 'Unknown error')
-                    debug_logger.log_error(f"[reCAPTCHA {method}] Failed to create task: {error_desc}")
-                    return None
-
-                get_url = f"{base_url}/getTaskResult"
-                for i in range(40):
-                    get_data = {
-                        "clientKey": client_key,
-                        "taskId": task_id
-                    }
-                    # Use different params per proxy type
-                    if proxy:
-                        result = await session.post(get_url, json=get_data, impersonate="chrome124", proxy=proxy)
-                    else:
-                        result = await session.post(get_url, json=get_data, impersonate="chrome124", proxies=proxies)
-                    result_json = result.json()
-
-                    debug_logger.log_info(f"[reCAPTCHA {method}] polling #{i+1}: {result_json}")
-
-                    status = result_json.get('status')
-                    if status == 'ready':
-                        solution = result_json.get('solution', {})
-                        response = solution.get('gRecaptchaResponse')
-                        if response:
-                            self._merge_request_fingerprint(
-                                self._build_fingerprint_from_user_agent(
-                                    solution.get("userAgent"),
-                                    accept_language=self._get_primary_accept_language(),
-                                    proxy_url=resolved_proxy_url,
-                                )
-                            )
-                            debug_logger.log_info(f"[reCAPTCHA {method}] Token obtained")
-                            # Also return userAgent; the caller injects it into the fingerprint context
-                            # so Flow API submits use the same UA as the solve.
-                            user_agent = solution.get('userAgent')
-                            return response, user_agent
-
-                    await asyncio.sleep(3)
-
-                debug_logger.log_error(f"[reCAPTCHA {method}] Timeout waiting for token")
-                return None
-
-        except Exception as e:
-            debug_logger.log_error(f"[reCAPTCHA {method}] error: {str(e)}")
-            return None
-
-
+        # 2026-09-23 server-side fallback: the worker is offline, could not mint, or
+        # its token was refused earlier in this request. Mint on flow.google.com in a
+        # server Chromium that egresses through the account's own proxy; redeem must
+        # then use THAT Chromium's UA (a mismatched UA is refused).
+        fallback = await self._server_fallback_mint(action, token_id, why=extension_error or "extension mint failed")
+        if fallback:
+            return fallback, "server"
+        self._set_request_fingerprint(None)
+        return None, None

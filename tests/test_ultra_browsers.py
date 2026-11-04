@@ -356,15 +356,13 @@ class HoldTests(Base):
 
     async def _pick(self, lb):
         from src.core import client_policy as cp
-        from src.core.config import config
-        saved = (config.captcha_method, cp.client_policy_store._policies)
-        config.set_captcha_method("yescaptcha")
+        saved = cp.client_policy_store._policies
         cp.client_policy_store.replace([{"client": "default", "image_tier": "any", "video_tier": "any"}])
         try:
-            return await lb.select_token(for_image_generation=True, reserve=False, enforce_concurrency_filter=False, client="pinterest-factory")
+            with patch.object(LoadBalancer, "_check_extension_route", AsyncMock(return_value=(True, ""))):  # no extension route checks
+                return await lb.select_token(for_image_generation=True, reserve=False, enforce_concurrency_filter=False, client="pinterest-factory")
         finally:
-            config.set_captcha_method(saved[0])
-            cp.client_policy_store._policies = saved[1]
+            cp.client_policy_store._policies = saved
 
     async def test_enable_during_onboarding_does_not_serve(self):
         """REGRESSION (R3-3): the ordinary Enable button during onboarding."""

@@ -113,81 +113,18 @@ async def lifespan(app: FastAPI):
         await db.check_and_migrate_db(config_dict)
         print("Database migration check completed.")
 
-    # On startup, sync DB config into memory so personal/browser runtime settings are not missed.
+    # On startup, sync DB config (captcha, generation, cache settings) into memory.
     await db.reload_config_to_memory()
     # Per-caller routing policies (client_policies table) into memory; admin POST reloads them.
     from .core.client_policy import client_policy_store
     await client_policy_store.load(db)
     generation_handler.file_cache.set_timeout(config.cache_timeout)
     cache_cleanup_enabled = await generation_handler.file_cache.refresh_cleanup_task()
-    captcha_config = await db.get_captcha_config()
-
-    # Take a token snapshot before browser services start; concurrency and warmup share it.
+    # Take a token snapshot; the concurrency manager is built from it.
     tokens = await token_manager.get_all_tokens()
-
-    # Initialize browser captcha service if needed
-    browser_service = None
-    if captcha_config.captcha_method == "personal":
-        from .services.browser_captcha_personal import (
-            BrowserCaptchaService,
-            PERSONAL_POOL_MAX_TOTAL_RESIDENT_TABS,
-            resolve_effective_browser_count,
-            resolve_effective_personal_max_resident_tabs,
-        )
-        browser_service = await BrowserCaptchaService.get_instance(db)
-        print("Browser captcha service initialized (nodriver mode)")
-
-        warmup_limit = max(1, min(
-            PERSONAL_POOL_MAX_TOTAL_RESIDENT_TABS,
-            resolve_effective_browser_count(config.browser_count)
-            * resolve_effective_personal_max_resident_tabs(config.personal_max_resident_tabs),
-        ))
-        warmup_project_ids = await token_manager.get_personal_warmup_project_ids(
-            tokens=tokens,
-            limit=warmup_limit,
-        )
-
-        warmed_slots = []
-        warmup_error = None
-        try:
-            warmed_slots = await browser_service.warmup_resident_tabs(
-                warmup_project_ids,
-                limit=warmup_limit,
-            )
-        except Exception as e:
-            warmup_error = e
-            print(
-                "Browser captcha resident warmup failed: "
-                f"{type(e).__name__}: {e}"
-            )
-        if warmed_slots:
-            print(
-                f"Browser captcha shared resident tabs warmed "
-                f"({len(warmed_slots)} slot(s), limit={warmup_limit})"
-            )
-        elif warmup_error is not None:
-            print("Browser captcha resident warmup skipped for this startup")
-        elif tokens:
-            print("Browser captcha resident warmup skipped: no tab warmed successfully")
-        else:
-            # No usable token: open a login window for the user
-            await browser_service.open_login_window()
-            print("No active token found, opened login window for manual setup")
-    elif captcha_config.captcha_method == "browser":
-        from .services.browser_captcha import BrowserCaptchaService
-        browser_service = await BrowserCaptchaService.get_instance(db)
-        await browser_service.warmup_browser_slots()
-        print("Browser captcha service initialized (headed mode)")
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)
-
-    if config.captcha_method == "remote_browser":
-        try:
-            warmed_projects = await flow_client.prefill_remote_browser_for_tokens(tokens, action="IMAGE_GENERATION")
-            print(f"Remote browser pool prefill started for {warmed_projects} project(s)")
-        except Exception as e:
-            print(f"Remote browser pool prefill failed: {e}")
 
     # Start token auto-recovery task: re-enable auto-disabled tokens (error bursts,
     # usage quota, 429 rate limits) after their cooldown so they recover on their own.
@@ -340,10 +277,6 @@ async def lifespan(app: FastAPI):
         pass
     # Stop upstream protocol token refresher
     await token_manager.stop_protocol_refresher()
-    # Close browser if initialized
-    if browser_service:
-        await browser_service.close()
-        print("✓ Browser captcha service closed")
     print("✓ File cache cleanup task stopped")
     print("✓ Token auto-recovery task stopped")
     print("✓ Log cleanup task stopped")

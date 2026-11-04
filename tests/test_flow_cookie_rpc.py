@@ -440,3 +440,46 @@ def test_protocol_healer_stamps_a_failed_cookie_recheck():
     asyncio.run(tm._refresh_protocol_token(row, now))
     kwargs = tm.db.update_token.await_args.kwargs
     assert kwargs["last_st_refresh_at"] == now
+
+
+def test_a_dropped_handle_remembers_its_row_only():
+    # 2026-11-04: requests in flight when a push replaced the handle failed with "unknown cookie session".
+    # The fallback follows the ROW's current handle (guarded promotion), so it records the row, nothing else.
+    reg = ck.FlowCookieSessions()
+    bound, unbound = _session("a@x.com"), _session("b@x.com")
+    bound.token_id = 17
+    reg.put(bound)
+    reg.put(unbound)
+    reg.alias("FLOWCK.db.old", bound)
+    reg.drop_session(bound)
+    reg.drop_session(unbound)
+    assert reg.retired_token_id(bound.handle) == 17 and reg.retired_token_id("FLOWCK.db.old") == 17
+    assert reg.retired_token_id(unbound.handle) is None
+
+
+def test_stale_handle_follows_the_rows_current_promoted_handle():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from src.services.flow_client import FlowClient, FlowAPIError
+
+    client = FlowClient.__new__(FlowClient)
+    client._cookie_sessions = ck.FlowCookieSessions()
+    import contextvars
+    client._cookie_token_ctx = contextvars.ContextVar("t", default=None)
+    old = _session("a@x.com"); old.token_id = 17
+    new = _session("a@x.com", fp="g"); new.token_id = 17
+    client._cookie_sessions.put(old)
+    client._cookie_sessions.put(new)
+    client._cookie_sessions.drop_session(old)
+    client.db = SimpleNamespace(get_token_by_at=AsyncMock(return_value=None),
+                                get_token=AsyncMock(return_value=SimpleNamespace(id=17, at=new.handle, email="a@x.com")),
+                                count_tokens_by_email=AsyncMock(return_value=1))
+    assert asyncio.run(client._cookie_session_for_handle(old.handle)) is new
+    client.db.count_tokens_by_email = AsyncMock(return_value=2)          # two rows share the email: no guessing
+    with pytest.raises(FlowAPIError):
+        asyncio.run(client._cookie_session_for_handle(old.handle))
+    client.db.count_tokens_by_email = AsyncMock(return_value=1)
+    client.db.get_token = AsyncMock(return_value=SimpleNamespace(id=17, at=old.handle, email="a@x.com"))  # not re-pushed yet
+    with pytest.raises(FlowAPIError):
+        asyncio.run(client._cookie_session_for_handle(old.handle))

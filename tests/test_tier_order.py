@@ -2,7 +2,7 @@
 import asyncio
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -43,10 +43,12 @@ def _pick(tokens, **kw):
 
 class PickerOrderTests(unittest.TestCase):
     def setUp(self):
-        self._saved = (config.tier_order, config.call_logic_mode, config.captcha_method)
+        self._saved = (config.tier_order, config.call_logic_mode)
         config.set_tier_order("save_ultra")
         config.set_call_logic_mode("default")
-        config.set_captcha_method("yescaptcha")  # no extension route checks
+        route_patch = patch.object(LoadBalancer, "_check_extension_route", AsyncMock(return_value=(True, "")))  # no extension route checks
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
         self._saved_store = cp.client_policy_store._policies
         cp.client_policy_store.replace([
             {"client": "default", "image_tier": "any", "video_tier": "any"},
@@ -57,7 +59,6 @@ class PickerOrderTests(unittest.TestCase):
         cp.client_policy_store._policies = self._saved_store
         config.set_tier_order(self._saved[0])
         config.set_call_logic_mode(self._saved[1])
-        config.set_captcha_method(self._saved[2])
 
     def test_images_try_pro_then_free_then_ultra(self):
         pool = [_token(1, ULT), _token(2, FREE), _token(3, PRO)]

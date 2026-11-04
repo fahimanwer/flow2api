@@ -403,207 +403,16 @@
                     <div class="space-y-4 flex-1">
                         <div>
                             <label class="text-sm font-medium mb-2 block">Captcha solving method</label>
-                            <select id="cfgCaptchaMethod" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" onchange="toggleCaptchaOptions()">
+                            <select id="cfgCaptchaMethod" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
                                 <option value="extension">Worker extension (production)</option>
-                                <option value="yescaptcha">YesCaptcha</option>
-                                <option value="capmonster">CapMonster</option>
-                                <option value="ezcaptcha">EzCaptcha</option>
-                                <option value="capsolver">CapSolver</option>
-                                <option value="browser">Headed browser</option>
-                                <option value="personal">Built-in browser</option>
-                                <option value="remote_browser">Remote headed browser</option>
                             </select>
-                            <p class="text-xs text-muted-foreground mt-1">Choose how captchas are obtained</p>
+                            <p class="text-xs text-muted-foreground mt-1">Each account's worker browser mints its captchas (2026-11-04: the other methods were removed)</p>
                         </div>
 
-                        <!-- YesCaptcha settings options -->
-                        <div id="yescaptchaOptions" class="space-y-4">
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">YesCaptcha API key</label>
-                                <input id="cfgYescaptchaApiKey" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="Enter YesCaptcha API key">
-                                <p class="text-xs text-muted-foreground mt-1">Used to automatically obtain reCAPTCHA tokens; leave empty to disable captcha solving</p>
-                            </div>
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">YesCaptcha API address</label>
-                                <input id="cfgYescaptchaBaseUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="https://api.yescaptcha.com">
-                                <p class="text-xs text-muted-foreground mt-1">YesCaptcha service address, default: https://api.yescaptcha.com</p>
-                            </div>
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">YesCaptcha Type</label>
-                                <select id="cfgYescaptchaTaskType" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
-                                    <option value="RecaptchaV3TaskProxyless">RecaptchaV3TaskProxyless - 20 POINTS</option>
-                                    <option value="RecaptchaV3TaskProxylessM1">RecaptchaV3TaskProxylessM1 - 25 POINTS</option>
-                                    <option value="RecaptchaV3TaskProxylessM1S7">RecaptchaV3TaskProxylessM1S7 - 30 POINTS (minScore 0.7)</option>
-                                    <option value="RecaptchaV3TaskProxylessM1S9">RecaptchaV3TaskProxylessM1S9 - 35 POINTS (minScore 0.9)</option>
-                                </select>
-                                <p class="text-xs text-muted-foreground mt-1">S7/S9 forces minScore 0.7/0.9 to be submitted with createTask.</p>
-                            </div>
-                        </div>
-
-                        <!-- CapMonster settings options -->
-                        <div id="capmonsterOptions" class="hidden space-y-4">
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">CapMonster API key</label>
-                                <input id="cfgCapmonsterApiKey" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="Enter CapMonster API key">
-                                <p class="text-xs text-muted-foreground mt-1">Used to automatically obtain reCAPTCHA tokens</p>
-                            </div>
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">CapMonster API address</label>
-                                <input id="cfgCapmonsterBaseUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="https://api.capmonster.cloud">
-                                <p class="text-xs text-muted-foreground mt-1">CapMonster service address, default: https://api.capmonster.cloud</p>
-                            </div>
-                        </div>
-
-                        <!-- EzCaptcha settings options -->
-                        <div id="ezcaptchaOptions" class="hidden space-y-4">
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">EzCaptcha API key</label>
-                                <input id="cfgEzcaptchaApiKey" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="Enter EzCaptcha API key">
-                                <p class="text-xs text-muted-foreground mt-1">Used to automatically obtain reCAPTCHA tokens</p>
-                            </div>
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">EzCaptcha API address</label>
-                                <input id="cfgEzcaptchaBaseUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="https://api.ez-captcha.com">
-                                <p class="text-xs text-muted-foreground mt-1">EzCaptcha service address, default: https://api.ez-captcha.com</p>
-                            </div>
-                        </div>
-
-                        <!-- CapSolver settings options -->
-                        <div id="capsolverOptions" class="hidden space-y-4">
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">CapSolver API key</label>
-                                <input id="cfgCapsolverApiKey" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="Enter CapSolver API key">
-                                <p class="text-xs text-muted-foreground mt-1">Used to automatically obtain reCAPTCHA tokens</p>
-                            </div>
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">CapSolver API address</label>
-                                <input id="cfgCapsolverBaseUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="https://api.capsolver.com">
-                                <p class="text-xs text-muted-foreground mt-1">CapSolver service address, default: https://api.capsolver.com</p>
-                            </div>
-                        </div>
-
-                        <!-- Browser captcha settings options -->
-                        <div id="browserCaptchaOptions" class="hidden space-y-4">
-                            <div class="rounded-md bg-blue-50 dark:bg-blue-900/20 p-3 border border-blue-200 dark:border-blue-800">
-                                <p class="text-xs text-blue-800 dark:text-blue-200">
-                                    ℹ️ <strong>Browser captcha:</strong> Uses a Playwright-automated browser to obtain captchas. No extra configuration is needed, but it consumes more system resources.
-                                </p>
-                            </div>
-
-                            <div>
-                                <label class="inline-flex items-center gap-2 cursor-pointer">
-                                    <input type="checkbox" id="cfgBrowserProxyEnabled" class="h-4 w-4 rounded border-input" onchange="toggleBrowserProxyInput()">
-                                    <span class="text-sm font-medium">Enable proxy</span>
-                                </label>
-                                <p class="text-xs text-muted-foreground mt-2">Configure a dedicated proxy for the headed browser</p>
-                            </div>
-
-                            <div id="browserProxyUrlInput" class="hidden">
-                                <label class="text-sm font-medium mb-2 block">Proxy address</label>
-                                <input id="cfgBrowserProxyUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="http://host:port or socks5://host:port">
-                                <p class="text-xs text-muted-foreground mt-1">
-                                    ✅ <strong>Supported:</strong> HTTP/HTTPS/SOCKS5/SOCKS5H proxies, all with authentication support<br>
-                                    Example: <code class="bg-muted px-1 py-0.5 rounded">http://user:pass@proxy.com:8080</code> or <code class="bg-muted px-1 py-0.5 rounded">socks5://user:pass@proxy.com:1080</code>
-                                </p>
-                            </div>
-
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">Number of browsers</label>
-                                <input id="cfgBrowserCount" type="number" min="1" max="20" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="1" value="1">
-                                <p class="text-xs text-muted-foreground mt-1">Number of browser instances started simultaneously; each browser opens only 1 tab and requests are distributed in rotation</p>
-                            </div>
-                        </div>
-
-                        <!-- Built-in browser captcha settings options -->
-                        <div id="personalOptions" class="hidden space-y-4">
-                            <div class="rounded-md bg-blue-50 dark:bg-blue-900/20 p-3 border border-blue-200 dark:border-blue-800">
-                                <p class="text-xs text-blue-800 dark:text-blue-200">
-                                    ℹ️ <strong>Built-in browser captcha:</strong> Uses a nodriver-automated browser to obtain captchas, supports tab reuse, and offers better performance.
-                                </p>
-                            </div>
-
-                            <div class="grid grid-cols-2 gap-4">
-                                <div>
-                                    <label class="text-sm font-medium mb-2 block">Number of browser instances</label>
-                                    <input id="cfgPersonalBrowserCount" type="number" min="1" max="20" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="1" value="1">
-                                    <p class="text-xs text-muted-foreground mt-1">
-                                        Number of real browser instances in personal mode.<br>
-                                        Effective slots are roughly instances × tabs per instance, capped at 50.
-                                    </p>
-                                </div>
-
-                                <div>
-                                    <label class="text-sm font-medium mb-2 block">Project pool size per Token</label>
-                                    <input id="cfgPersonalProjectPoolSize" type="number" min="1" max="50" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="4" value="4">
-                                    <p class="text-xs text-muted-foreground mt-1">
-                                        Only affects how many project_ids this Token can rotate through; it does not determine the number of captcha tabs.<br>
-                                        Captcha tabs are reused from a unified global shared pool.
-                                    </p>
-                                </div>
-
-                                <div>
-                                    <label class="text-sm font-medium mb-2 block">Max tabs per instance</label>
-                                    <input id="cfgPersonalMaxTabs" type="number" min="1" max="50" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="5" value="5">
-                                    <p class="text-xs text-muted-foreground mt-1">
-                                        Maximum number of shared captcha tabs each browser keeps.<br>
-                                        Total concurrency slots are roughly number of browser instances × this value, capped at 50.
-                                    </p>
-                                </div>
-
-                                <div>
-                                    <label class="text-sm font-medium mb-2 block">Restart after N solves</label>
-                                    <input id="cfgPersonalFreshRestartEveryNSolves" type="number" min="0" max="999" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="10" value="10">
-                                    <p class="text-xs text-muted-foreground mt-1">
-                                        Clean up and restart the browser after this many successful solves.<br>
-                                        For high concurrency, use 0 or >=50; 5/10 causes frequent restarts and queuing.
-                                    </p>
-                                </div>
-                            </div>
-
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">Tab idle timeout (seconds)</label>
-                                <input id="cfgPersonalIdleTTL" type="number" min="60" max="3600" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="600" value="600">
-                                <p class="text-xs text-muted-foreground mt-1">How long a tab stays idle before being automatically reclaimed; default 600 seconds (10 minutes)</p>
-                            </div>
-
-                            <div class="pt-3 border-t border-border">
-                                <label class="inline-flex items-center gap-2 cursor-pointer">
-                                    <input type="checkbox" id="cfgPersonalProxyEnabled" class="h-4 w-4 rounded border-input" onchange="togglePersonalProxyInput()">
-                                    <span class="text-sm font-medium">Enable proxy</span>
-                                </label>
-                                <p class="text-xs text-muted-foreground mt-2">Configure a dedicated proxy for the built-in browser (takes priority over the global request proxy)</p>
-                            </div>
-
-                            <div id="personalProxyUrlInput" class="hidden">
-                                <label class="text-sm font-medium mb-2 block">Proxy address</label>
-                                <input id="cfgPersonalProxyUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="http://host:port or socks5://host:port">
-                                <p class="text-xs text-muted-foreground mt-1">
-                                    ✅ <strong>Supported:</strong> HTTP/HTTPS/SOCKS5/SOCKS5H proxies, all with authentication support<br>
-                                    Example: <code class="bg-muted px-1 py-0.5 rounded">http://user:pass@proxy.com:8080</code> or <code class="bg-muted px-1 py-0.5 rounded">socks5://user:pass@proxy.com:1080</code>
-                                </p>
-                            </div>
-                        </div>
-
-                        <!-- Remote headed captcha settings options -->
-                        <div id="remoteBrowserOptions" class="hidden space-y-4">
-                            <div class="rounded-md bg-blue-50 dark:bg-blue-900/20 p-3 border border-blue-200 dark:border-blue-800">
-                                <p class="text-xs text-blue-800 dark:text-blue-200">
-                                    ℹ️ <strong>Remote headed captcha:</strong> Calls a standalone captcha service over HTTP to obtain the token, and calls back finish/error after the request completes.
-                                </p>
-                            </div>
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">Remote service Base URL</label>
-                                <input id="cfgRemoteBrowserBaseUrl" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="http://127.0.0.1:8060">
-                                <p class="text-xs text-muted-foreground mt-1">Example: <code class="bg-muted px-1 py-0.5 rounded">http://127.0.0.1:8060</code></p>
-                            </div>
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">Remote service API Key</label>
-                                <input id="cfgRemoteBrowserApiKey" type="text" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="fcs_xxx">
-                            </div>
-                            <div>
-                                <label class="text-sm font-medium mb-2 block">Remote request timeout (seconds)</label>
-                                <input id="cfgRemoteBrowserTimeout" type="number" min="5" max="300" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="60" value="60">
-                            </div>
+                        <div>
+                            <label class="text-sm font-medium mb-2 block">Project pool size per Token</label>
+                            <input id="cfgPersonalProjectPoolSize" type="number" min="1" max="50" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="4" value="4">
+                            <p class="text-xs text-muted-foreground mt-1">How many project_ids each Token rotates through.</p>
                         </div>
                     </div>
                     <!-- Server captcha fallback (2026-09-23): always visible, any captcha method -->
@@ -805,13 +614,6 @@
                     <input id="addTokenProjectName" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="Auto-generated if left empty (e.g. Jan 01 - 12:00)">
                 </div>
 
-                <!-- Captcha Proxy -->
-                <div class="space-y-2">
-                    <label class="text-sm font-medium">Captcha proxy <span class="text-muted-foreground text-xs">- optional</span></label>
-                    <input id="addTokenCaptchaProxyUrl" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono" placeholder="e.g. http://user:pass@host:port">
-                    <p class="text-xs text-muted-foreground">Overrides only this Token's browser captcha proxy; leave empty to use the global captcha proxy</p>
-                </div>
-
                 <!-- Feature toggles -->
                 <div class="space-y-3 pt-2 border-t border-border">
                     <label class="text-sm font-medium">Feature toggles</label>
@@ -887,13 +689,6 @@
                 <div class="space-y-2">
                     <label class="text-sm font-medium">Project Name <span class="text-muted-foreground text-xs">- optional</span></label>
                     <input id="editTokenProjectName" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder="Leave empty to keep the existing value">
-                </div>
-
-                <!-- Captcha Proxy -->
-                <div class="space-y-2">
-                    <label class="text-sm font-medium">Captcha proxy <span class="text-muted-foreground text-xs">- optional</span></label>
-                    <input id="editTokenCaptchaProxyUrl" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono" placeholder="e.g. http://user:pass@host:port">
-                    <p class="text-xs text-muted-foreground">When set, it overrides the global captcha proxy; clear it to revert to the global captcha proxy</p>
                 </div>
 
                 <!-- Extension Route Key: binds this token to a specific worker browser for on-demand session refresh -->
@@ -1023,13 +818,13 @@
         refreshTokenAT=async(id)=>{try{showToast('Updating AT...','info');const r=await apiRequest(`/api/tokens/${id}/refresh-at`,{method:'POST'});if(!r)return;const d=await r.json();if(d.success){const expiresDate=d.token.at_expires?new Date(d.token.at_expires):null;const expiresStr=expiresDate?expiresDate.toLocaleString('en-US',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).replace(/\//g,'-'):'Unknown';showToast(`AT updated successfully! New expiry: ${expiresStr}`,'success');await refreshTokens()}else{showToast('Update failed: '+(d.detail||'Unknown error'),'error')}}catch(e){showToast('Update failed: '+e.message,'error')}},
         refreshTokens=async()=>{await loadTokens();await loadStats()},
         openAddModal=()=>$('addModal').classList.remove('hidden'),
-        closeAddModal=()=>{$('addModal').classList.add('hidden');$('addTokenST').value='';$('addTokenRemark').value='';$('addTokenProjectId').value='';$('addTokenProjectName').value='';$('addTokenCaptchaProxyUrl').value='';$('addTokenImageEnabled').checked=true;$('addTokenVideoEnabled').checked=true;$('addTokenImageConcurrency').value='-1';$('addTokenVideoConcurrency').value='-1'},
-        openEditModal=(id)=>{const token=allTokens.find(t=>t.id===id);if(!token)return showToast('Token does not exist','error');$('editTokenId').value=token.id;$('editTokenST').value=token.st||'';$('editTokenRemark').value=token.remark||'';$('editTokenProjectId').value=token.current_project_id||'';$('editTokenProjectName').value=token.current_project_name||'';$('editTokenCaptchaProxyUrl').value=token.captcha_proxy_url||'';$('editTokenRouteKey').value=token.extension_route_key||'';$('editTokenReservedClient').value=token.reserved_client||'';$('editTokenImageEnabled').checked=token.image_enabled!==false;$('editTokenVideoEnabled').checked=token.video_enabled!==false;$('editTokenImageConcurrency').value=token.image_concurrency||'-1';$('editTokenVideoConcurrency').value=token.video_concurrency||'-1';$('editModal').classList.remove('hidden')},
-        closeEditModal=()=>{$('editModal').classList.add('hidden');$('editTokenId').value='';$('editTokenST').value='';$('editTokenRemark').value='';$('editTokenProjectId').value='';$('editTokenProjectName').value='';$('editTokenCaptchaProxyUrl').value='';$('editTokenImageEnabled').checked=true;$('editTokenVideoEnabled').checked=true;$('editTokenImageConcurrency').value='';$('editTokenVideoConcurrency').value=''},
-        submitEditToken=async()=>{const id=parseInt($('editTokenId').value),st=$('editTokenST').value.trim(),remark=$('editTokenRemark').value.trim(),projectId=$('editTokenProjectId').value.trim(),projectName=$('editTokenProjectName').value.trim(),captchaProxyUrl=$('editTokenCaptchaProxyUrl').value.trim(),imageEnabled=$('editTokenImageEnabled').checked,videoEnabled=$('editTokenVideoEnabled').checked,imageConcurrency=$('editTokenImageConcurrency').value?parseInt($('editTokenImageConcurrency').value):null,videoConcurrency=$('editTokenVideoConcurrency').value?parseInt($('editTokenVideoConcurrency').value):null;if(!id)return showToast('Invalid Token ID','error');if(!st)return showToast('Please enter the Session Token','error');const btn=$('editTokenBtn'),btnText=$('editTokenBtnText'),btnSpinner=$('editTokenBtnSpinner');btn.disabled=true;btnText.textContent='Saving...';btnSpinner.classList.remove('hidden');try{const r=await apiRequest(`/api/tokens/${id}`,{method:'PUT',body:JSON.stringify({st:st,remark:remark||null,project_id:projectId||null,project_name:projectName||null,captcha_proxy_url:captchaProxyUrl,image_enabled:imageEnabled,video_enabled:videoEnabled,image_concurrency:imageConcurrency,video_concurrency:videoConcurrency})});if(!r){btn.disabled=false;btnText.textContent='Save';btnSpinner.classList.add('hidden');return}const d=await r.json();if(d.success){closeEditModal();await refreshTokens();showToast('Token updated successfully','success')}else{showToast('Update failed: '+(d.detail||d.message||'Unknown error'),'error')}}catch(e){showToast('Update failed: '+e.message,'error')}finally{btn.disabled=false;btnText.textContent='Save';btnSpinner.classList.add('hidden')}},
+        closeAddModal=()=>{$('addModal').classList.add('hidden');$('addTokenST').value='';$('addTokenRemark').value='';$('addTokenProjectId').value='';$('addTokenProjectName').value='';$('addTokenImageEnabled').checked=true;$('addTokenVideoEnabled').checked=true;$('addTokenImageConcurrency').value='-1';$('addTokenVideoConcurrency').value='-1'},
+        openEditModal=(id)=>{const token=allTokens.find(t=>t.id===id);if(!token)return showToast('Token does not exist','error');$('editTokenId').value=token.id;$('editTokenST').value=token.st||'';$('editTokenRemark').value=token.remark||'';$('editTokenProjectId').value=token.current_project_id||'';$('editTokenProjectName').value=token.current_project_name||'';$('editTokenRouteKey').value=token.extension_route_key||'';$('editTokenReservedClient').value=token.reserved_client||'';$('editTokenImageEnabled').checked=token.image_enabled!==false;$('editTokenVideoEnabled').checked=token.video_enabled!==false;$('editTokenImageConcurrency').value=token.image_concurrency||'-1';$('editTokenVideoConcurrency').value=token.video_concurrency||'-1';$('editModal').classList.remove('hidden')},
+        closeEditModal=()=>{$('editModal').classList.add('hidden');$('editTokenId').value='';$('editTokenST').value='';$('editTokenRemark').value='';$('editTokenProjectId').value='';$('editTokenProjectName').value='';$('editTokenImageEnabled').checked=true;$('editTokenVideoEnabled').checked=true;$('editTokenImageConcurrency').value='';$('editTokenVideoConcurrency').value=''},
+        submitEditToken=async()=>{const id=parseInt($('editTokenId').value),st=$('editTokenST').value.trim(),remark=$('editTokenRemark').value.trim(),projectId=$('editTokenProjectId').value.trim(),projectName=$('editTokenProjectName').value.trim(),imageEnabled=$('editTokenImageEnabled').checked,videoEnabled=$('editTokenVideoEnabled').checked,imageConcurrency=$('editTokenImageConcurrency').value?parseInt($('editTokenImageConcurrency').value):null,videoConcurrency=$('editTokenVideoConcurrency').value?parseInt($('editTokenVideoConcurrency').value):null;if(!id)return showToast('Invalid Token ID','error');if(!st)return showToast('Please enter the Session Token','error');const btn=$('editTokenBtn'),btnText=$('editTokenBtnText'),btnSpinner=$('editTokenBtnSpinner');btn.disabled=true;btnText.textContent='Saving...';btnSpinner.classList.remove('hidden');try{const r=await apiRequest(`/api/tokens/${id}`,{method:'PUT',body:JSON.stringify({st:st,remark:remark||null,project_id:projectId||null,project_name:projectName||null,image_enabled:imageEnabled,video_enabled:videoEnabled,image_concurrency:imageConcurrency,video_concurrency:videoConcurrency})});if(!r){btn.disabled=false;btnText.textContent='Save';btnSpinner.classList.add('hidden');return}const d=await r.json();if(d.success){closeEditModal();await refreshTokens();showToast('Token updated successfully','success')}else{showToast('Update failed: '+(d.detail||d.message||'Unknown error'),'error')}}catch(e){showToast('Update failed: '+e.message,'error')}finally{btn.disabled=false;btnText.textContent='Save';btnSpinner.classList.add('hidden')}},
         convertST2AT=async()=>{const st=$('addTokenST').value.trim();if(!st)return showToast('Please enter the Session Token first','error');try{showToast('Converting ST to AT...','info');const r=await apiRequest('/api/tokens/st2at',{method:'POST',body:JSON.stringify({st:st})});if(!r)return;const d=await r.json();if(d.success&&d.access_token){$('addTokenAT').value=d.access_token;showToast('Conversion succeeded! The AT has been filled in automatically','success')}else{showToast('Conversion failed: '+(d.message||d.detail||'Unknown error'),'error')}}catch(e){showToast('Conversion failed: '+e.message,'error')}},
         convertEditST2AT=async()=>{const st=$('editTokenST').value.trim();if(!st)return showToast('Please enter the Session Token first','error');try{showToast('Converting ST to AT...','info');const r=await apiRequest('/api/tokens/st2at',{method:'POST',body:JSON.stringify({st:st})});if(!r)return;const d=await r.json();if(d.success&&d.access_token){$('editTokenAT').value=d.access_token;showToast('Conversion succeeded! The AT has been filled in automatically','success')}else{showToast('Conversion failed: '+(d.message||d.detail||'Unknown error'),'error')}}catch(e){showToast('Conversion failed: '+e.message,'error')}},
-        submitAddToken=async()=>{const st=$('addTokenST').value.trim(),remark=$('addTokenRemark').value.trim(),projectId=$('addTokenProjectId').value.trim(),projectName=$('addTokenProjectName').value.trim(),captchaProxyUrl=$('addTokenCaptchaProxyUrl').value.trim(),imageEnabled=$('addTokenImageEnabled').checked,videoEnabled=$('addTokenVideoEnabled').checked,imageConcurrency=parseInt($('addTokenImageConcurrency').value)||(-1),videoConcurrency=parseInt($('addTokenVideoConcurrency').value)||(-1);if(!st)return showToast('Please enter the Session Token','error');const btn=$('addTokenBtn'),btnText=$('addTokenBtnText'),btnSpinner=$('addTokenBtnSpinner');btn.disabled=true;btnText.textContent='Adding...';btnSpinner.classList.remove('hidden');try{const r=await apiRequest('/api/tokens',{method:'POST',body:JSON.stringify({st:st,remark:remark||null,project_id:projectId||null,project_name:projectName||null,captcha_proxy_url:captchaProxyUrl,image_enabled:imageEnabled,video_enabled:videoEnabled,image_concurrency:imageConcurrency,video_concurrency:videoConcurrency})});if(!r){btn.disabled=false;btnText.textContent='Add';btnSpinner.classList.add('hidden');return}const d=await r.json();if(d.success){closeAddModal();await refreshTokens();showToast('Token added successfully','success')}else{showToast('Failed to add: '+(d.detail||d.message||'Unknown error'),'error')}}catch(e){showToast('Failed to add: '+e.message,'error')}finally{btn.disabled=false;btnText.textContent='Add';btnSpinner.classList.add('hidden')}},
+        submitAddToken=async()=>{const st=$('addTokenST').value.trim(),remark=$('addTokenRemark').value.trim(),projectId=$('addTokenProjectId').value.trim(),projectName=$('addTokenProjectName').value.trim(),imageEnabled=$('addTokenImageEnabled').checked,videoEnabled=$('addTokenVideoEnabled').checked,imageConcurrency=parseInt($('addTokenImageConcurrency').value)||(-1),videoConcurrency=parseInt($('addTokenVideoConcurrency').value)||(-1);if(!st)return showToast('Please enter the Session Token','error');const btn=$('addTokenBtn'),btnText=$('addTokenBtnText'),btnSpinner=$('addTokenBtnSpinner');btn.disabled=true;btnText.textContent='Adding...';btnSpinner.classList.remove('hidden');try{const r=await apiRequest('/api/tokens',{method:'POST',body:JSON.stringify({st:st,remark:remark||null,project_id:projectId||null,project_name:projectName||null,image_enabled:imageEnabled,video_enabled:videoEnabled,image_concurrency:imageConcurrency,video_concurrency:videoConcurrency})});if(!r){btn.disabled=false;btnText.textContent='Add';btnSpinner.classList.add('hidden');return}const d=await r.json();if(d.success){closeAddModal();await refreshTokens();showToast('Token added successfully','success')}else{showToast('Failed to add: '+(d.detail||d.message||'Unknown error'),'error')}}catch(e){showToast('Failed to add: '+e.message,'error')}finally{btn.disabled=false;btnText.textContent='Add';btnSpinner.classList.add('hidden')}},
         testToken=async(id)=>{try{showToast('Testing Token...','info');const r=await apiRequest(`/api/tokens/${id}/test`,{method:'POST'});if(!r)return;const d=await r.json();if(d.success&&d.status==='success'){let msg=`Token is valid! User: ${d.email||'Unknown'}`;if(d.sora2_supported){const remaining=d.sora2_total_count-d.sora2_redeemed_count;msg+=`\nSora2: Supported (${remaining}/${d.sora2_total_count})`;if(d.sora2_remaining_count!==undefined){msg+=`\nAvailable: ${d.sora2_remaining_count}`}}showToast(msg,'success');await refreshTokens()}else{showToast(`Token is invalid: ${d.message||'Unknown error'}`,'error')}}catch(e){showToast('Test failed: '+e.message,'error')}},
         toggleToken=async(id,isActive)=>{const action=isActive?'disable':'enable';try{const r=await apiRequest(`/api/tokens/${id}/${action}`,{method:'POST'});if(!r)return;const d=await r.json();d.success?(await refreshTokens(),showToast(isActive?'Token disabled':'Token enabled','success')):showToast('Operation failed','error')}catch(e){showToast('Operation failed: '+e.message,'error')}},
         toggleTokenStatus=async(id,active)=>{try{const r=await apiRequest(`/api/tokens/${id}/status`,{method:'PUT',body:JSON.stringify({is_active:active})});if(!r)return;const d=await r.json();d.success?(await refreshTokens(),showToast('Status updated successfully','success')):showToast('Update failed','error')}catch(e){showToast('Update failed: '+e.message,'error')}},
@@ -1060,11 +855,8 @@
         saveCacheConfig=async()=>{const enabled=$('cfgCacheEnabled').checked,timeoutInput=$('cfgCacheTimeout').value.trim(),timeout=timeoutInput===''?7200:parseInt(timeoutInput,10),baseUrl=$('cfgCacheBaseUrl').value.trim();console.log('Saving cache settings:',{enabled,timeout,baseUrl});if(Number.isNaN(timeout)||timeout<0||timeout>86400)return showToast('The cache timeout must be between 0 and 86400 seconds; 0 means do not delete','error');if(baseUrl&&!baseUrl.startsWith('http://')&&!baseUrl.startsWith('https://'))return showToast('The domain must start with http:// or https://','error');try{console.log('Saving cache enabled state...');const r0=await apiRequest('/api/cache/enabled',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r0){console.error('Failed to request saving cache enabled state');return}const d0=await r0.json();console.log('Cache enabled state save result:',d0);if(!d0.success){console.error('Failed to save cache enabled state:',d0);return showToast('Failed to save cache enabled state','error')}console.log('Saving timeout...');const r1=await apiRequest('/api/cache/config',{method:'POST',body:JSON.stringify({timeout:timeout})});if(!r1){console.error('Failed to request saving timeout');return}const d1=await r1.json();console.log('Timeout save result:',d1);if(!d1.success){console.error('Failed to save timeout:',d1);return showToast('Failed to save timeout','error')}console.log('Saving domain...');const r2=await apiRequest('/api/cache/base-url',{method:'POST',body:JSON.stringify({base_url:baseUrl})});if(!r2){console.error('Failed to request saving domain');return}const d2=await r2.json();console.log('Domain save result:',d2);if(d2.success){showToast('Cache settings saved successfully','success');console.log('Waiting for the config file write to complete...');await new Promise(r=>setTimeout(r,200));console.log('Reloading settings...');await loadCacheConfig()}else{console.error('Failed to save domain:',d2);showToast('Failed to save domain','error')}}catch(e){console.error('Save failed:',e);showToast('Save failed: '+e.message,'error')}},
         saveGenerationTimeout=async()=>{const imageTimeout=parseInt($('cfgImageTimeout').value)||300,videoTimeout=parseInt($('cfgVideoTimeout').value)||1500,maxRetries=parseInt($('cfgMaxRetries').value)||3;console.log('Saving generation settings:',{imageTimeout,videoTimeout,maxRetries});if(imageTimeout<60||imageTimeout>3600)return showToast('The image timeout must be between 60 and 3600 seconds','error');if(videoTimeout<60||videoTimeout>7200)return showToast('The video timeout must be between 60 and 7200 seconds','error');if(maxRetries<1)return showToast('The maximum retries cannot be less than 1','error');try{const r=await apiRequest('/api/generation/timeout',{method:'POST',body:JSON.stringify({image_timeout:imageTimeout,video_timeout:videoTimeout,max_retries:maxRetries,remove_watermark:$('cfgRemoveWatermark').checked})});if(!r){console.error('Save request failed');return}const d=await r.json();console.log('Save result:',d);if(d.success){showToast('Generation settings saved successfully','success');await new Promise(r=>setTimeout(r,200));await loadGenerationTimeout()}else{console.error('Save failed:',d);showToast('Save failed','error')}}catch(e){console.error('Save failed:',e);showToast('Save failed: '+e.message,'error')}},
         saveCallLogicConfig=async()=>{const callMode=$('cfgCallLogicMode').value||'default';try{const r=await apiRequest('/api/call-logic/config',{method:'POST',body:JSON.stringify({call_mode:callMode,tier_order:$('cfgTierOrder').value||'save_ultra'})});if(!r)return;const d=await r.json();if(d.success){showToast('Token rotation settings saved successfully','success');await loadCallLogicConfig()}else{showToast(d.message||'Save failed','error')}}catch(e){console.error('Failed to save rotation mode settings:',e);showToast('Failed to save rotation mode settings: '+e.message,'error')}},
-        toggleCaptchaOptions=()=>{const method=$('cfgCaptchaMethod').value;$('yescaptchaOptions').style.display=method==='yescaptcha'?'block':'none';$('capmonsterOptions').classList.toggle('hidden',method!=='capmonster');$('ezcaptchaOptions').classList.toggle('hidden',method!=='ezcaptcha');$('capsolverOptions').classList.toggle('hidden',method!=='capsolver');$('browserCaptchaOptions').classList.toggle('hidden',method!=='browser');$('personalOptions').classList.toggle('hidden',method!=='personal');$('remoteBrowserOptions').classList.toggle('hidden',method!=='remote_browser')},
-        toggleBrowserProxyInput=()=>{const enabled=$('cfgBrowserProxyEnabled').checked;$('browserProxyUrlInput').classList.toggle('hidden',!enabled)},
-        togglePersonalProxyInput=()=>{const enabled=$('cfgPersonalProxyEnabled').checked;$('personalProxyUrlInput').classList.toggle('hidden',!enabled)},
-        loadCaptchaConfig=async()=>{try{console.log('Loading captcha settings...');const r=await apiRequest('/api/captcha/config');if(!r){console.error('API request failed');return}const d=await r.json();console.log('Captcha settings data:',d);const freshRestart=d.browser_personal_fresh_restart_every_n_solves===undefined?10:d.browser_personal_fresh_restart_every_n_solves;$('cfgCaptchaMethod').value=d.captcha_method||'yescaptcha';$('cfgYescaptchaApiKey').value=d.yescaptcha_api_key||'';$('cfgYescaptchaBaseUrl').value=d.yescaptcha_base_url||'https://api.yescaptcha.com';$('cfgYescaptchaTaskType').value=d.yescaptcha_task_type||'RecaptchaV3TaskProxylessM1';$('cfgCapmonsterApiKey').value=d.capmonster_api_key||'';$('cfgCapmonsterBaseUrl').value=d.capmonster_base_url||'https://api.capmonster.cloud';$('cfgEzcaptchaApiKey').value=d.ezcaptcha_api_key||'';$('cfgEzcaptchaBaseUrl').value=d.ezcaptcha_base_url||'https://api.ez-captcha.com';$('cfgCapsolverApiKey').value=d.capsolver_api_key||'';$('cfgCapsolverBaseUrl').value=d.capsolver_base_url||'https://api.capsolver.com';$('cfgRemoteBrowserBaseUrl').value=d.remote_browser_base_url||'';$('cfgRemoteBrowserApiKey').value=d.remote_browser_api_key||'';$('cfgRemoteBrowserTimeout').value=d.remote_browser_timeout||60;$('cfgBrowserProxyEnabled').checked=d.browser_proxy_enabled||false;$('cfgBrowserProxyUrl').value=d.browser_proxy_url||'';$('cfgPersonalProxyEnabled').checked=d.browser_proxy_enabled||false;$('cfgPersonalProxyUrl').value=d.browser_proxy_url||'';$('cfgBrowserCount').value=d.browser_count||1;$('cfgPersonalBrowserCount').value=d.browser_count||1;$('cfgPersonalProjectPoolSize').value=d.personal_project_pool_size||4;$('cfgPersonalMaxTabs').value=d.personal_max_resident_tabs||5;$('cfgPersonalFreshRestartEveryNSolves').value=freshRestart;$('cfgPersonalIdleTTL').value=d.personal_idle_tab_ttl_seconds||600;$('cfgServerFallbackEnabled').checked=d.server_fallback_enabled!==false;$('cfgServerFallbackMaxBrowsers').value=d.server_fallback_max_browsers||3;toggleCaptchaOptions();toggleBrowserProxyInput();togglePersonalProxyInput();console.log('Captcha settings loaded successfully')}catch(e){console.error('Failed to load captcha settings:',e);showToast('Failed to load captcha settings: '+e.message,'error')}},
-        saveCaptchaConfig=async()=>{const method=$('cfgCaptchaMethod').value,yesApiKey=$('cfgYescaptchaApiKey').value.trim(),yesBaseUrl=$('cfgYescaptchaBaseUrl').value.trim(),yesTaskType=$('cfgYescaptchaTaskType').value,capApiKey=$('cfgCapmonsterApiKey').value.trim(),capBaseUrl=$('cfgCapmonsterBaseUrl').value.trim(),ezApiKey=$('cfgEzcaptchaApiKey').value.trim(),ezBaseUrl=$('cfgEzcaptchaBaseUrl').value.trim(),solverApiKey=$('cfgCapsolverApiKey').value.trim(),solverBaseUrl=$('cfgCapsolverBaseUrl').value.trim(),remoteBaseUrl=$('cfgRemoteBrowserBaseUrl').value.trim(),remoteApiKey=$('cfgRemoteBrowserApiKey').value.trim(),remoteTimeout=parseInt($('cfgRemoteBrowserTimeout').value)||60,browserProxyEnabled=$('cfgBrowserProxyEnabled').checked,browserProxyUrl=$('cfgBrowserProxyUrl').value.trim(),personalProxyEnabled=$('cfgPersonalProxyEnabled').checked,personalProxyUrl=$('cfgPersonalProxyUrl').value.trim(),browserCount=parseInt($('cfgBrowserCount').value)||1,personalBrowserCount=parseInt($('cfgPersonalBrowserCount').value)||1,personalProjectPoolSize=parseInt($('cfgPersonalProjectPoolSize').value)||4,personalMaxTabs=parseInt($('cfgPersonalMaxTabs').value)||5,personalFreshRestartEveryNSolves=Math.max(0,parseInt($('cfgPersonalFreshRestartEveryNSolves').value)||0),personalIdleTTL=parseInt($('cfgPersonalIdleTTL').value)||600;const serverFallbackEnabled=$('cfgServerFallbackEnabled').checked,serverFallbackMaxBrowsers=Math.max(1,Math.min(6,parseInt($('cfgServerFallbackMaxBrowsers').value)||3));const finalProxyEnabled=method==='personal'?personalProxyEnabled:browserProxyEnabled;const finalProxyUrl=method==='personal'?personalProxyUrl:browserProxyUrl;const finalBrowserCount=method==='personal'?personalBrowserCount:browserCount;console.log('Saving captcha settings:',{method,yesApiKey,yesBaseUrl,yesTaskType,capApiKey,capBaseUrl,ezApiKey,ezBaseUrl,solverApiKey,solverBaseUrl,remoteBaseUrl,remoteApiKey,remoteTimeout,browserProxyEnabled,browserProxyUrl,personalProxyEnabled,personalProxyUrl,finalProxyEnabled,finalProxyUrl,browserCount,personalBrowserCount,finalBrowserCount,personalProjectPoolSize,personalMaxTabs,personalFreshRestartEveryNSolves,personalIdleTTL});try{const r=await apiRequest('/api/captcha/config',{method:'POST',body:JSON.stringify({captcha_method:method,yescaptcha_api_key:yesApiKey,yescaptcha_base_url:yesBaseUrl,yescaptcha_task_type:yesTaskType,capmonster_api_key:capApiKey,capmonster_base_url:capBaseUrl,ezcaptcha_api_key:ezApiKey,ezcaptcha_base_url:ezBaseUrl,capsolver_api_key:solverApiKey,capsolver_base_url:solverBaseUrl,remote_browser_base_url:remoteBaseUrl,remote_browser_api_key:remoteApiKey,remote_browser_timeout:remoteTimeout,browser_proxy_enabled:finalProxyEnabled,browser_proxy_url:finalProxyUrl,browser_count:finalBrowserCount,personal_project_pool_size:personalProjectPoolSize,personal_max_resident_tabs:personalMaxTabs,browser_personal_fresh_restart_every_n_solves:personalFreshRestartEveryNSolves,personal_idle_tab_ttl_seconds:personalIdleTTL,server_fallback_enabled:serverFallbackEnabled,server_fallback_max_browsers:serverFallbackMaxBrowsers})});if(!r){console.error('Save request failed');return}const d=await r.json();console.log('Save result:',d);if(d.success){showToast('Captcha settings saved successfully','success');await new Promise(r=>setTimeout(r,200));await loadCaptchaConfig()}else{console.error('Save failed:',d);showToast(d.message||'Save failed','error')}}catch(e){console.error('Save failed:',e);showToast('Save failed: '+e.message,'error')}},
+        loadCaptchaConfig=async()=>{try{const r=await apiRequest('/api/captcha/config');if(!r){console.error('API request failed');return}const d=await r.json();$('cfgCaptchaMethod').value='extension';$('cfgPersonalProjectPoolSize').value=d.personal_project_pool_size||4;$('cfgServerFallbackEnabled').checked=d.server_fallback_enabled!==false;$('cfgServerFallbackMaxBrowsers').value=d.server_fallback_max_browsers||3}catch(e){console.error('Failed to load captcha settings:',e);showToast('Failed to load captcha settings: '+e.message,'error')}},
+        saveCaptchaConfig=async()=>{const method=$('cfgCaptchaMethod').value||'extension',personalProjectPoolSize=parseInt($('cfgPersonalProjectPoolSize').value)||4,serverFallbackEnabled=$('cfgServerFallbackEnabled').checked,serverFallbackMaxBrowsers=Math.max(1,Math.min(6,parseInt($('cfgServerFallbackMaxBrowsers').value)||3));try{const r=await apiRequest('/api/captcha/config',{method:'POST',body:JSON.stringify({captcha_method:method,personal_project_pool_size:personalProjectPoolSize,server_fallback_enabled:serverFallbackEnabled,server_fallback_max_browsers:serverFallbackMaxBrowsers})});if(!r){console.error('Save request failed');return}const d=await r.json();if(d.success){showToast('Captcha settings saved successfully','success');await new Promise(r=>setTimeout(r,200));await loadCaptchaConfig()}else{console.error('Save failed:',d);showToast(d.message||'Save failed','error')}}catch(e){console.error('Save failed:',e);showToast('Save failed: '+e.message,'error')}},
         loadPluginConfig=async()=>{try{const r=await apiRequest('/api/plugin/config');if(!r)return;const d=await r.json();if(d.success&&d.config){$('cfgPluginConnectionUrl').value=d.config.connection_url||'';$('cfgPluginConnectionToken').value=d.config.connection_token||'';$('cfgAutoEnableOnUpdate').checked=d.config.auto_enable_on_update||false;const pp=d.config.ext_proxy_pool||{};$('cfgExtProxyHost').value=pp.host||'';$('cfgExtProxyUser').value=pp.user||'';$('cfgExtProxyPass').value=pp.pass||'';$('cfgExtProxyPorts').value=(pp.ports||[]).join(', ')}}catch(e){console.error('Failed to load plugin settings:',e);showToast('Failed to load plugin settings: '+e.message,'error')}},
         savePluginConfig=async()=>{const token=$('cfgPluginConnectionToken').value.trim();const autoEnable=$('cfgAutoEnableOnUpdate').checked;const ext_proxy_pool={host:$('cfgExtProxyHost').value.trim(),user:$('cfgExtProxyUser').value.trim(),pass:$('cfgExtProxyPass').value.trim(),ports:$('cfgExtProxyPorts').value};try{const r=await apiRequest('/api/plugin/config',{method:'POST',body:JSON.stringify({connection_token:token,auto_enable_on_update:autoEnable,ext_proxy_pool})});if(!r)return;const d=await r.json();if(d.success){showToast('Plugin settings saved successfully','success');await loadPluginConfig()}else{showToast(d.message||'Save failed','error')}}catch(e){showToast('Save failed: '+e.message,'error')}},
         copyConnectionUrl=()=>{const url=$('cfgPluginConnectionUrl').value;if(!url){showToast('The connection endpoint is empty','error');return}navigator.clipboard.writeText(url).then(()=>showToast('Connection endpoint copied','success')).catch(()=>showToast('Copy failed','error'))},
