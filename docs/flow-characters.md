@@ -1,9 +1,14 @@
 # Flow Characters (consistent people / objects) — flow2api
 
-> **Not available since 2026-10-21 (checked 2026-10-23).** These endpoints lived on aisandbox-pa REST, which
-> needs the retired Labs login. On cookie sessions a request with `characters` gets an immediate 501 with a
-> plain message (`generation_handler.CHARACTERS_UNAVAILABLE`), never an account strike. Bringing it back needs
-> the Flow web app's character RPC ids, captured from a HAR of the real app (none captured yet).
+> **Since 2026-11-04 characters work again for images, on the Flow web RPCs** (captured from a HAR of the real
+> Flow app in the Gamers Lens test account, then proven live on account 76: create → upload → slot → a 768×1376
+> image with the character). Create = `C4BZMd` `[[projectId, null, null, [1, name, []]]]` → reply row[1] is the
+> character id; photo into slot = `Sc7aEb` `[mediaId, null, null, projectId, null, null, null,
+> [null, null, [characterId, [slot]]], null, uuid, uuid]`; use = image request (`ogiZ0b`) slot 10 `[[characterId]]`,
+> prompt stays plain text (the @Name becomes the name). The web app has no batch read, so a character is
+> confirmed by its own create/slot answers; after a restart a cached character is rebuilt once. **Videos with
+> characters are still not available** (immediate 501). UNVERIFIED: a second photo (slot index 1) — the HAR
+> used one photo. The REST endpoints below are history.
 
 A character is a named person or thing built from 1–2 photos. In the prompt you write `@Name`
 and Flow keeps that face/object consistent. flow2api creates the character on the account that
