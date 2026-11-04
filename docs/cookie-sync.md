@@ -23,9 +23,11 @@ push carries the rotated cookies. With the browser gone, the account stops withi
 
 ## What is shared, and where it goes
 
-- Exactly the cookies Chrome would send to `https://accounts.google.com/` for that profile
-  (`chrome.cookies.getAll({url})`), serialised as a JSON list of `{name, value}`. Nothing else
-  from the browser.
+- The cookies Chrome would send to `https://accounts.google.com/` and (since 3.8.0) to
+  `https://flow.google.com/` for that profile, as a JSON list of `{name, value, domain, path, hostOnly,
+  secure, httpOnly, sameSite, expirationDate}`, deduplicated, partitioned and expired ones skipped.
+  Extensions ≤ 3.7.x send `{name, value}` from accounts.google.com only; the server accepts both.
+  Nothing else from the browser.
 - Sent inside the normal session push (`POST /api/plugin/update-token`, plugin connection
   token auth) as `google_cookies`, together with `protocol_mode: "protocol"`.
 - Stored in the `tokens` row (`google_cookies`, `protocol_mode`, `login_account`,
@@ -55,8 +57,11 @@ and authenticated with the shared plugin connection token: any worker holding th
 clear any account, which is the same trust level the session push already has.
 
 When the switch is ON the push also repeats whenever Google rotates a login cookie
-(`SID`, `HSID`, `SSID`, `LSID`, `__Secure-1PSID/3PSID`, `__Secure-1PSIDTS/3PSIDTS`), debounced
-30 s and at most once per 10 min, on top of the hourly session push.
+(`SID`, `HSID`, `SSID`, `LSID`, `__Secure-1PSID/3PSID`, `__Secure-1PSIDTS/3PSIDTS`, and since 3.8.0 the
+device-bound `__Secure-1PSIDRTS/3PSIDRTS`, `__Secure-STRP`). 3.8.0: the push waits for a 10 s quiet spell
+(at most 60 s) and at least 90 s after the previous push, and is never dropped (kept in storage, timed with
+`chrome.alarms`, retried twice), plus a periodic push every 20 min. 3.7.x dropped a change that came within
+10 min of the last push and pushed hourly.
 
 ## How the server uses it (cookie sessions, 2026-10-23)
 
@@ -95,12 +100,15 @@ extended video.
 - Device-bound logins (DBSC): 26 of 36 stored cookie sets on 2026-10-23 carry `__Secure-1PSIDRTS` /
   `__Secure-STRP`. Copied cookies of such a login go stale (Flow shows its signed-out page; seen on
   account 51 about an hour after its last push). The extension re-pushes when Google rotates the
-  login cookie (at most every 10 min) and hourly. Measured 2026-10-23 (`tmp/dbsc_lifetime_1023.py`, frozen
+  login cookie (3.8.0: within ~10–90 s; 3.7.x: dropped within 10 min of a push) and periodically
+  (3.8.0: every 20 min; 3.7.x: hourly). Measured 2026-10-23 (`tmp/dbsc_lifetime_1023.py`, frozen
   cookie snapshots, through each account's proxy): two DBSC accounts' sessions AND fresh logins still worked
   28 min after the snapshot (cookies up to ~41 min old); a non-DBSC account's snapshot died 19 min in,
   exactly when its browser rotated its login cookies and pushed new ones (old OSID session 401, new login →
   sign-in page), while production moved to the new cookies on that push. So what ends a server session is
   the BROWSER rotating its login, not a fixed lifetime; the server follows only through the next push.
-  UNVERIFIED: whether the extension's 10-min gap between cookie-triggered pushes (`COOKIE_SYNC_MIN_GAP_MS`)
-  explains account 51 dying with no newer push.
+  3.8.0 removed the 10-min drop, so a rotation now reaches the server within about 1.5 min.
+  Proven 2026-11-04 on server browser flow-ultra-01 (Ultra 93, off since 2026-10-30 on 3.7.5): 3.8.0 pushed
+  8 s after start (first push refused, signed-out page, Chrome had just renewed its login; next push 5 s later
+  accepted) and the account went active again.
 - Old extensions (≤ 3.6.4) never send cookies, so since 2026-10-23 their accounts cannot work.

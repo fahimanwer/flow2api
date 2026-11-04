@@ -1,23 +1,19 @@
-/* Flow2API Worker — combined captcha + token-refresh service worker.
+/* Flow2API Worker — combined captcha + Google-login service worker.
  *
  * Two jobs in one extension:
- *   1) reCAPTCHA: holds a persistent (hidden) Google Labs tab and mints a fresh
+ *   1) reCAPTCHA: keeps one hidden flow.google.com/about tab and mints a fresh
  *      reCAPTCHA Enterprise token on demand over the /captcha_ws WebSocket.
- *   2) Session refresh: on a timer, extracts the Google Labs session-token cookie
- *      and POSTs it to /api/plugin/update-token so the backend's login stays valid.
+ *   2) Login sharing (3.8.0, cookie-first): pushes this profile's Google login cookies
+ *      to /api/plugin/update-token. Since 2026-10-23 they ARE the account's Flow login on
+ *      the server (docs/cookie-sync.md): pushed when Google rotates the login, and at
+ *      least every 20 min. Google retired the Labs sign-in on 2026-10-21, so 3.8.0 has
+ *      no Labs tab, no Labs cookie and no Labs reload any more.
  *
  * Built for heavy use and a fleet of laptops (one account each): set a unique
  * Route Key per laptop so the backend routes each account's captcha to the right
- * browser. Reliability is the priority — persistent tab is recreated on loss,
+ * browser. Reliability is the priority — the mint tab is recreated on loss,
  * the socket auto-reconnects, and an alarm revives everything if Chrome suspends
- * the service worker.
- *
- * Anti-tab-storm guarantees (post sleep/wake): the extension only ever closes
- * tabs IT created (tracked in storage), never the user's own Labs tabs; tab
- * creation is bounded by a storage-backed lease + a hard ceiling so a wake storm
- * can never pile up tabs; and if Google Labs needs a fresh login (session expired
- * during sleep -> redirect to accounts.google.com) it STOPS opening tabs, backs
- * off, and raises a "login required" badge instead of churning Chrome to a crash.
+ * the service worker. The worker never closes the last tab of a window.
  *
  * Optional third job (opt-in per profile, see suno.js): share this browser's Suno
  * login with the backend so Flow2API can make songs on that account.
@@ -34,57 +30,31 @@ let SITE_CONFIG = {};
 try { importScripts("site.js"); SITE_CONFIG = FlowSiteConfig.sanitizeSiteConfig(globalThis.FlowSite); } catch (_) {}
 
 const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
-// Where the worker tab is opened to mint. 2026-09-04: Google now bounces migrated
-// accounts from labs.google/fx/tools/flow to flow.google.com (client-side, ~1.5 s
-// after load). The new flow.google.com Angular app does NOT load grecaptcha at
-// all, and its CSP (Trusted Types + nonce) blocks injecting it, so a tab there can
-// never mint ("Failed to set the 'src' property ... TrustedScriptURL"). The Labs
-// FX home page does not redirect, loads grecaptcha.enterprise itself with the
-// SAME site key, and keeps the same NextAuth session alive (/fx/api/auth/session)
-// for migrated and non-migrated accounts alike — so that is where we mint.
-const MINT_URL = "https://labs.google/fx";
-// 2026-09-23: Google's backend now accepts ONLY tokens minted on flow.google.com
-// (a labs.google-hosted token is refused: "reCAPTCHA evaluation failed"), and the
+// 2026-09-23: Google's backend accepts ONLY tokens minted on flow.google.com (a
+// labs.google-hosted token is refused: "reCAPTCHA evaluation failed"), and the
 // flow.google.com app booby-traps grecaptcha.enterprise.execute (see
-// recaptcha_hook.js). So the Labs tab above stays for the session cookie only, and
-// minting happens in a SEPARATE, unowned tab on flow.google.com/about — a page that
-// does not load reCAPTCHA itself, where we load it with the same site key (Trusted
-// Types policy + the page's own script nonce satisfy its CSP).
+// recaptcha_hook.js). So minting happens in an unowned tab on flow.google.com/about —
+// a page that does not load reCAPTCHA itself, where we load it with the same site key
+// (Trusted Types policy + the page's own script nonce satisfy its CSP). It needs no
+// Flow sign-in.
 const MINT2_URL = "https://flow.google.com/about";
 const MINT2_ORIGIN = "https://flow.google.com/";
-// A tab is "on Flow" (not bounced to login/consent) on either origin, so a
-// redirect to flow.google.com is never mistaken for a sign-out ...
-const FLOW_ORIGINS = ["https://labs.google/fx", "https://flow.google.com"];
-// ... but only a labs.google tab can actually mint (see above).
-const MINT_ORIGINS = ["https://labs.google/fx"];
-const COOKIE_DOMAINS = ["labs.google", "flow.google.com"];
-const SESSION_COOKIE = "__Secure-next-auth.session-token";
 
 const ALARM_SESSION = "flow2api_session_refresh";
 const ALARM_KEEPALIVE = "flow2api_keepalive";
 const ALARM_PORT_MIGRATION = "flow2api_port_migration"; // 3.7.4: ask again for a pending IP move
-const ALARM_RELOAD = "flow2api_session_reload";
+const LEGACY_ALARM_RELOAD = "flow2api_session_reload";   // 3.7.x Labs reload; cleared on boot
 
-// Proactive session-cookie roll: reload the persistent Labs tab when the
-// session-token cookie is within this window of expiry, so NextAuth re-issues
-// (rolls) a fresh cookie long before it can drift to expiry.
-const RELOAD_THRESHOLD_MS = 24 * 60 * 60 * 1000;  // reload when < 24h to expiry
-const RELOAD_MIN_GAP_MS   = 2 * 60 * 60 * 1000;   // never reload more than ~once / 2h
-const RELOAD_ACTIVE_MS    = 45 * 1000;            // skip reload if a mint started in last 45s (>= VIDEO 30s)
-const COOKIE_SETTLE_MS    = 1500;                 // let NextAuth write the rolled cookie
 const PUSH_TIMEOUT_MS     = 25 * 1000;            // hard bound on the session-push POST
+// Safety-net push interval. A server session dies when this browser rotates its Google login
+// (10–80 min after a push); a cookie rotation pushes at once, this catches anything missed.
+const SESSION_PUSH_MAX_MINUTES = 20;
 
 // WebSocket heartbeat: keep the MV3 service worker alive (Chrome 116+ resets the
 // idle timer on WS traffic). 15s gives margin under the ~30s idle limit + timer jitter.
 const HEARTBEAT_MS = 15000;
 const DEAD_SOCKET_MS = 50000;  // > 3 missed pongs; an old server that never pongs is still detected by get_token/register_ack traffic
 let lastServerMsgAt = 0;
-
-// Tab-creation safety rails.
-const LEASE_MS = 25000;            // creation lease lifetime (> worst-case tab load ~16s)
-const MAX_OWNED_TABS = 2;          // hard ceiling fuse: never keep more owned Labs tabs than this
-const LOGIN_HOSTS = ["accounts.google.com", "consent.google.com", "signin.google.com"];
-const AUTH_BACKOFF_MS = [60000, 300000, 900000, 1800000]; // 1m, 5m, 15m, 30m (capped)
 
 const DEFAULT_SETTINGS = {
   // Baked-in config so the extension works the moment it is loaded — no setup.
@@ -94,8 +64,7 @@ const DEFAULT_SETTINGS = {
   connectionToken: "fahim", // plugin connection token -> authenticates token-update
   routeKey: "",           // empty = shared captcha pool (any browser serves any account)
   clientLabel: "",        // optional friendly name shown in the backend logs
-  refreshIntervalMinutes: 60,
-  tabMode: "persistent",  // "persistent" (reuse one hidden tab) | "ephemeral" (open/close per token)
+  refreshIntervalMinutes: SESSION_PUSH_MAX_MINUTES,
   mintIntervalMs: 2000,   // min spacing between reCAPTCHA mints; paces one browser under Google's rate limit
   // Per-profile egress proxy. With proxyAuto ON (default), EACH Chrome profile
   // auto-builds its OWN sticky Oxylabs session (a random per-profile sessid that
@@ -113,23 +82,19 @@ const DEFAULT_SETTINGS = {
   failedImageMode: false,
   // Opt-in Suno login sharing (suno.js). Same rule as above: MUST be listed here.
   sunoEnabled: false,
-  // "Keep working when I'm away" (cookie_sync.js): share this profile's Google login so
-  // the server can renew the Labs session while the laptop is closed. Default ON.
+  // "Use this account in Flow2API" (cookie_sync.js): share this profile's Google login — the
+  // account's Flow login on the server. Default ON; OFF stops the account in Flow2API.
   cookieSyncEnabled: true
 };
 
 let ws = null;
 let lastMintAt = 0;       // timestamp of the last reCAPTCHA mint (for pacing)
 let extPortMigration = null; // {id, port} offered by the server in the last pool fetch (3.7.4)
-let mintInFlight = false; // true while handleGetToken holds the persistent tab (in-mem only)
-let lastReloadAt = 0;     // timestamp of last proactive reload (in-mem rate cap)
+let mintInFlight = false; // true while handleGetToken mints (in-mem only); an IP move waits for it
 let heartbeatInterval = null;
 let reconnectTimer = null;
-let persistentTabId = null;           // in-memory cache of the live persistent tab id
-let mintTabId = null;                 // the flow.google.com/about mint tab (NOT owned; sweeps ignore it)
+let mintTabId = null;                 // the flow.google.com/about mint tab (NOT owned by a user)
 let tokenQueue = Promise.resolve();   // serialize token requests
-let ensureChain = Promise.resolve();  // serialize persistent-tab ensures within this SW life
-let ownedQueue = Promise.resolve();   // serialize owned-tab-id storage mutations
 let connecting = false;
 
 /* ----------------------------- settings ----------------------------- */
@@ -144,8 +109,9 @@ async function getSettings() {
         connectionToken: (stored.connectionToken || "").trim(),
         routeKey,
         clientLabel: (site.clientLabel || stored.clientLabel || "").trim(),
-        refreshIntervalMinutes: Math.max(5, parseInt(stored.refreshIntervalMinutes, 10) || 60),
-        tabMode: stored.tabMode === "ephemeral" ? "ephemeral" : "persistent",
+        // At most every 20 min (3.8.0): a stored 60 is the old default that the pre-2.9.0 settings
+        // page saved, and nothing in the popup sets this any more. Shorter stored values (>= 5) stay.
+        refreshIntervalMinutes: Math.min(SESSION_PUSH_MAX_MINUTES, Math.max(5, parseInt(stored.refreshIntervalMinutes, 10) || SESSION_PUSH_MAX_MINUTES)),
         mintIntervalMs: Math.max(0, parseInt(stored.mintIntervalMs, 10) || 2000),
         // Residential proxy is ALWAYS on for staff builds: the backend redeems the
         // generate call from the same residential IP the extension minted from, so a
@@ -529,27 +495,35 @@ async function log(level, message, details) {
 
 /* ------------------------------ user signal -------------------------- */
 
+const RED_ICON = "data:image/svg+xml;base64," + btoa(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" rx="18" fill="#f06262"/><text x="48" y="68" font-size="64" text-anchor="middle" fill="#fff" font-family="sans-serif">!</text></svg>'
+);
+
 // The toolbar badge is the reliable, always-visible signal — it survives the user
-// being away (lid closed) and needs no icon asset. Two states share it, by priority:
-//   login_required (red "!")  — urgent, must re-sign-in; ALWAYS outranks an update.
+// being away (lid closed) and needs no icon asset. Recomputed from the CURRENT state, by priority:
+//   sign-in needed (red "!")  — no Google login here, or the server could not sign in to Flow
+//                               with it (push answered 400); ALWAYS outranks an update.
+//   grant expired (red "!")   — the server said Google stopped renewing the access token.
 //   update_available (blue ↑) — a newer ext version is published; shown when login is ok
 //                               so staff notice WITHOUT opening the popup.
-async function setBadge(state) {
+async function refreshBadge() {
   try {
     if (!chrome.action) return;
-    if (state === "login_required") {
+    const red = (title) => {
       chrome.action.setBadgeText({ text: "!" });
       chrome.action.setBadgeBackgroundColor({ color: "#f06262" });
-      chrome.action.setTitle({ title: "Flow2API Worker — Google Labs login required" });
+      chrome.action.setTitle({ title });
+    };
+    const auth = await getAuthState();
+    if (auth.state === "login_required") {
+      red(auth.kind === "rejected"
+        ? "Flow2API Worker — open flow.google.com in this Chrome and check you are signed in"
+        : "Flow2API Worker — sign in to Google in this Chrome");
       return;
     }
-    // Grant expired: the cookie is still there (so login_required never fires) but Google
-    // stopped renewing this account's access token. Only a human sign-out/sign-in fixes it.
-    // Separate persisted state — NOT login_required, which is cleared by mere cookie presence.
+    // Separate persisted state, cleared only by a push the server confirms (credential_verified).
     if (await isGrantExpired()) {
-      chrome.action.setBadgeText({ text: "!" });
-      chrome.action.setBadgeBackgroundColor({ color: "#f06262" });
-      chrome.action.setTitle({ title: "Flow2API Worker — sign out of Google Labs and sign back in, then Reconnect" });
+      red("Flow2API Worker — sign out of Google in this Chrome, sign back in, then Reconnect");
       return;
     }
     // Login is fine — surface an available update on the icon (blue ↑) so it can't be missed.
@@ -565,22 +539,16 @@ async function setBadge(state) {
   } catch (_) {}
 }
 
-// Recompute the badge from the CURRENT auth + update state (login always wins). Call after
-// either changes so the icon stays truthful without every caller knowing both signals.
-async function refreshBadge() {
-  setBadge((await getAuthState()).state);
-}
-
-async function notifyLogin() {
+async function notifyLogin(kind) {
   // Best-effort desktop notification; the badge is the guaranteed signal.
   try {
     await chrome.notifications.create("flow2api_login_" + Date.now(), {
       type: "basic",
-      iconUrl: "data:image/svg+xml;base64," + btoa(
-        '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" rx="18" fill="#f06262"/><text x="48" y="68" font-size="64" text-anchor="middle" fill="#fff" font-family="sans-serif">!</text></svg>'
-      ),
+      iconUrl: RED_ICON,
       title: "Flow2API Worker — login needed",
-      message: "Your Google Labs session expired. Open Google Labs and sign in again to resume reCAPTCHA minting.",
+      message: kind === "rejected"
+        ? "Flow2API could not sign in to Flow with this Chrome's Google login. Open flow.google.com in this Chrome and check you are signed in."
+        : "This Chrome is not signed in to Google. Sign in to Google (open flow.google.com) and Flow2API picks it up by itself.",
       priority: 2
     });
   } catch (_) {}
@@ -614,40 +582,44 @@ chrome.notifications.onClicked.addListener((id) => {
 });
 
 /* ------------------------------ auth state --------------------------- */
+// "Sign-in needed" (3.8.0). Set when this Chrome has no Google login cookies (kind "signed_out")
+// or the server could not sign in to Flow with the pushed cookies (push answered 400, kind
+// "rejected"). It gates nothing (minting needs no login); it drives the red badge, the popup line
+// and one notification. Cleared by a push the server confirms (2xx with credential_verified).
 
 async function getAuthState() {
   const { authState } = await chrome.storage.local.get(["authState"]);
-  return authState || { state: "ok", failCount: 0, nextRetryAt: 0 };
+  return authState || { state: "ok" };
 }
 
-// Enter the "login required" circuit-breaker: stop opening tabs, back off
-// (growing interval), and raise the badge so the user knows to re-login.
-async function setLoginRequired(reason) {
+async function setLoginRequired(kind, reason) {
   const cur = await getAuthState();
-  const transition = cur.state !== "login_required";
-  const failCount = (cur.state === "login_required" ? cur.failCount : 0) + 1;
-  const backoff = AUTH_BACKOFF_MS[Math.min(failCount - 1, AUTH_BACKOFF_MS.length - 1)];
+  const transition = cur.state !== "login_required" || cur.kind !== kind;
   await chrome.storage.local.set({
-    authState: { state: "login_required", failCount, nextRetryAt: Date.now() + backoff, reason: reason || "" }
+    authState: { state: "login_required", kind, reason: String(reason || "").slice(0, 200), since: transition ? Date.now() : (cur.since || Date.now()) }
   });
-  setBadge("login_required");
-  await log("ERROR", "Google Labs login required — pausing tab creation", { reason, backoffMs: backoff });
-  if (transition) notifyLogin(reason);
+  await refreshBadge();
+  if (transition) {
+    await log("ERROR", kind === "rejected"
+      ? "Flow2API could not sign in to Flow with this Chrome's Google login — open flow.google.com and check you are signed in"
+      : "This Chrome is not signed in to Google — sign in so Flow2API can use this account", { reason });
+    notifyLogin(kind);
+  }
 }
 
 async function clearLoginRequired() {
   const cur = await getAuthState();
   if (cur.state !== "ok") {
-    await chrome.storage.local.set({ authState: { state: "ok", failCount: 0, nextRetryAt: 0 } });
-    setBadge("ok");
-    await log("SUCCESS", "Google Labs session restored");
+    await chrome.storage.local.set({ authState: { state: "ok" } });
+    await refreshBadge();
+    await log("SUCCESS", "Flow2API signed in to Flow with this Chrome's Google login");
   }
 }
 
 /* ------------------------- grant-expired state ------------------------ */
 // Set ONLY when the server answers a session push with action=relogin_required (it
-// verified the access token inside our cookie against Google's API and it is dead).
-// Cleared ONLY by a push the server confirms as credential_verified — never by the cookie
+// verified the login inside our cookies and Google refused it).
+// Cleared ONLY by a push the server confirms as credential_verified — never by a cookie
 // merely being present, which is exactly the trap that kept accounts flapping for weeks.
 async function isGrantExpired() {
   try { const { grantExpired } = await chrome.storage.local.get(["grantExpired"]); return !!(grantExpired && grantExpired.state === "grant_expired"); }
@@ -657,15 +629,15 @@ async function isGrantExpired() {
 async function setGrantExpired(message) {
   const was = await isGrantExpired();
   await chrome.storage.local.set({ grantExpired: { state: "grant_expired", since: Date.now(), message: message || "" } });
-  setBadge("ok"); // falls through to the grant-expired branch (login_required still outranks it)
-  await log("ERROR", "Google stopped renewing this account's access token — sign out of Google Labs, sign back in, then click Reconnect", { message: (message || "").slice(0, 160) });
+  await refreshBadge(); // sign-in needed still outranks it
+  await log("ERROR", "Google stopped renewing this account's access token — sign out of Google in this Chrome, sign back in, then click Reconnect", { message: (message || "").slice(0, 160) });
   if (!was) notifyGrantExpired();
 }
 
 async function clearGrantExpired() {
   if (await isGrantExpired()) {
     await chrome.storage.local.remove("grantExpired");
-    setBadge("ok");
+    await refreshBadge();
     await log("SUCCESS", "Google access token verified — account healthy again");
   }
 }
@@ -674,11 +646,9 @@ async function notifyGrantExpired() {
   try {
     await chrome.notifications.create("flow2api_grant_" + Date.now(), {
       type: "basic",
-      iconUrl: "data:image/svg+xml;base64," + btoa(
-        '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" rx="18" fill="#f06262"/><text x="48" y="68" font-size="64" text-anchor="middle" fill="#fff" font-family="sans-serif">!</text></svg>'
-      ),
+      iconUrl: RED_ICON,
       title: "Flow2API Worker — please sign in again",
-      message: "Google stopped renewing this account's access token. Sign OUT of Google Labs, sign back IN, then click Reconnect in the extension.",
+      message: "Google stopped renewing this account's access token. Sign OUT of Google in this Chrome, sign back IN, then click Reconnect in the extension.",
       priority: 2
     });
   } catch (_) {}
@@ -705,26 +675,6 @@ function getTab(tabId) {
 }
 
 function tabUrlOf(tab) { return (tab && (tab.url || tab.pendingUrl)) || ""; }
-function isFlowUrl(u) { return !!u && FLOW_ORIGINS.some((o) => u.startsWith(o)); }
-function isMintUrl(u) { return !!u && MINT_ORIGINS.some((o) => u.startsWith(o)); }
-
-// A tab counts as "on Flow" if EITHER its committed url OR its pending (loading)
-// url is the Flow URL — checked independently so an about:blank-then-Flow tab
-// (which reports url:"about:blank", pendingUrl:Flow) is not missed.
-function tabOnFlow(tab) {
-  return !!tab && (isFlowUrl(tab.url || "") || isFlowUrl(tab.pendingUrl || ""));
-}
-
-// A tab is "usable" (ready to mint) only when navigation has COMMITTED to a
-// labs.google page — a flow.google.com tab is on Flow but cannot mint, so it is
-// never reused; the caller drops it and opens MINT_URL instead.
-function tabUsable(tab) { return !!tab && isMintUrl(tab.url || ""); }
-
-function isLoginTab(tab) {
-  const u = tabUrlOf(tab);
-  try { const h = new URL(u).hostname; return LOGIN_HOSTS.some((x) => h === x || h.endsWith("." + x)); }
-  catch (_) { return false; }
-}
 
 function waitForTabComplete(tabId, timeoutMs = 15000) {
   return new Promise((resolve) => {
@@ -746,179 +696,20 @@ function waitForTabComplete(tabId, timeoutMs = 15000) {
   });
 }
 
-// The NextAuth session cookie, from whichever Flow domain holds it (labs.google
-// first, then flow.google.com). Returns the cookie object or null.
-async function readSessionCookie() {
-  for (const domain of COOKIE_DOMAINS) {
-    let c = await chrome.cookies.get({ url: "https://" + domain, name: SESSION_COOKIE });
-    if (!c) {
-      const all = await chrome.cookies.getAll({ domain });
-      c = all.find((x) => x.name === SESSION_COOKIE) || null;
-    }
-    if (c && c.value) return c;
-  }
-  return null;
-}
-
-async function hasSessionCookie() {
-  try {
-    const c = await readSessionCookie();
-    return !!(c && c.value);
-  } catch (_) {
-    return true; // don't block on cookie API errors
-  }
-}
-
-/* --------------------------- owned-tab registry ---------------------- */
-// We only ever CLOSE tabs we opened ourselves (tracked here), never the user's
-// own Labs tabs. All mutations are serialized to avoid lost-update races with
-// the onRemoved listener.
-
-function mutateOwned(fn) {
-  ownedQueue = ownedQueue.then(async () => {
-    const { ownedTabIds = [] } = await chrome.storage.local.get(["ownedTabIds"]);
-    const next = fn(ownedTabIds.slice());
-    await chrome.storage.local.set({ ownedTabIds: next });
-    return next;
-  }).catch(() => []);
-  return ownedQueue;
-}
-async function getOwned() {
-  const { ownedTabIds = [] } = await chrome.storage.local.get(["ownedTabIds"]);
-  return ownedTabIds;
-}
-function addOwned(id) { return mutateOwned((a) => (a.includes(id) ? a : a.concat(id))); }
-function removeOwned(id) { return mutateOwned((a) => a.filter((x) => x !== id)); }
-
-// Live owned tabs that are on Flow (committed or loading).
-async function queryOwnedFlowTabs() {
-  const owned = await getOwned();
-  const out = [];
-  for (const id of owned) {
-    const tab = await getTab(id);
-    if (tab && tabOnFlow(tab)) out.push({ id, tab });
-  }
-  return out;
-}
-
-// Every live owned tab (regardless of URL — counts login/loading tabs too), used
-// by the absolute create ceiling so nothing slips outside the fuse.
-async function queryOwnedLiveTabs() {
-  const owned = await getOwned();
-  const out = [];
-  for (const id of owned) {
-    const tab = await getTab(id);
-    if (tab) out.push({ id, tab });
-  }
-  return out;
-}
-
-// Close every owned tab and clear all persistent state (used by ephemeral-mode boot).
-async function closeAllOwnedTabs() {
-  for (const id of await getOwned()) { try { await chrome.tabs.remove(id); } catch (_) {} }
-  await mutateOwned(() => []);
-  persistentTabId = null;
-  await chrome.storage.local.remove("persistentTabId");
-}
-
-// Close every OWNED Labs tab except one to keep. Prunes dead/closed ids and never
-// keeps a tab sitting on a login page. Returns the kept id (or null). This is the
-// hard global cap: even if every other guard failed, at most one owned tab survives.
-async function sweepOwnedTabs(keepId = null) {
-  const owned = await getOwned();
-  const live = [];
-  for (const id of owned) {
-    const tab = await getTab(id);
-    if (tab) live.push({ id, tab });
-  }
-  if (live.length === 0) { await mutateOwned(() => []); return null; } // prune dead ids; keep persistentTabId untouched
-
-  // Choose which to keep: explicit keepId, else a committed-Flow tab, else first.
-  let keep = keepId != null ? live.find((x) => x.id === keepId) : null;
-  if (!keep) keep = live.find((x) => tabUsable(x.tab)) || null;
-  if (!keep) keep = live[0];
-  // Never keep a login-redirected tab around.
-  if (keep && isLoginTab(keep.tab)) keep = null;
-
-  let closed = 0;
-  const survivors = [];
-  const closedUrls = [];
-  for (const x of live) {
-    if (keep && x.id === keep.id) { survivors.push(x.id); continue; }
-    // Window-safe: a tab that is the last in its window is left open and merely
-    // deregistered (removeOwnedTabSafely logs it) — closing it closes the window.
-    if (await removeOwnedTabSafely(x.id, "extra owned tab")) { closed++; closedUrls.push(shortUrl(x.tab.url)); }
-  }
-  await mutateOwned((cur) => cur.filter((id) => survivors.includes(id)));
-
-  if (keep) {
-    persistentTabId = keep.id;
-    await chrome.storage.local.set({ persistentTabId: keep.id });
-  } else {
-    persistentTabId = null;
-    await chrome.storage.local.remove("persistentTabId");
-  }
-  if (closed > 0) await log("INFO", "Swept extra owned Labs tabs", { kept: keep ? keep.id : null, keptUrl: keep ? shortUrl(keep.tab.url) : null, closed, closedUrls });
-  return keep ? keep.id : null;
-}
-
-// Find a live, COMMITTED-to-Flow tab we can mint in right now (or null). Only
-// considers tabs WE own (the durable owned-list) — never adopts a tab by URL, so
-// a user's own Labs tab can never be claimed and later closed by the sweep.
-async function findUsableLabsTab() {
-  for (const id of await getOwned()) {
-    const tab = await getTab(id);
-    if (tabUsable(tab)) return id;
-  }
-  return null;
-}
-
 /* ------------------------ window-safe tab handling ------------------- */
 //
 // 2026-09-04: the worker tab is usually the ONLY tab in its Chrome window (staff run
 // it in a dedicated profile). Chrome closes a window when its last tab closes, and a
 // profile with no window left makes the next chrome.tabs.create fail with
-// "No current window" (seen 2026-09-03 21:39:40). Every path below that used to
-// remove-then-recreate did exactly that: the window vanished, the replacement could
-// not be opened, and the account went dark until a human clicked the profile.
-// Rules now: (1) create the replacement FIRST, in the same window, then remove the
-// old tab; (2) never close the last tab of a window, deregister it instead;
-// (3) a tab that drifted off labs.google/fx is navigated back, not killed.
+// "No current window" (seen 2026-09-03 21:39:40). Rules: never close the last tab of
+// a window, and open a window when the profile has none.
 
 function shortUrl(u) { u = String(u || ""); return u.length > 90 ? u.slice(0, 90) + "…" : u; }
-
-// Compact picture of every owned tab, for the log line that explains a replacement.
-async function snapshotOwnedTabs() {
-  const out = [];
-  for (const id of await getOwned()) {
-    const t = await getTab(id);
-    out.push(t
-      ? { id, url: shortUrl(t.url), pending: t.pendingUrl ? shortUrl(t.pendingUrl) : undefined, status: t.status, discarded: !!t.discarded, win: t.windowId }
-      : { id, gone: true });
-  }
-  return out;
-}
 
 async function isLastTabInWindow(tab) {
   if (!tab || tab.windowId == null) return false;
   try { const tabs = await chrome.tabs.query({ windowId: tab.windowId }); return tabs.length <= 1; }
   catch (_) { return false; }
-}
-
-// Remove an owned tab without ever closing its window. Returns true if the tab was
-// actually closed; false if it was left open (last in window) or already gone. In
-// both false cases it is deregistered so the extension stops managing it.
-async function removeOwnedTabSafely(tabId, why) {
-  const tab = await getTab(tabId);
-  if (tab && await isLastTabInWindow(tab)) {
-    await log("INFO", "Left tab open: it is the last tab in its window (closing it would close the window)", { tabId, url: shortUrl(tab.url), why: why || null });
-    await removeOwned(tabId);
-    return false;
-  }
-  let closed = false;
-  try { await chrome.tabs.remove(tabId); closed = true; } catch (_) {}
-  await removeOwned(tabId);
-  return closed;
 }
 
 // chrome.tabs.create that survives the two ways it fails in a worker profile: the
@@ -938,196 +729,15 @@ async function createTabSafely(url, preferWindowId) {
     const win = await chrome.windows.create({ url, focused: false, type: "normal" });
     const tab = win && win.tabs && win.tabs[0];
     if (!tab) throw new Error("no Chrome window was open and creating one failed");
-    await log("WARN", "No Chrome window was open for this profile; opened one for the Labs tab", { windowId: win.id, tabId: tab.id });
+    await log("WARN", "No Chrome window was open for this profile; opened one for the mint tab", { windowId: win.id, tabId: tab.id });
     return tab;
   }
 }
 
-/* --------------------------- tab creation ---------------------------- */
-
-// Open ONE hidden Labs tab, wait for it to settle, and verify it actually reached
-// Flow (not a login/consent redirect). Records ownership + a durable creation
-// lease BEFORE the long load so a service-worker crash mid-load can't orphan it
-// or let a respawned worker create a second tab. Throws on login redirect (and
-// trips the circuit breaker). Used for BOTH persistent and ephemeral modes; it
-// does NOT itself assign persistentTabId (callers own that policy).
-// opts.windowId: open the tab in that window (the one the tab it replaces lives in),
-// so a later removal of the old tab can never close the window the user is watching.
-async function openLabsTab(opts = {}) {
-  // Absolute create ceiling: enforced at the single creation chokepoint, so NO
-  // caller (persistent, ephemeral, warm, retry) can push owned tabs past the cap.
-  const liveOwned = await queryOwnedLiveTabs();
-  if (liveOwned.length >= MAX_OWNED_TABS) await sweepOwnedTabs();
-
-  await chrome.storage.local.set({ creationLease: { state: "creating", expiresAt: Date.now() + LEASE_MS } });
-  let tab;
-  try {
-    tab = await createTabSafely(MINT_URL, opts.windowId);
-  } catch (e) {
-    await chrome.storage.local.remove("creationLease");
-    throw e;
-  }
-  await addOwned(tab.id);
-  await chrome.storage.local.set({ creationLease: { state: "creating", tabId: tab.id, expiresAt: Date.now() + LEASE_MS } });
-
-  try {
-    await waitForTabComplete(tab.id);
-    const settled = await getTab(tab.id);
-    if (!tabOnFlow(settled)) {
-      // Redirected away from Flow (login/consent) or vanished — don't keep it,
-      // and don't let it be recreated forever. (Left open, unowned, if it is the
-      // last tab in its window: a login page the user can actually sign in on.)
-      await removeOwnedTabSafely(tab.id, "did not reach Flow");
-      if (isLoginTab(settled)) await setLoginRequired("Labs redirected to " + tabUrlOf(settled));
-      throw new Error("labs tab did not reach Flow URL (" + (tabUrlOf(settled) || "gone") + ")");
-    }
-    if (!tabUsable(settled)) {
-      // On Flow, but on a page with no reCAPTCHA (flow.google.com). Don't keep it:
-      // every mint there fails, and the retry would just reuse it.
-      await removeOwnedTabSafely(tab.id, "landed on a page without reCAPTCHA");
-      throw new Error("labs tab was redirected to " + tabUrlOf(settled) + " where reCAPTCHA cannot be minted");
-    }
-    await sleep(1200); // let grecaptcha settle
-    return tab.id;
-  } finally {
-    await chrome.storage.local.remove("creationLease");
-  }
-}
-
-// Ensure exactly ONE persistent Labs tab exists; returns its id. Serialized via
-// ensureChain (one at a time within this SW life) and guarded across SW respawns
-// by the storage lease + owned-tab ceiling, so concurrent callers (warm-up,
-// keepalive, session refresh, token backlog) can never spawn a tab storm.
-function ensurePersistentTab() {
-  ensureChain = ensureChain.then(_ensurePersistentTab, _ensurePersistentTab);
-  return ensureChain;
-}
-
-async function _ensurePersistentTab() {
-  // 0) Circuit breaker: while login is required and backoff is active, refuse —
-  //    but first recover immediately if the user has logged back in (cookie back),
-  //    so a token request right after re-login isn't needlessly rejected.
-  const auth = await getAuthState();
-  if (auth.state === "login_required" && Date.now() < (auth.nextRetryAt || 0)) {
-    if (await hasSessionCookie()) { await clearLoginRequired(); }
-    else throw new Error("login_required");
-  }
-
-  // 1) Already have a live, usable tab -> adopt + collapse any extras to one.
-  const usable = await findUsableLabsTab();
-  if (usable != null) {
-    // Chrome's memory saver can discard a background tab: url is kept (so it still
-    // looks usable) but the page is gone and a mint in it fails. Reload it in place
-    // rather than letting the retry throw the tab away.
-    const t = await getTab(usable);
-    if (t && t.discarded) {
-      await log("INFO", "Labs tab was discarded by Chrome (memory saver); reloading it in place", { tabId: usable });
-      try { await chrome.tabs.reload(usable, { bypassCache: false }); await waitForTabComplete(usable); await sleep(1200); } catch (_) {}
-    }
-    persistentTabId = usable;
-    await chrome.storage.local.set({ persistentTabId: usable });
-    await sweepOwnedTabs(usable);
-    return persistentTabId;
-  }
-
-  // Nothing usable. Record WHY before creating, so a replacement is never a mystery
-  // in the log again (2026-09-04: a tab was swapped 19 s after being kept, and
-  // nothing said what the old tab's URL was).
-  const before = await snapshotOwnedTabs();
-  const liveBefore = before.filter((x) => !x.gone);
-  const preferWindowId = liveBefore.length ? liveBefore[0].win : undefined;
-
-  // 2) Honor an in-flight creation lease (possibly from a prior SW life): wait a
-  //    beat and re-check instead of starting a second creation.
-  const { creationLease } = await chrome.storage.local.get(["creationLease"]);
-  if (creationLease && creationLease.expiresAt > Date.now()) {
-    await sleep(1500);
-    const again = await findUsableLabsTab();
-    if (again != null) { persistentTabId = again; await sweepOwnedTabs(again); return persistentTabId; }
-  }
-
-  // 3) Hard ceiling fuse: never exceed MAX_OWNED_TABS owned Labs tabs.
-  const ownedFlow = await queryOwnedFlowTabs();
-  if (ownedFlow.length >= MAX_OWNED_TABS) {
-    const kept = await sweepOwnedTabs();
-    if (kept != null) {
-      const t = await getTab(kept);
-      if (tabUsable(t)) { persistentTabId = kept; return persistentTabId; }
-    }
-  }
-
-  // 4) Auth gate: don't open a tab that will just bounce to login.
-  if (!(await hasSessionCookie())) {
-    await setLoginRequired("session cookie missing");
-    throw new Error("login_required");
-  }
-
-  // 5) Create exactly one — in the same window as whatever we had, so the sweep
-  //    that follows removes a tab from a window that still has ours in it.
-  const id = await openLabsTab({ windowId: preferWindowId });
-  await clearLoginRequired();
-  persistentTabId = id;
-  await chrome.storage.local.set({ persistentTabId: id });
-  await sweepOwnedTabs(id); // close anything that snuck in during the load window
-  await log("INFO", "Persistent Labs tab opened", {
-    tabId: persistentTabId,
-    why: liveBefore.length ? "owned tab(s) were not on labs.google/fx" : (before.length ? "owned tab(s) were gone" : "no owned tab"),
-    previous: before,
-  });
-  return persistentTabId;
-}
-
-// Swap the persistent tab for a fresh one because a mint failed IN it. Order matters:
-// the new tab is created first, in the SAME window, and only then is the old one
-// removed — so the window survives even when the old tab was its last tab (the
-// 2026-09-03 "No current window" failure). Serialized on ensureChain like ensure.
-function replacePersistentTab(why) {
-  const run = () => _replacePersistentTab(why);
-  ensureChain = ensureChain.then(run, run);
-  return ensureChain;
-}
-
-async function _replacePersistentTab(why) {
-  const cur = await findUsableLabsTab();
-  if (cur == null) return _ensurePersistentTab(); // nothing to replace: normal path (logs its own reason)
-  const curTab = await getTab(cur);
-  const fresh = await openLabsTab({ windowId: curTab ? curTab.windowId : undefined });
-  await clearLoginRequired();
-  persistentTabId = fresh;
-  await chrome.storage.local.set({ persistentTabId: fresh });
-  await removeOwnedTabSafely(cur, why);
-  await sweepOwnedTabs(fresh);
-  await log("WARN", "Replaced the Labs tab", {
-    why,
-    old: curTab ? { id: cur, url: shortUrl(curTab.url), status: curTab.status, discarded: !!curTab.discarded, win: curTab.windowId } : { id: cur, gone: true },
-    new: fresh,
-  });
-  return fresh;
-}
-
-// Warm/keep the persistent tab, respecting the login circuit breaker. Recovers
-// promptly: if login was required but the user has since logged back in (cookie
-// present again), clear the breaker and proceed.
-async function maybeEnsurePersistentTab() {
-  const settings = await getSettings();
-  if (settings.tabMode !== "persistent") return;
-  const auth = await getAuthState();
-  if (auth.state === "login_required") {
-    if (await hasSessionCookie()) {
-      await clearLoginRequired();
-    } else if (Date.now() < (auth.nextRetryAt || 0)) {
-      return; // still backing off
-    }
-  }
-  ensurePersistentTab().then(() => maybeEnsureMintTab(), () => {});
-}
-
 /* ------------------------------- minting ----------------------------- */
 
-// The flow.google.com/about mint tab. Not in the owned-tab registry on purpose:
-// the sweeps and MAX_OWNED_TABS ceiling are about Labs tabs, and this one must
-// never be mistaken for a Labs tab that "drifted off the mint page". Reuses the
-// same tab for every mint (reCAPTCHA stays loaded, so a mint is ~1-2 s).
+// The flow.google.com/about mint tab — since 3.8.0 the only tab the worker opens.
+// Reuses the same tab for every mint (reCAPTCHA stays loaded, so a mint is ~1-2 s).
 //
 // Ownership rules (Codex review 2026-09-23):
 // - the id lives in chrome.storage.session, which Chrome clears on browser
@@ -1252,14 +862,10 @@ async function _dropMintTab(why) {
   await rememberMintTab(null);
 }
 
-// Warm the mint tab right after the Labs tab, so the first real request does not
+// Warm the mint tab (socket connect + keep-alive), so the first real request does not
 // pay the page load inside the server's 25 s budget.
 async function maybeEnsureMintTab() {
-  try {
-    const labsId = await findUsableLabsTab();
-    const labsTab = await getTab(labsId);
-    await ensureMintTab(labsTab ? labsTab.windowId : undefined);
-  } catch (_) {}
+  try { await ensureMintTab(); } catch (_) {}
 }
 
 // Mint a reCAPTCHA token in the given tab's MAIN world.
@@ -1345,8 +951,7 @@ async function mintTokenInTab(tabId, action, timeoutMs) {
 }
 
 async function handleGetToken(data, settings, responseSocket = ws) {
-  // Mark the persistent tab as in-use so proactive reload / session-refresh
-  // fallback never reload it out from under an in-flight mint.
+  // Mark a mint as in progress so a port move (applyProxy) never switches IP under it.
   mintInFlight = true;
   try {
     return await _handleGetToken(data, settings, responseSocket);
@@ -1364,31 +969,19 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
   const remaining = () => deadline - Date.now();
   let lastMintError = null; // attempt 1's failure, carried into the replacement log line
 
-  // Try up to twice: a stale persistent tab is recreated on the second attempt.
+  // Try up to twice: a mint that failed in the mint tab is retried in a fresh one.
   for (let attempt = 1; attempt <= 2; attempt++) {
-    let ephemeralTabId = null;
     try {
-      // The Labs tab is still ensured first: it is the login gate (throws
-      // login_required when the session cookie is gone) and keeps the NextAuth
-      // session rolling. Since 2026-09-23 the token itself is minted in the
-      // separate flow.google.com tab (see MINT2_URL).
-      if (attempt === 2 && remaining() < 6000) {
-        sendWS({ req_id: data.req_id, status: "error", error: "worker failed: " + String(lastMintError || "") + " (no time left to retry)" }, responseSocket);
-        return;
+      // 3.8.0: no Labs tab and no login gate. The token is minted in the flow.google.com/about
+      // tab (since 3.6.4, see MINT2_URL), which needs no Flow sign-in.
+      if (attempt === 2) {
+        if (remaining() < 6000) {
+          sendWS({ req_id: data.req_id, status: "error", error: "worker failed: " + String(lastMintError || "") + " (no time left to retry)" }, responseSocket);
+          return;
+        }
+        await dropMintTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
       }
-      let labsTabId;
-      if (settings.tabMode === "ephemeral") {
-        ephemeralTabId = await openLabsTab();
-        labsTabId = ephemeralTabId;
-      } else {
-        // The Labs tab is only the login gate now; a failed mint happened in the
-        // mint tab, so on retry only the mint tab is replaced.
-        labsTabId = await ensurePersistentTab();
-      }
-      if (attempt === 2) await dropMintTab("mint attempt 1 failed: " + String(lastMintError || "").slice(0, 160));
-      if (remaining() < 4000) throw new Error("no time left after the Labs tab check (" + Math.round(remaining()) + " ms remaining)");
-      const labsTab = await getTab(labsTabId);
-      const tabId = await ensureMintTab(labsTab ? labsTab.windowId : undefined, deadline - 3000);
+      const tabId = await ensureMintTab(undefined, deadline - 3000);
 
       await paceMint(settings.mintIntervalMs);
       const mintBudget = Math.min(action === "VIDEO_GENERATION" ? 60000 : 20000, remaining() - 500);
@@ -1400,17 +993,8 @@ async function _handleGetToken(data, settings, responseSocket = ws) {
       const msg = String(e && e.message || e);
       lastMintError = msg;
       await log("ERROR", `token attempt ${attempt} failed`, { error: msg });
-      if (msg === "login_required") {
-        // No point retrying — surface immediately so the backend can route elsewhere.
-        sendWS({ req_id: data.req_id, status: "error", error: "worker login required (re-login to Google Labs)" }, responseSocket);
-        return;
-      }
       if (attempt === 2) {
         sendWS({ req_id: data.req_id, status: "error", error: "worker failed: " + msg }, responseSocket);
-      }
-    } finally {
-      if (ephemeralTabId != null) {
-        await removeOwnedTabSafely(ephemeralTabId, "ephemeral mint tab");
       }
     }
   }
@@ -1491,8 +1075,8 @@ async function connectWS() {
       }
       sendWS({ type: "ping" }, socket);
     }, HEARTBEAT_MS);
-    // Warm the persistent tab so the first real request is fast (login-aware).
-    maybeEnsurePersistentTab();
+    // Warm the mint tab so the first real request is fast.
+    maybeEnsureMintTab();
   };
 
   socket.onmessage = (event) => {
@@ -1506,17 +1090,10 @@ async function connectWS() {
       tokenQueue = tokenQueue.then(() => handleGetToken(data, settings, socket)).catch(() => {});
     }
     if (data.type === "refresh_session") {
-      if (data.reload) {
-        // Forced reload navigates the Labs tab → must be serialized behind mints
-        // (tokenQueue) exactly like the periodic roll; the server waits longer (45s) for it.
-        tokenQueue = tokenQueue.then(() => handleRefreshSession(data, socket)).catch(() => {});
-      } else {
-        // Direct call (NOT tokenQueue): refreshSession's common path is tab-free
-        // (cookie read + POST), so it can't conflict with an in-flight mint, and the
-        // only tab-reloading path (empty-cookie fallback) is already mint-busy-guarded.
-        // Queueing behind a long (video) mint would blow the backend's 30s wait.
-        handleRefreshSession(data, socket);
-      }
+      // Direct call (NOT tokenQueue), with or without `reload`: the push is tab-free (cookie
+      // read + POST), so it can't conflict with a mint, and queueing behind a long (video)
+      // mint would blow the backend's 30 s wait.
+      handleRefreshSession(data, socket);
     }
   };
 
@@ -1544,322 +1121,173 @@ function closeSocket() {
 
 /* --------------------------- session refresh ------------------------- */
 
-// Drop an owned tab (window-safe remove + deregister + clear persistent pointer).
-async function dropOwnedTab(tabId, why) {
-  await removeOwnedTabSafely(tabId, why);
-  if (tabId === persistentTabId) {
-    persistentTabId = null;
-    await chrome.storage.local.remove("persistentTabId");
-  }
-}
-
-// Bring an owned tab that drifted off labs.google/fx back there, in place. Returns
-// true if it is mintable afterwards. Used instead of killing the tab, because
-// killing it is what closed the user's window.
-async function steerTabBackToMintPage(tabId) {
-  try {
-    await chrome.tabs.update(tabId, { url: MINT_URL });
-    await waitForTabComplete(tabId);
-  } catch (_) { return false; }
-  const t = await getTab(tabId);
-  if (!tabUsable(t)) return false;
-  await sleep(1200); // grecaptcha settle
+// Pushes can overlap (alarm, cookie change, server request); each carries its own cookie_sync_seq.
+// Only the answer to the NEWEST push may change the badge and the popup: an older push finishing
+// later says nothing about now. In memory is enough — overlapping pushes share one worker life.
+let newestAnsweredSeq = 0;
+function isNewestAnswer(seq) {
+  if (seq < newestAnsweredSeq) return false;
+  newestAnsweredSeq = seq;
   return true;
 }
 
-// Time-to-expiry (ms) of the session-token cookie. null = no cookie; 0 = present
-// but session-scoped (no expirationDate) -> treat as roll-eligible on cadence so
-// the proactive feature never silently no-ops. Mirrors hasSessionCookie's read.
-async function sessionCookieTimeToExpiry() {
-  const c = await readSessionCookie();
-  if (!c || !c.value) return null;
-  if (!c.expirationDate) return 0; // session cookie, no expiry -> eligible to roll
-  return c.expirationDate * 1000 - Date.now();
+// The server's verdict on the newest push, for the popup and support (no cookie values).
+async function rememberLastPush(entry) {
+  try { await chrome.storage.local.set({ lastPush: { ...entry, at: Date.now() } }); } catch (_) {}
 }
 
-// Force NextAuth to re-issue (roll) the session-token cookie by navigating a Labs
-// tab: reload an existing usable owned tab if we have one (no MAX_OWNED_TABS
-// pressure), else open one fresh via openLabsTab() (ceiling/lease/login-redirect
-// safe). NEVER throws. Returns the live tab id on Flow, or null if we ended up off
-// Flow / logged out (the breaker is armed inside on a real login bounce). Does NOT
-// read or push the cookie — the caller re-reads after COOKIE_SETTLE_MS.
-async function rollSessionTab() {
-  let tabId = await findUsableLabsTab();
-  if (tabId != null) {
-    const beforeTab = await getTab(tabId);
-    try {
-      await chrome.tabs.reload(tabId, { bypassCache: false });
-    } catch (_) {
-      await dropOwnedTab(tabId, "vanished mid-reload"); // -> fall through to fresh open
-      tabId = null;
-    }
-    if (tabId != null) {
-      await waitForTabComplete(tabId);
-      const settled = await getTab(tabId);
-      if (isLoginTab(settled)) {
-        // Real sign-out. Arm the breaker; leave the login page where the user can
-        // see it (dropOwnedTab keeps a last-in-window tab open, unowned).
-        await setLoginRequired("reload bounced to " + tabUrlOf(settled));
-        await dropOwnedTab(tabId, "login bounce");
-        return null;
-      }
-      if (!tabUsable(settled)) {
-        // Off labs.google/fx (or on flow.google.com, which has no reCAPTCHA).
-        // 3.3.9 returned this tab as "fine" in the flow.google.com case, so the
-        // next mint quietly replaced it. Steer it back in place instead.
-        await log("WARN", "Reload landed off the mint page; steering the tab back to labs.google/fx", { url: tabUrlOf(settled) });
-        if (await steerTabBackToMintPage(tabId)) return tabId;
-        await log("WARN", "Could not steer the tab back; opening a fresh one", { url: tabUrlOf(await getTab(tabId)) });
-        await dropOwnedTab(tabId, "stuck off the mint page");
-        tabId = null;
-      } else {
-        await sleep(1200); // grecaptcha settle, mirror openLabsTab
-        return tabId;
-      }
-    }
-    // Fresh open goes in the same window the old tab was in.
-    try {
-      const id = await openLabsTab({ windowId: beforeTab ? beforeTab.windowId : undefined });
-      persistentTabId = id;
-      await chrome.storage.local.set({ persistentTabId: id });
-      await sweepOwnedTabs(id);
-      return id;
-    } catch (e) {
-      await log("WARN", "rollSessionTab fresh open failed", { error: e && e.message });
-      return null;
-    }
-  }
-  // No usable tab to reload -> open one fresh. openLabsTab enforces the ceiling,
-  // records the lease, and arms login_required + throws on a login redirect.
+// One POST to /api/plugin/update-token. Never throws: a transport failure comes back as status 0.
+async function postSessionPush(updateUrl, settings, body) {
+  // Bound the push so a hung request can't outlive the server's wait for our ack.
+  const pushAbort = new AbortController();
+  const pushTimer = setTimeout(() => pushAbort.abort(), PUSH_TIMEOUT_MS);
   try {
-    const id = await openLabsTab();
-    persistentTabId = id;
-    await chrome.storage.local.set({ persistentTabId: id });
-    await sweepOwnedTabs(id); // collapse to exactly one
-    return id;
+    const resp = await fetch(updateUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.connectionToken}` },
+      body: JSON.stringify(body),
+      signal: pushAbort.signal
+    });
+    const text = await resp.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) {}
+    return { status: resp.status, ok: resp.ok, data, text };
   } catch (e) {
-    await log("WARN", "rollSessionTab fresh open failed", { error: e && e.message });
-    return null; // breaker already armed by openLabsTab if this was a login bounce
+    const detail = e && e.name === "AbortError" ? "no answer from Flow2API in 25 s" : "could not reach Flow2API";
+    return { status: 0, ok: false, data: { detail }, text: String((e && e.message) || e) };
+  } finally {
+    clearTimeout(pushTimer);
   }
 }
 
-// Expiry-aware proactive roll, run on ALARM_RELOAD via tokenQueue so it never
-// races a mint. Login-aware + rate-capped + yields to active traffic.
-async function maybeReloadForRoll() {
-  const settings = await getSettings();
-  if (settings.tabMode !== "persistent") return;          // ephemeral reopens every mint anyway
-  if (mintInFlight) return;                                // a mint is holding the tab right now
-  if (Date.now() - lastMintAt < RELOAD_ACTIVE_MS) return; // busy serving -> defer
-
-  // Circuit-breaker gate, mirroring maybeEnsurePersistentTab.
-  const auth = await getAuthState();
-  if (auth.state === "login_required") {
-    if (await hasSessionCookie()) await clearLoginRequired();
-    else if (Date.now() < (auth.nextRetryAt || 0)) return;
+// The session push, cookie-first (3.8.0). This profile's Google login cookies ARE the account's
+// Flow login on the server (docs/cookie-sync.md), so there is no Labs tab, Labs cookie or "busy"
+// gate any more: build google_cookies and push. token_id = the server asked about that account
+// (refresh_session). Every attempt also settles an owed cookie-change push (cookie_sync.js).
+async function refreshSession(token_id = null) {
+  const builtAt = Date.now();
+  let r;
+  try {
+    r = await pushSession(token_id);
+  } catch (e) {
+    await log("ERROR", "Session refresh error", { error: e && e.message });
+    r = { success: false, error: e && e.message, reason: "network" };
   }
-
-  if (Date.now() - lastReloadAt < RELOAD_MIN_GAP_MS) return; // hard rate cap
-
-  const ttl = await sessionCookieTimeToExpiry();
-  if (ttl === null) return;               // no cookie -> let refreshSession's fallback handle it
-  if (ttl > RELOAD_THRESHOLD_MS) return;  // plenty of life left -> common no-op case
-  if (ttl === 0) await log("INFO", "Session cookie has no expiry; rolling on cadence");
-
-  lastReloadAt = Date.now();
-  const tabId = await rollSessionTab();   // never throws; arms breaker on login bounce
-  if (tabId == null) return;              // bounced to login / off-Flow -> handled inside
-
-  await refreshSession();                 // push the freshly rolled cookie
-  await log("INFO", "Proactive reload rolled session cookie", { tabId, prevTtlMs: ttl });
+  // A probe (the server asked about ANOTHER account) says nothing about this Chrome's owed push.
+  if (!r.probe) await settlePendingCookiePush(builtAt, r.reason !== "network");
+  return r;
 }
 
-async function refreshSession(token_id = null, opts = {}) {
+async function pushSession(token_id) {
   const settings = await getSettings();
   if (!settings.serverBase || !settings.connectionToken) {
     await log("INFO", "Session refresh skipped (need Server URL + Connection Token)");
     return { success: false, error: "not configured", reason: "not_configured" };
   }
   const { updateUrl } = deriveUrls(settings);
+  const explicit = token_id != null;
 
-  try {
-    // Make sure a Labs tab is loaded so the session cookie is fresh/active
-    // (login-aware: won't spin up tabs while a re-login is required).
-    if (settings.tabMode === "persistent") {
-      await maybeEnsurePersistentTab();
-    }
-    // Forced reload (server found our access token dead): navigate Labs FIRST so
-    // NextAuth gets a chance to renew the grant, then push. Never yank the tab from
-    // under a mint — the caller (handleRefreshSession) already serializes via tokenQueue,
-    // this is the belt to that suspender.
-    if (opts.reload && settings.tabMode === "persistent") {
-      // Already serialized behind mints via tokenQueue, so only a truly in-flight mint
-      // vetoes; the "mint finished seconds ago" veto would make every queued reload
-      // return busy (the preceding mint just set lastMintAt).
-      if (mintInFlight) {
-        return { success: false, error: "busy minting, retry next cycle", reason: "busy" };
-      }
-      const reloadedTab = await rollSessionTab(); // never throws; arms breaker on login bounce
-      if (reloadedTab == null) {
-        const auth = await getAuthState();
-        // 3.7.0: a Labs sign-in bounce is no dead end when away mode can carry the push.
-        if (auth.state === "login_required" && !(await cookieSyncCanCarryPush())) return { success: false, error: "login required", reason: "logged_out" };
-      } else {
-        await sleep(COOKIE_SETTLE_MS);
-      }
-      await log("INFO", "Forced Labs reload before session push (server reported a dead access token)");
-    }
-    // Read the session-token cookie directly (no extra tab needed).
-    let cookie = await readSessionCookie();
-    if (!cookie || !cookie.value) {
-      // FALLBACK: the cookie read came back empty even though Google may still be
-      // logged in. In persistent mode, force a navigation (reload existing tab, or
-      // open a fresh one) so NextAuth re-issues the cookie, then re-read. Only end
-      // at login_required if we genuinely bounced to a login page (armed inside
-      // rollSessionTab/openLabsTab) — never on a transient empty read.
-      if (settings.tabMode === "persistent") {
-        // B1: never reload the tab out from under an in-flight / very recent mint.
-        if (mintInFlight || (Date.now() - lastMintAt < RELOAD_ACTIVE_MS)) {
-          return { success: false, error: "busy minting, retry next cycle", reason: "busy" };
-        }
-        const tabId = await rollSessionTab(); // never throws; arms breaker on login bounce
-        if (tabId == null) {
-          const auth = await getAuthState();
-          // 3.7.0: bounced to Labs sign-in but Google is signed in and away mode is ON:
-          // push the Google login alone; the server derives the Labs session from it.
-          if (!(auth.state === "login_required" && (await cookieSyncCanCarryPush()))) {
-            return {
-              success: false,
-              error: auth.state === "login_required"
-                ? "login required (Google Labs logged out)"
-                : "reload fallback failed (will retry)",
-              reason: auth.state === "login_required" ? "logged_out" : "network",
-            };
-          }
-          cookie = null;
-        } else {
-          await sleep(COOKIE_SETTLE_MS); // let NextAuth write the rolled cookie
-          cookie = await readSessionCookie();
-        }
-        if (tabId != null && (!cookie || !cookie.value)) {
-          // On Flow but still no cookie: unhealthy, not necessarily logged out.
-          // Fail soft — next ALARM_SESSION retries; do NOT setLoginRequired here.
-          // 3.7.0: with away mode ON and Google signed in, push the Google login alone —
-          // the server derives a Labs session from it (a Labs sign-in that never happened
-          // on this laptop is no longer a dead end).
-          if (!(await cookieSyncCanCarryPush())) {
-            await log("WARN", "Cookie still missing after reload (will retry next cycle)");
-            return { success: false, error: "session-token missing after reload (will retry)", reason: "network" };
-          }
-          cookie = null;
-        }
-        // recovered -> fall through to push below
-      } else {
-        // Ephemeral mode: unchanged behavior (unless the Google login can carry the push).
-        if (!(await cookieSyncCanCarryPush())) {
-          await setLoginRequired("session-token cookie not found");
-          return { success: false, error: "session-token not found (log into Google Labs)", reason: "logged_out" };
-        }
-        cookie = null;
-      }
-    }
-
-    // Slice B: report the residential proxy this profile mints through + this browser's
-    // real User-Agent, so the backend can REDEEM the generate call from the SAME IP + UA
-    // (fixes reCAPTCHA "unusual activity" caused by residential-mint vs datacenter-redeem).
-    let effProxy = "";
-    try { effProxy = await resolveProxyUrl(settings); } catch (_) {}
-    const pushBody = cookie ? { session_token: cookie.value } : {};
-    if (token_id != null) pushBody.token_id = token_id;
-    if (effProxy) pushBody.proxy_url = effProxy;
-    try { if (navigator && navigator.userAgent) pushBody.user_agent = navigator.userAgent; } catch (_) {}
-    // Bind this account to THIS device so its captcha minting routes back here (same
-    // residential IP as the redeem). Uses the stable per-profile route key.
-    if (settings.routeKey) pushBody.route_key = settings.routeKey;
-    // Two-pool routing: report this profile's pool from the "Failed-image mode" switch.
-    pushBody.pool_mode = settings.failedImageMode ? "failed_image" : "auto";
-    // Version visibility: report this build's version so the admin can see who's outdated.
-    pushBody.ext_version = extVersion();
-    // 3.5.2: the project open on flow.google.com (if any). Flow no longer lets the server create a
-    // first project through Labs for a fresh account, so a new account registers with this one.
-    try {
-      const tabs = await chrome.tabs.query({ url: ["*://flow.google.com/project/*", "*://labs.google/fx/tools/flow/project/*"] });
-      for (const t of tabs || []) {
-        const pid = FlowSessionState.flowProjectIdFromUrl(t.url || "");
-        if (pid) { pushBody.project_id = pid; pushBody.project_name = String(t.title || "").slice(0, 80); break; }
-      }
-    } catch (_) {}
-
-    // Cookie sync (3.7.0): ON adds this profile's Google login + protocol_mode=protocol,
-    // OFF sends an explicit clear. Sequenced so a slow ON push can never undo a later OFF.
-    const cookieSent = await cookieSyncPushFields();
-    Object.assign(pushBody, cookieSent.fields);
-    if (cookieSent.seq) pushBody.cookie_sync_seq = cookieSent.seq;
-    if (!pushBody.session_token && !pushBody.google_cookies) {
-      // Labs cookie gone AND nothing to derive it from: same outcome as before 3.7.0.
-      await setLoginRequired("session-token cookie not found");
-      return { success: false, error: "session-token not found (log into Google Labs)", reason: "logged_out" };
-    }
-    const boundTokenId = await getBoundTokenId();
-    if (token_id == null && boundTokenId != null && cookieSent.fields.google_cookies !== undefined) {
-      // A cookie write is bound to the account this profile registered as (the server
-      // still verifies the session's email against that row).
-      pushBody.token_id = boundTokenId;
-    }
-
-    // Bound the push so a hung request can't outlive the server's wait for our ack.
-    const pushAbort = new AbortController();
-    const pushTimer = setTimeout(() => pushAbort.abort(), PUSH_TIMEOUT_MS);
-    let resp;
-    try {
-      resp = await fetch(updateUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.connectionToken}` },
-        body: JSON.stringify(pushBody),
-        signal: pushAbort.signal
-      });
-    } finally {
-      clearTimeout(pushTimer);
-    }
-    if (!resp.ok) {
-      const txt = await resp.text();
-      await log("ERROR", "Session push failed", { status: resp.status, body: txt.slice(0, 200) });
-      return {
-        success: false,
-        error: `server ${resp.status}`,
-        reason: resp.status === 409 ? "account_mismatch" : resp.status === 400 ? "logged_out" : "network",
-      };
-    }
-    const result = await resp.json();
-    if (result && result.token_id != null) await rememberBoundTokenId(result.token_id);
-    await noteCookieSyncResult(cookieSent, result && result.cookie_sync);
-    // The server VERIFIES the access token inside our cookie against Google's API. A 2xx
-    // no longer means "healthy": honor the action before touching any state.
-    if (result && result.action === "relogin_required") {
-      await setGrantExpired(result.message);
-      return { success: false, message: result.message, action: result.action, reason: "relogin_required" };
-    }
-    // A valid Labs cookie pushed -> session is healthy. A cookies-only push (away mode)
-    // proves nothing about THIS browser's Labs login, so the breaker stays as it was.
-    if (pushBody.session_token) await clearLoginRequired();
-    if (!result || result.credential_verified !== false) await clearGrantExpired();
-    await log("SUCCESS", "Session token pushed to Flow2API", { action: result.action, message: result.message });
-    // 3.7.4: the server queued this account's one-time move to its own IP — fetch the port now.
-    if (result && result.proxy_migration_pending && !settings.proxyUrl) applyProxy(settings).catch(() => {});
-    return { success: true, message: result.message, action: result.action, reason: "refreshed" };
-  } catch (e) {
-    await log("ERROR", "Session refresh error", { error: e.message });
-    return { success: false, error: e.message, reason: "network" };
+  // This profile's Google login. Switch OFF = "Stop using this account in Flow2API": nothing is
+  // pushed (the switch's own clear call deleted the server copy).
+  const cookieSent = await cookieSyncPushFields();
+  if (!cookieSent.enabled) {
+    return { success: false, error: "sharing is OFF in this Chrome: Flow2API does not use this account", reason: "sharing_off" };
   }
+  if (!cookieSent.fields.google_cookies) {
+    if (isNewestAnswer(cookieSent.seq)) {
+      await rememberLastPush({ seq: cookieSent.seq, reason: "logged_out", detail: "no Google login cookies in this Chrome" });
+      await setLoginRequired("signed_out", "no Google login cookies in this Chrome");
+    }
+    return { success: false, error: "Sign in to Google in this Chrome", reason: "logged_out" };
+  }
+  const pushBody = { ...cookieSent.fields, cookie_sync_seq: cookieSent.seq };
+
+  // Slice B: report the residential proxy this profile mints through + this browser's
+  // real User-Agent, so the backend can REDEEM the generate call from the SAME IP + UA
+  // (fixes reCAPTCHA "unusual activity" caused by residential-mint vs datacenter-redeem).
+  let effProxy = "";
+  try { effProxy = await resolveProxyUrl(settings); } catch (_) {}
+  if (effProxy) pushBody.proxy_url = effProxy;
+  try { if (navigator && navigator.userAgent) pushBody.user_agent = navigator.userAgent; } catch (_) {}
+  // Bind this account to THIS device so its captcha minting routes back here (same
+  // residential IP as the redeem). Uses the stable per-profile route key.
+  if (settings.routeKey) pushBody.route_key = settings.routeKey;
+  // Two-pool routing: report this profile's pool from the "Failed-image mode" switch.
+  pushBody.pool_mode = settings.failedImageMode ? "failed_image" : "auto";
+  // Version visibility: report this build's version so the admin can see who's outdated.
+  pushBody.ext_version = extVersion();
+  // 3.5.2: the project open on flow.google.com (if any). Flow no longer lets the server create a
+  // first project through Labs for a fresh account, so a new account registers with this one.
+  try {
+    const tabs = await chrome.tabs.query({ url: ["*://flow.google.com/project/*", "*://labs.google/fx/tools/flow/project/*"] });
+    for (const t of tabs || []) {
+      const pid = FlowSessionState.flowProjectIdFromUrl(t.url || "");
+      if (pid) { pushBody.project_id = pid; pushBody.project_name = String(t.title || "").slice(0, 80); break; }
+    }
+  } catch (_) {}
+  // Which row: the one the server asked about, else the one this profile registered as (the
+  // server still checks the login's email against that row).
+  const boundId = explicit ? null : await getBoundTokenId();
+  if (explicit) pushBody.token_id = token_id;
+  else if (boundId != null) pushBody.token_id = boundId;
+
+  await noteCookiePushAttempt();
+  let resp = await postSessionPush(updateUrl, settings, pushBody);
+  let answer = describePushAnswer(resp.status, resp.data);
+  if (shouldRetryUnbound(resp.status, answer, boundId != null)) {
+    // The remembered row is gone (404) or is another account now (409: this profile switched
+    // Google accounts). 3.7.x kept sending it and was refused forever.
+    await log("WARN", "This Chrome's remembered account no longer matches; forgetting it and pushing by email", { tokenId: boundId, status: resp.status, detail: answer.detail });
+    await forgetBoundTokenId();
+    delete pushBody.token_id;
+    resp = await postSessionPush(updateUrl, settings, pushBody);
+    answer = describePushAnswer(resp.status, resp.data);
+  }
+  // A 404/409 on a push the server asked for is the answer to the server's question ("is this the
+  // browser of account N?": the shared-pool fan-out asks every browser), not news about this Chrome.
+  const aboutThisChrome = !(explicit && (resp.status === 404 || resp.status === 409));
+  // A push built before a later ON/OFF says nothing about now (e.g. a 400 landing after OFF must not
+  // bring back the red sign-in badge).
+  const newest = aboutThisChrome && cookieSent.gen === cookieSyncGen && isNewestAnswer(cookieSent.seq);
+
+  if (!resp.ok) {
+    await log("ERROR", "Session push failed", { status: resp.status, body: String(resp.text || "").slice(0, 200) });
+    if (newest) {
+      await rememberLastPush({ seq: cookieSent.seq, http: resp.status, reason: answer.reason, detail: answer.detail });
+      await noteCookieSyncFailure(cookieSent, answer);
+      // 400 = the server could not sign in to Flow with these cookies: red badge + popup line.
+      if (answer.rejected) await setLoginRequired("rejected", answer.detail);
+    }
+    return { success: false, error: resp.status ? `server ${resp.status}` : answer.detail, message: answer.detail || null, reason: answer.reason, probe: !aboutThisChrome };
+  }
+  const result = resp.data || {};
+  if (result.token_id != null) await rememberBoundTokenId(result.token_id);
+  if (newest) {
+    await rememberLastPush({ seq: cookieSent.seq, http: resp.status, reason: answer.reason, verified: answer.verified, detail: answer.detail });
+    await noteCookieSyncResult(cookieSent, result.cookie_sync);
+    // The server VERIFIES the login (a Flow sign-in with the pushed cookies). A 2xx alone is not
+    // "healthy": only credential_verified clears the sign-in states.
+    if (answer.reason === "relogin_required") await setGrantExpired(result.message);
+    else if (answer.verified) { await clearLoginRequired(); await clearGrantExpired(); }
+  }
+  if (answer.reason === "relogin_required") {
+    return { success: false, message: result.message, action: result.action, reason: "relogin_required" };
+  }
+  await log("SUCCESS", "Google login pushed to Flow2API", { action: result.action, verified: answer.verified, message: result.message });
+  // 3.7.4: the server queued this account's one-time move to its own IP — fetch the port now.
+  if (result.proxy_migration_pending && !settings.proxyUrl) applyProxy(settings).catch(() => {});
+  return { success: true, message: result.message, action: result.action, reason: "refreshed" };
 }
 
-// Backend (admin UI) asked THIS specific browser to refresh its session NOW.
-// Called directly (not via tokenQueue) — see the onmessage refresh_session branch.
-// Replies with an honest status the backend maps to a UI toast; never lies "refreshed".
+// Server "push now": refresh_session over the captcha socket (the admin UI or the healer asked
+// THIS browser). The same cookie push as every other; the reload flag (3.7.x: reload the Labs tab
+// first) has nothing left to reload. Replies with the push's real status — never lies "refreshed".
 async function handleRefreshSession(data, responseSocket = ws) {
   let status, msg = null, err = null;
   try {
-    const r = await refreshSession(data.token_id, { reload: !!data.reload });
-    // reason carries relogin_required / refreshed / busy / logged_out / network verbatim.
+    const r = await refreshSession(data.token_id == null ? null : data.token_id);
+    // reason carries refreshed / relogin_required / account_mismatch / logged_out / network /
+    // not_configured / sharing_off verbatim.
     status = r.reason || (r.success ? "refreshed" : "network");
     msg = r.message || null;
     err = r.error || null;
@@ -1876,35 +1304,28 @@ async function setupAlarms() {
   const settings = await getSettings();
   await chrome.alarms.clear(ALARM_SESSION);
   await chrome.alarms.clear(ALARM_KEEPALIVE);
-  await chrome.alarms.clear(ALARM_RELOAD);
+  await chrome.alarms.clear(LEGACY_ALARM_RELOAD);   // 3.7.x reloaded the Labs tab every 3 h; nothing to reload now
   chrome.alarms.create(ALARM_SESSION, { periodInMinutes: settings.refreshIntervalMinutes, delayInMinutes: 0.1 });
-  chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: 1 }); // revive SW/socket/tab
-  chrome.alarms.create(ALARM_RELOAD, { periodInMinutes: 180, delayInMinutes: 5 }); // ~3h proactive cookie roll
+  chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: 1 }); // revive SW/socket/mint tab
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_SESSION) {
+    // Safety-net push (every 20 min); a Google cookie rotation pushes sooner (cookie_sync.js).
     await refreshSession();
     sunoSync("alarm").catch(() => {});   // no-op unless the Suno switch is ON
-    checkForUpdate();   // piggyback the hourly session cycle to refresh the update banner
+    checkForUpdate();   // piggyback the session cycle to refresh the update banner
   } else if (alarm.name === ALARM_PORT_MIGRATION) {
     applyProxy(await getSettings()).catch(() => {});
   } else if (alarm.name === ALARM_KEEPALIVE) {
     retryPendingCookieClear().catch(() => {});   // no-op unless an OFF is still unacknowledged
+    runPendingCookiePush().catch(() => {});      // backstop: no-op unless a cookie change is owed and due
     sendPendingPortAck().catch(() => {});        // no-op unless an IP-move confirmation is unanswered
     connectWS();
-    // Only ensure a tab when we actually have an OPEN socket — never spin up
-    // tabs while disconnected. The call itself is login-aware and serialized.
+    // Only warm the mint tab when we actually have an OPEN socket — never open
+    // tabs while disconnected.
     if (ws && ws.readyState === WebSocket.OPEN) {
-      maybeEnsurePersistentTab();
-    }
-  } else if (alarm.name === ALARM_RELOAD) {
-    // Proactive cookie roll. Enqueue on tokenQueue so it serializes FIFO with
-    // mints — it waits for any in-flight mint and blocks the next mint only while
-    // the tab reloads. Never on ensureChain. Only when the socket is OPEN, so we
-    // never spin tabs while disconnected (mirrors the keepalive guard).
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      tokenQueue = tokenQueue.then(() => maybeReloadForRoll()).catch(() => {});
+      maybeEnsureMintTab();
     }
   }
 });
@@ -1912,37 +1333,34 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 /* ------------------------------ lifecycle ---------------------------- */
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  removeOwned(tabId).catch(() => {});
-  if (tabId === persistentTabId) {
-    persistentTabId = null;
-    chrome.storage.local.remove("persistentTabId");
-  }
   if (tabId === mintTabId) rememberMintTab(null).catch(() => {});
 });
 
-// On SW boot/wake: drop a stale (expired) creation lease, restore the badge, and
-// collapse our owned tabs. Persistent mode keeps exactly one; ephemeral mode keeps
-// none. A still-valid lease is preserved so a genuinely in-flight create isn't
-// duplicated. Runs BEFORE connectWS so the socket's warm-up can't race the janitor.
-async function reconcileTabsOnBoot() {
-  const settings = await getSettings();
-  const { creationLease } = await chrome.storage.local.get(["creationLease"]);
-  if (!creationLease || (creationLease.expiresAt || 0) <= Date.now()) {
-    await chrome.storage.local.remove("creationLease");
+// 3.8.0 boot janitor. Up to 3.7.5 the worker kept its own hidden labs.google tab (ids in storage).
+// Release those once: close each one still on labs.google (never the last tab of a window — that
+// would close the window), and forget the rest (after a Chrome restart a stored id can name an
+// unrelated tab). Also drop the Labs-era state: the tab lease and a 3.7.x "Labs login required"
+// breaker (it has no `kind`; it was about the retired Labs cookie). Runs BEFORE connectWS.
+async function releaseLabsTabsOnBoot() {
+  const { ownedTabIds = [], authState } = await chrome.storage.local.get(["ownedTabIds", "authState"]);
+  let closed = 0, leftOpen = 0;
+  for (const id of ownedTabIds) {
+    const tab = await getTab(id);
+    if (!tab || !tabUrlOf(tab).startsWith("https://labs.google/")) continue;
+    if (await isLastTabInWindow(tab)) { leftOpen++; continue; }
+    try { await chrome.tabs.remove(id); closed++; } catch (_) {}
   }
-  setBadge((await getAuthState()).state);
-  if (settings.tabMode === "ephemeral") {
-    await closeAllOwnedTabs();   // ephemeral mode never keeps a persistent tab
-  } else {
-    await sweepOwnedTabs();      // collapse owned tabs to exactly one
-  }
+  await chrome.storage.local.remove(["ownedTabIds", "persistentTabId", "creationLease"]);
+  if (authState && authState.state === "login_required" && !authState.kind) await chrome.storage.local.remove("authState");
+  if (closed || leftOpen) await log("INFO", "Released the old Google Labs tab (3.8.0 does not use Labs)", { closed, leftOpen });
+  await refreshBadge();
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
   await log("INFO", "Flow2API Worker installed");
   await applyProxy(await getSettings());   // proxy live before any network use
   await setupAlarms();
-  await reconcileTabsOnBoot();
+  await releaseLabsTabsOnBoot();
   connectWS();
   // Kick off an immediate session push so the backend is valid right away.
   refreshSession().catch(() => {});
@@ -1952,7 +1370,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 chrome.runtime.onStartup.addListener(async () => {
   await applyProxy(await getSettings());   // proxy live before WS/Google
   await setupAlarms();
-  await reconcileTabsOnBoot();
+  await releaseLabsTabsOnBoot();
   connectWS();
   // Push the session on boot as well (was install + hourly only): a device that signed in and
   // then restarted Chrome otherwise stayed unregistered for up to an hour (2026-09-22).
@@ -1960,39 +1378,8 @@ chrome.runtime.onStartup.addListener(async () => {
   scheduleSunoSync("startup", 3000);
 });
 
-// The moment Labs writes its session cookie (staff just pressed "Sign in with Google" on
-// labs.google/fx), clear the login breaker and push — no waiting for the hourly alarm, no
-// Reconnect click. Debounced: NextAuth rewrites the cookie a few times during sign-in.
-let flowCookiePushTimer = null;
-// A cookie-triggered push is rate-limited: NextAuth rewrites the cookie every time the Labs tab
-// loads, and while the server says the grant is DEAD (relogin_required) each push just reopens the
-// tab and rewrites the cookie again — a push every few seconds, 216 server log lines in 10 min on
-// flow-ultra-01 (2026-09-24). While the grant is dead, at most one push per 10 min (a real
-// sign-out/sign-in also fires the hourly alarm and Reconnect); otherwise at most one per minute.
-chrome.cookies.onChanged.addListener((changeInfo) => {
-  if (!FlowSessionState.isFlowSessionCookieSet(changeInfo)) return;
-  clearTimeout(flowCookiePushTimer);
-  flowCookiePushTimer = setTimeout(async () => {
-    try {
-      const minGap = (await isGrantExpired()) ? 10 * 60 * 1000 : 60 * 1000;
-      // Persisted: the cookie event itself wakes a fresh service worker, so an in-memory stamp
-      // would be 0 on every event and the limit would never apply (seen live 2026-09-24).
-      const store = chrome.storage.session || chrome.storage.local;
-      const { lastCookiePushAt: last = 0 } = await store.get(["lastCookiePushAt"]);
-      if (Date.now() - last < minGap) return;
-      await store.set({ lastCookiePushAt: Date.now() });
-      await clearLoginRequired();
-      await log("INFO", "Google Labs session cookie appeared — pushing it to the server now");
-      await refreshSession();
-      connectWS();
-    } catch (e) {
-      await log("WARN", "Session push after sign-in failed (hourly retry stays armed)", { error: e && e.message });
-    }
-  }, 4000);
-});
-
 // Is a Google account signed in in this Chrome at all? (accounts.google.com session cookies;
-// any of these means "yes" — Labs' own sign-in is a separate step on top.)
+// any of these means "yes".)
 async function googleSignedIn() {
   try {
     for (const name of ["SID", "__Secure-1PSID", "__Secure-3PSID", "SAPISID"]) {
@@ -2026,9 +1413,9 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
-  if (req.action === "openLabsSignIn") {
-    // Popup button: bring staff to the page where Labs' own "Sign in with Google" lives.
-    chrome.tabs.create({ url: FlowSessionState.LABS_SIGNIN_URL, active: true }, () => sendResponse({ ok: true }));
+  if (req.action === "openFlowSignIn") {
+    // Popup button: open flow.google.com so staff can see (and fix) which Google account is signed in.
+    chrome.tabs.create({ url: FlowSessionState.FLOW_SIGNIN_URL, active: true }, () => sendResponse({ ok: true }));
     return true;
   }
   if (req.action === "refreshSessionNow") {
@@ -2080,12 +1467,17 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   }
   if (req.action === "getConnState") {
     (async () => {
+      const auth = await getAuthState();
+      const { cookieSyncEnabled } = await cookieSyncStore();
+      const { lastPush } = await chrome.storage.local.get(["lastPush"]);
       sendResponse({
         connected: !!(ws && ws.readyState === WebSocket.OPEN),
         grantExpired: await isGrantExpired(),
-        loginRequired: (await getAuthState()).state === "login_required",
+        loginRequired: auth.state === "login_required",
+        loginKind: auth.kind || null,
         googleSignedIn: await googleSignedIn(),
-        labsSignedIn: await hasSessionCookie(),
+        sharingOff: cookieSyncEnabled === false,
+        lastPush: lastPush || null,   // the server's verdict on the newest push (status, detail, when)
       });
     })();
     return true;
@@ -2117,7 +1509,7 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
 (async () => {
   await applyProxy(await getSettings());   // proxy live before WS/Google
   await setupAlarms();
-  await reconcileTabsOnBoot();
+  await releaseLabsTabsOnBoot();
   connectWS();
   checkForUpdate();   // fire-and-forget: refresh the update banner state on boot
   scheduleSunoSync("boot", 3000);   // no-op unless the Suno switch is ON
