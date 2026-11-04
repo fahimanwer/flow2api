@@ -149,10 +149,14 @@ def _prompt_text(request: Dict[str, Any]) -> str:
     for part in parts:
         if not isinstance(part, dict):
             continue
+        entity = ((part.get("reference") or {}).get("entity") or {}) if isinstance(part.get("reference"), dict) else {}
+        if entity:
+            # A character mention: the web app sends the character in its own slot and keeps the prompt
+            # as plain text (HAR 2026-11-04), so the mention stays as its name.
+            texts.append(str(entity.get("handle") or ""))
+            continue
         if set(part) - {"text"}:
-            raise CookieModeUnsupported(
-                "Flow Characters (@Name) are not available on the new Flow API yet; send the prompt without characters"
-            )
+            raise CookieModeUnsupported(f"prompt part {sorted(part)} has no Flow web mapping")
         texts.append(str(part.get("text") or ""))
     if texts:
         return "".join(texts)
@@ -164,8 +168,8 @@ def build_image_argument(project_id: str, body: Dict[str, Any]) -> tuple:
     if len(requests) != 1:
         raise CookieModeUnsupported(f"image batch of {len(requests)} requests (expected 1)")
     request = requests[0] or {}
-    if request.get("referenceEntities"):
-        raise CookieModeUnsupported("Flow Characters are not available on the new Flow API yet")
+    characters = [str((e or {}).get("entityId") or "").strip() for e in request.get("referenceEntities") or []]
+    characters = [c for c in characters if c]
     model = str(request.get("imageModelName") or "").strip()
     if model == "NARWHAL":
         model = "BELUGA"
@@ -187,7 +191,8 @@ def build_image_argument(project_id: str, body: Dict[str, Any]) -> tuple:
     seed = int(seed) if isinstance(seed, (int, float)) and seed > 0 else random.randint(1, 2147483647)
     rpc_request = [
         None, None, refs or None, seed, IMAGE_ASPECT[aspect_key], model, None, context,
-        [[[_prompt_text(request)]]], None, None, None, session_id, str(uuid.uuid4()).upper(),
+        [[[_prompt_text(request)]]], None, [[c] for c in characters] or None, None, session_id,
+        str(uuid.uuid4()).upper(),
     ]
     # The Flow web app sends its own batch id here, not the request's session id (HAR 2026-10-23).
     return [None, [rpc_request], 1, context, [str(uuid.uuid4()).upper()]], session_id
@@ -264,6 +269,45 @@ def normalize_upsample_response(payload: Any) -> Dict[str, Any]:
     raise RuntimeError("Flow upsample RPC returned no image")
 
 
+# ---------- characters (HAR of the real Flow web app, 2026-11-04) ----------
+
+def build_create_character_argument(body: Dict[str, Any]) -> tuple:
+    entity = (body or {}).get("entity") or {}
+    project_id = str(entity.get("projectId") or "").strip()
+    name = str(((entity.get("entityInfo") or {}).get("displayName")) or "Character").strip()[:80]
+    if not project_id:
+        raise CookieModeUnsupported("character create without a project id")
+    return [[project_id, None, None, [1, name, []]]], project_id
+
+
+def normalize_create_character(payload: Any) -> Dict[str, Any]:
+    # [[projectId, entityId, null, [1, name, []], ...]]
+    row = payload[0] if isinstance(payload, list) and payload and isinstance(payload[0], list) else []
+    entity_id = str(row[1] or "") if len(row) > 1 else ""
+    if not UUID_RE.fullmatch(entity_id):
+        raise RuntimeError("Flow character create returned no character id")
+    return {"entity": {"entityId": entity_id}, "frontendRpc": "C4BZMd"}
+
+
+def build_character_slot_argument(body: Dict[str, Any]) -> tuple:
+    context = (((body or {}).get("destinationMediaContext") or {}).get("entityContext")) or {}
+    media_id = media_name(str((body or {}).get("mediaId") or ""))
+    project_id = str((body or {}).get("destinationProjectId") or "").strip()
+    entity_id = str(context.get("entityId") or "").strip()
+    index = int(((context.get("characterSlot") or {}).get("imageReferenceIndex")) or 0)
+    if not (media_id and project_id and entity_id):
+        raise CookieModeUnsupported("character photo without media, project or character id")
+    argument = [media_id, None, None, project_id, None, None, None, [None, None, [entity_id, [index]]], None,
+                str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()]
+    return argument, project_id
+
+
+def normalize_character_slot(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError("Flow did not attach the photo to the character")
+    return {"frontendRpc": "Sc7aEb"}
+
+
 # ---------- project ----------
 
 def build_create_project_argument(title: str) -> List[Any]:
@@ -297,6 +341,12 @@ def translate_request(method: str, url: str, body: Optional[Dict[str, Any]]) -> 
     if path.endswith("/v1/flow/uploadImage"):
         argument, project_id = build_upload_argument(body)
         return RpcCall("maseQ", argument, source_path_for(project_id), make_upload_normalizer(project_id), timeout_floor=90)
+    if method.upper() == "POST" and path.endswith("/v1/flow/entities"):
+        argument, project_id = build_create_character_argument(body)
+        return RpcCall("C4BZMd", argument, f"/project/{project_id}/character", normalize_create_character)
+    if path.endswith("/v1/flow:copyProjectMedia"):
+        argument, project_id = build_character_slot_argument(body)
+        return RpcCall("Sc7aEb", argument, f"/project/{project_id}/character", normalize_character_slot)
     if path.endswith("/v1/flow/upsampleImage"):
         argument, project_id = build_upsample_argument(body)
         return RpcCall("SPrCad", argument, source_path_for(project_id), normalize_upsample_response, timeout_floor=90)
