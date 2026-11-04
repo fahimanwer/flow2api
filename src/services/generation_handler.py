@@ -1643,12 +1643,6 @@ class GenerationHandler:
                 progress=22,
                 response_extra={"project_id": project_id},
             )
-            prefill_action = "IMAGE_GENERATION" if generation_type == "image" else "VIDEO_GENERATION"
-            await self.flow_client.prefill_remote_browser_pool(
-                project_id=project_id,
-                action=prefill_action,
-                token_id=token.id,
-            )
 
             # 5. Handle by type
             generation_pipeline_started_at = time.time()
@@ -1751,8 +1745,6 @@ class GenerationHandler:
                 f"project={perf_trace.get('ensure_project_ms', 0)}ms, "
                 f"pipeline={perf_trace.get('generation_pipeline_ms', 0)}ms, "
                 f"slot_wait={image_perf.get('slot_wait_ms', 0)}ms, "
-                f"launch_queue={image_perf.get('launch_queue_wait_ms', 0)}ms, "
-                f"launch_stagger={image_perf.get('launch_stagger_wait_ms', 0)}ms, "
                 f"video_slot_wait={video_perf.get('slot_wait_ms', 0)}ms"
             )
 
@@ -2041,7 +2033,6 @@ class GenerationHandler:
                 aspect_ratio=model_config["aspect_ratio"],
                 image_inputs=image_inputs,
                 token_id=token.id,
-                token_image_concurrency=token.image_concurrency,
                 progress_callback=_image_progress_callback,
                 prompt_parts=prompt_parts,
                 reference_entities=reference_entities,
@@ -2049,11 +2040,6 @@ class GenerationHandler:
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
                 image_trace["upstream_trace"] = upstream_trace
-                attempts = upstream_trace.get("generation_attempts") if isinstance(upstream_trace, dict) else None
-                if isinstance(attempts, list) and attempts:
-                    first_attempt = attempts[0] if isinstance(attempts[0], dict) else {}
-                    image_trace["launch_queue_wait_ms"] = int(first_attempt.get("launch_queue_ms") or 0)
-                    image_trace["launch_stagger_wait_ms"] = int(first_attempt.get("launch_stagger_ms") or 0)
             await self._update_request_log_progress(
                 request_log_state,
                 token_id=token.id,
@@ -2534,7 +2520,6 @@ class GenerationHandler:
                         use_v2_model_config=use_v2_model_config,
                         user_paygate_tier=normalized_tier,
                         token_id=token.id,
-                        token_video_concurrency=token.video_concurrency,
                     )
                 else:
                     # First frame only - strip _fl from model_key
@@ -2554,7 +2539,6 @@ class GenerationHandler:
                         use_v2_model_config=use_v2_model_config,
                         user_paygate_tier=normalized_tier,
                         token_id=token.id,
-                        token_video_concurrency=token.video_concurrency,
                     )
 
             # R2V: multi-image generation
@@ -2568,7 +2552,6 @@ class GenerationHandler:
                     reference_images=reference_images,
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
-                    token_video_concurrency=token.video_concurrency,
                     prompt_parts=prompt_parts,
                     reference_entities=reference_entities,
                 )
@@ -2593,7 +2576,6 @@ class GenerationHandler:
                         use_v2_model_config=True,
                         user_paygate_tier=normalized_tier,
                         token_id=token.id,
-                        token_video_concurrency=token.video_concurrency,
                     )
                 else:
                     result = await self.flow_client.generate_video_start_image(
@@ -2606,7 +2588,6 @@ class GenerationHandler:
                         use_v2_model_config=True,
                         user_paygate_tier=normalized_tier,
                         token_id=token.id,
-                        token_video_concurrency=token.video_concurrency,
                     )
 
             # Omni 1.1: three or more images → reference-images route.
@@ -2622,7 +2603,6 @@ class GenerationHandler:
                     reference_images=reference_images,
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
-                    token_video_concurrency=token.video_concurrency,
                     prompt_parts=prompt_parts,
                     reference_entities=reference_entities,
                 )
@@ -2649,7 +2629,6 @@ class GenerationHandler:
                     aspect_ratio=model_config["aspect_ratio"],
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
-                    token_video_concurrency=token.video_concurrency,
                 )
 
             # T2V or R2V without images: text-only generation
@@ -2664,7 +2643,6 @@ class GenerationHandler:
                     use_v2_model_config=use_v2_model_config,
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
-                    token_video_concurrency=token.video_concurrency,
                 )
             if video_trace is not None:
                 video_trace["submit_generation_ms"] = int((time.time() - submit_started_at) * 1000)
@@ -2900,7 +2878,6 @@ class GenerationHandler:
                                 model_key=upsample_config["model_key"],
                                 user_paygate_tier=normalize_user_paygate_tier(token.user_paygate_tier),
                                 token_id=token.id,
-                                token_video_concurrency=token.video_concurrency,
                             )
                             
                             upsample_operations = upsample_result.get("operations", [])

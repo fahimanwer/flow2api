@@ -40,7 +40,7 @@ class Token(BaseModel):
     image_concurrency: int = -1  # -1 means unlimited
     video_concurrency: int = -1  # -1 means unlimited
 
-    # Captcha proxy (per token, overrides the global browser captcha proxy)
+    # Per-token captcha proxy: read only by the browser captcha modes removed 2026-11-04; column kept
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
 
@@ -215,31 +215,11 @@ class DebugConfig(BaseModel):
 
 
 class CaptchaConfig(BaseModel):
-    """Captcha configuration"""
+    """Captcha configuration (the captcha_config table keeps older columns this model ignores)"""
 
     id: int = 1
-    captcha_method: str = "browser"  # yescaptcha/capmonster/ezcaptcha/capsolver/browser/personal/remote_browser
-    yescaptcha_api_key: str = ""
-    yescaptcha_base_url: str = "https://api.yescaptcha.com"
-    yescaptcha_task_type: str = "RecaptchaV3TaskProxylessM1S9"
-    capmonster_api_key: str = ""
-    capmonster_base_url: str = "https://api.capmonster.cloud"
-    ezcaptcha_api_key: str = ""
-    ezcaptcha_base_url: str = "https://api.ez-captcha.com"
-    capsolver_api_key: str = ""
-    capsolver_base_url: str = "https://api.capsolver.com"
-    remote_browser_base_url: str = ""
-    remote_browser_api_key: str = ""
-    remote_browser_timeout: int = 60
-    website_key: str = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
-    page_action: str = "IMAGE_GENERATION"
-    browser_proxy_enabled: bool = False  # Whether browser captcha uses a proxy
-    browser_proxy_url: Optional[str] = None  # Browser captcha proxy URL
-    browser_count: int = 1  # Number of browser captcha instances
+    captcha_method: str = "extension"  # 2026-11-04: the worker extension is the only captcha method
     personal_project_pool_size: int = 4  # Default project pool size per token (only affects project rotation)
-    personal_max_resident_tabs: int = 5  # Max shared captcha tabs per built-in browser instance
-    browser_personal_fresh_restart_every_n_solves: int = 10  # Clean and restart the browser after this many successful solves, 0 = disabled
-    personal_idle_tab_ttl_seconds: int = 600  # Built-in browser tab idle timeout (seconds)
     server_fallback_enabled: bool = True  # server mints on flow.google.com when a worker cannot (2026-09-23)
     server_fallback_max_browsers: int = 3  # fallback Chromiums open at once (one per proxy)
     created_at: Optional[datetime] = None

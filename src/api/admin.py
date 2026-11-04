@@ -1,7 +1,6 @@
 """Admin API routes"""
 import asyncio
 import hashlib
-import importlib
 import inspect
 import json
 from datetime import datetime, timezone
@@ -13,14 +12,11 @@ from typing import Optional, List, Dict, Any, Tuple
 import secrets
 import time
 import re
-import urllib.error
-import urllib.request
-from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
 from ..core.database import Database, UltraOwnershipError, proxy_port, with_proxy_port
 from ..core.account_tiers import normalize_user_paygate_tier
-from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha_task_type
+from ..core.config import config
 from ..core.models import Token
 from ..core.client_policy import (
     DEFAULT_CLIENT,
@@ -32,24 +28,12 @@ from ..core.client_policy import (
     normalize_client,
     normalize_rule,
 )
-from ..core.browser_runtime_status import (
-    fail_runtime_prepare,
-    finish_runtime_prepare,
-    get_runtime_status,
-    progress_runtime_prepare,
-    start_runtime_prepare,
-)
 from ..core.monitoring import build_public_health_snapshot
 from ..core.logger import debug_logger, mask_proxy_url
 from ..services.token_manager import TokenManager
 from ..services.protocol_login import _parse_google_cookies, google_cookies_usable
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
-
-try:
-    import httpx
-except ImportError:
-    httpx = None
 
 router = APIRouter()
 
@@ -58,7 +42,6 @@ token_manager: TokenManager = None
 proxy_manager: ProxyManager = None
 db: Database = None
 concurrency_manager: Optional[ConcurrencyManager] = None
-captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 
 # Store active admin session tokens (in production, use Redis or database)
 active_admin_tokens = set()
@@ -68,15 +51,6 @@ ADMIN_SESSION_COOKIE_NAME = "admin_session"
 # says logged in → go to /manage) and /manage (cookie says not → back to /login)
 # bounced forever. See _ensure_admin_page_session in main.py for the loop breaker.
 ADMIN_SESSION_COOKIE_MAX_AGE = 7 * 24 * 3600
-SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
-
-
-def _mask_token(token: Optional[str]) -> str:
-    if not token:
-        return ""
-    if len(token) <= 24:
-        return token
-    return f"{token[:18]}...{token[-8:]}"
 
 
 def _truncate_text(text: Any, limit: int = 240) -> str:
@@ -132,444 +106,6 @@ def _extract_error_summary(payload: Any) -> str:
         return ""
 
     return _truncate_text(payload)
-
-
-def _guess_client_hints_from_user_agent(user_agent: str) -> Dict[str, str]:
-    """Fill in common sec-ch-* headers based on the UA."""
-    ua = (user_agent or "").strip()
-    if not ua:
-        return {}
-
-    headers: Dict[str, str] = {}
-    major_match = re.search(r"(?:Chrome|Chromium|Edg|EdgA|EdgiOS)/(\d+)", ua)
-    is_mobile = any(token in ua for token in ("Android", "iPhone", "iPad", "Mobile"))
-    headers["sec-ch-ua-mobile"] = "?1" if is_mobile else "?0"
-
-    if "Windows" in ua:
-        headers["sec-ch-ua-platform"] = '"Windows"'
-    elif "Macintosh" in ua or "Mac OS X" in ua:
-        headers["sec-ch-ua-platform"] = '"macOS"'
-    elif "Android" in ua:
-        headers["sec-ch-ua-platform"] = '"Android"'
-    elif "iPhone" in ua or "iPad" in ua:
-        headers["sec-ch-ua-platform"] = '"iOS"'
-    elif "Linux" in ua:
-        headers["sec-ch-ua-platform"] = '"Linux"'
-
-    if major_match:
-        major = major_match.group(1)
-        if "Edg/" in ua:
-            headers["sec-ch-ua"] = (
-                f'"Not:A-Brand";v="99", "Microsoft Edge";v="{major}", "Chromium";v="{major}"'
-            )
-        else:
-            headers["sec-ch-ua"] = (
-                f'"Not:A-Brand";v="99", "Google Chrome";v="{major}", "Chromium";v="{major}"'
-            )
-
-    return headers
-
-
-def _validate_browser_proxy_url_local(proxy_url: str) -> tuple[bool, Optional[str]]:
-    """Accepts one proxy URL or a comma / newline / semicolon separated list (the
-    browser pool rotates through a list; the validator used to reject the very
-    list the settings page had stored, so nothing on that page could be saved)."""
-    if not proxy_url:
-        return True, None
-    candidates = [p.strip() for p in re.split(r"[,\n;]+", proxy_url) if p.strip()]
-    for candidate in candidates:
-        normalized = candidate
-        if not re.match(r"^(http|https|socks5h?|socks5)://", normalized):
-            normalized = f"http://{normalized}"
-        if not re.match(r"^(socks5h?|socks5|http|https)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$", normalized):
-            return False, f"Invalid proxy format: {candidate[:60]}"
-    return True, None
-
-
-def _normalize_runtime_method(method: Optional[str]) -> str:
-    normalized = (method or "").strip().lower()
-    if normalized not in {"browser", "personal"}:
-        raise HTTPException(status_code=400, detail="Invalid runtime method")
-    return normalized
-
-
-async def _prepare_captcha_runtime(method: str):
-    runtime_method = _normalize_runtime_method(method)
-    try:
-        if runtime_method == "browser":
-            start_runtime_prepare(
-                runtime_method,
-                "Started preparing the headed-browser captcha runtime; install progress will show automatically.",
-            )
-        else:
-            start_runtime_prepare(
-                runtime_method,
-                "Started preparing the built-in browser captcha runtime; install progress will show automatically.",
-            )
-
-        if runtime_method == "browser":
-            module = await asyncio.to_thread(importlib.import_module, "src.services.browser_captcha")
-            service_cls = getattr(module, "BrowserCaptchaService")
-            service = await service_cls.get_instance(db)
-            if hasattr(service, "reload_browser_count"):
-                await service.reload_browser_count()
-            if hasattr(service, "warmup_browser_slots"):
-                await service.warmup_browser_slots()
-            finish_runtime_prepare(runtime_method, "Chromium browser runtime is ready; headed-browser captcha can be used now.")
-            return
-
-        module = await asyncio.to_thread(importlib.import_module, "src.services.browser_captcha_personal")
-        service_cls = getattr(module, "BrowserCaptchaService")
-        service = await service_cls.get_instance(db)
-        await service.reload_config()
-        finish_runtime_prepare(runtime_method, "Built-in browser runtime is ready; personal captcha can be used now.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        fail_runtime_prepare(runtime_method, f"Browser runtime preparation failed: {type(e).__name__}: {e}")
-    finally:
-        captcha_runtime_prepare_tasks.pop(runtime_method, None)
-
-
-def _schedule_captcha_runtime_prepare(method: str) -> bool:
-    runtime_method = _normalize_runtime_method(method)
-    task = captcha_runtime_prepare_tasks.get(runtime_method)
-    if task and not task.done():
-        progress_runtime_prepare(runtime_method, "Browser runtime preparation is still in progress, please wait...")
-        return False
-
-    captcha_runtime_prepare_tasks[runtime_method] = asyncio.create_task(
-        _prepare_captcha_runtime(runtime_method)
-    )
-    return True
-
-
-def _guess_impersonate_from_user_agent(user_agent: str) -> str:
-    """Pick a usable curl_cffi browser fingerprint version from the UA."""
-    ua = (user_agent or "").strip()
-    major_match = re.search(r"(?:Chrome|Chromium|Edg|EdgA|EdgiOS)/(\d+)", ua)
-    if not major_match:
-        return "chrome120"
-
-    try:
-        major = int(major_match.group(1))
-    except Exception:
-        return "chrome120"
-
-    if major >= 124:
-        return "chrome124"
-    if major >= 120:
-        return "chrome120"
-    return "chrome120"
-
-
-def _build_proxy_map(proxy_url: str) -> Optional[Dict[str, str]]:
-    normalized = (proxy_url or "").strip()
-    if not normalized:
-        return None
-    return {"http": normalized, "https": normalized}
-
-
-def _normalize_http_base_url(base_url: str) -> str:
-    normalized = (base_url or "").strip().rstrip("/")
-    if not normalized:
-        raise RuntimeError("Remote captcha service URL is not configured")
-
-    parsed = urlparse(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RuntimeError("Invalid remote captcha service URL; must be http(s)://host[:port]")
-
-    return normalized
-
-
-def _get_remote_browser_client_config() -> tuple[str, str, int]:
-    base_url = _normalize_http_base_url(config.remote_browser_base_url)
-    api_key = (config.remote_browser_api_key or "").strip()
-    if not api_key:
-        raise RuntimeError("Remote captcha service API key is not configured")
-    timeout = max(5, int(config.remote_browser_timeout or 60))
-    return base_url, api_key, timeout
-
-
-def _build_remote_browser_http_timeout(read_timeout: float) -> Any:
-    read_value = max(3.0, float(read_timeout))
-    write_value = min(10.0, max(3.0, read_value))
-    if httpx is None:
-        return read_value
-    return httpx.Timeout(
-        connect=2.5,
-        read=read_value,
-        write=write_value,
-        pool=2.5,
-    )
-
-
-def _parse_json_response_text(text: str) -> Optional[Any]:
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
-
-
-async def _stdlib_json_http_request(
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-    payload: Optional[Dict[str, Any]],
-    timeout: int,
-) -> tuple[int, Optional[Any], str]:
-    req_headers = dict(headers or {})
-    req_headers.setdefault("Accept", "application/json")
-    request_method = (method or "GET").upper()
-    request_data: Optional[bytes] = None
-
-    if payload is not None:
-        req_headers["Content-Type"] = "application/json; charset=utf-8"
-        if request_method != "GET":
-            request_data = json.dumps(payload).encode("utf-8")
-
-    def do_request() -> tuple[int, str]:
-        request = urllib.request.Request(
-            url=url,
-            data=request_data,
-            headers=req_headers,
-            method=request_method,
-        )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(request, timeout=max(1.0, float(timeout))) as response:
-                status_code = int(getattr(response, "status", 0) or response.getcode() or 0)
-                body = response.read()
-                charset = response.headers.get_content_charset() or "utf-8"
-                return status_code, body.decode(charset, errors="replace")
-        except urllib.error.HTTPError as exc:
-            body = exc.read()
-            charset = exc.headers.get_content_charset() if exc.headers else None
-            return int(getattr(exc, "code", 0) or 0), body.decode(charset or "utf-8", errors="replace")
-
-    try:
-        status_code, text = await asyncio.to_thread(do_request)
-    except Exception as e:
-        raise RuntimeError(f"Remote captcha service request failed: {e}") from e
-
-    return status_code, _parse_json_response_text(text), text
-
-
-async def _sync_json_http_request(
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-    payload: Optional[Dict[str, Any]],
-    timeout: int,
-) -> tuple[int, Optional[Any], str]:
-    req_headers = dict(headers or {})
-    req_headers.setdefault("Accept", "application/json")
-    request_method = (method or "GET").upper()
-    request_kwargs: Dict[str, Any] = {
-        "headers": req_headers,
-        "timeout": _build_remote_browser_http_timeout(timeout),
-    }
-
-    if payload is not None:
-        req_headers["Content-Type"] = "application/json; charset=utf-8"
-        if request_method != "GET":
-            request_kwargs["json"] = payload
-
-    if httpx is None:
-        return await _stdlib_json_http_request(
-            method=method,
-            url=url,
-            headers=req_headers,
-            payload=payload,
-            timeout=timeout,
-        )
-
-    try:
-        # The remote_browser control plane is a service-to-service JSON API. Use httpx so that
-        # curl_cffi on Windows + impersonate does not drop the POST body (FastAPI would reject it as missing).
-        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as session:
-            response = await session.request(
-                method=request_method,
-                url=url,
-                **request_kwargs,
-            )
-    except Exception as e:
-        raise RuntimeError(f"Remote captcha service request failed: {e}") from e
-
-    status_code = int(getattr(response, "status_code", 0) or 0)
-    text = response.text or ""
-    parsed = _parse_json_response_text(text)
-
-    return status_code, parsed, text
-
-
-async def _resolve_score_test_verify_proxy(
-    captcha_method: str,
-    browser_proxy_enabled: bool,
-    browser_proxy_url: str
-) -> tuple[Optional[Dict[str, str]], bool, str, str]:
-    """
-    Pick the proxy for the score-test verify request, preferring the browser captcha proxy.
-    Returns: (proxies, used, source, proxy_url)
-    """
-    # Browser captcha modes prefer browser_proxy so the egress matches the one that got the token
-    if captcha_method in {"browser", "personal"} and browser_proxy_enabled and browser_proxy_url:
-        proxy_map = _build_proxy_map(browser_proxy_url)
-        if proxy_map:
-            return proxy_map, True, "captcha_browser_proxy", browser_proxy_url
-
-    # Fall back to the request proxy config
-    try:
-        if proxy_manager:
-            proxy_cfg = await proxy_manager.get_proxy_config()
-            if proxy_cfg and proxy_cfg.enabled and proxy_cfg.proxy_url:
-                proxy_map = _build_proxy_map(proxy_cfg.proxy_url)
-                if proxy_map:
-                    return proxy_map, True, "request_proxy", proxy_cfg.proxy_url
-    except Exception:
-        pass
-
-    return None, False, "none", ""
-
-
-async def _solve_recaptcha_with_api_service(
-    method: str,
-    website_url: str,
-    website_key: str,
-    action: str,
-    enterprise: bool = False
-) -> Optional[str]:
-    """Get a token from the currently configured third-party captcha service."""
-    if method == "yescaptcha":
-        client_key = config.yescaptcha_api_key
-        base_url = config.yescaptcha_base_url
-        task_type = config.yescaptcha_task_type
-        min_score = get_yescaptcha_min_score(task_type)
-    elif method == "capmonster":
-        client_key = config.capmonster_api_key
-        base_url = config.capmonster_base_url
-        task_type = "RecaptchaV3TaskProxyless"
-        min_score = None
-    elif method == "ezcaptcha":
-        client_key = config.ezcaptcha_api_key
-        base_url = config.ezcaptcha_base_url
-        task_type = "ReCaptchaV3TaskProxylessS9"
-        min_score = None
-    elif method == "capsolver":
-        client_key = config.capsolver_api_key
-        base_url = config.capsolver_base_url
-        task_type = "ReCaptchaV3EnterpriseTaskProxyLess" if enterprise else "ReCaptchaV3TaskProxyLess"
-        min_score = None
-    else:
-        raise RuntimeError(f"Unsupported captcha method: {method}")
-
-    if not client_key:
-        raise RuntimeError(f"{method} API key is not configured")
-
-    task: Dict[str, Any] = {
-        "websiteURL": website_url,
-        "websiteKey": website_key,
-        "type": task_type,
-        "pageAction": action,
-    }
-    if min_score is not None:
-        task["minScore"] = min_score
-
-    if enterprise and method == "capsolver":
-        task["isEnterprise"] = True
-
-    create_url = f"{base_url.rstrip('/')}/createTask"
-    get_url = f"{base_url.rstrip('/')}/getTaskResult"
-
-    # Get proxy config
-    proxies = None
-    try:
-        if proxy_manager:
-            proxy_cfg = await proxy_manager.get_proxy_config()
-            if proxy_cfg and proxy_cfg.enabled and proxy_cfg.proxy_url:
-                proxies = {"http": proxy_cfg.proxy_url, "https": proxy_cfg.proxy_url}
-    except Exception:
-        pass
-
-    async with AsyncSession() as session:
-        create_resp = await session.post(
-            create_url,
-            json={"clientKey": client_key, "task": task},
-            impersonate="chrome120",
-            timeout=30,
-            proxies=proxies
-        )
-        create_json = create_resp.json()
-        task_id = create_json.get("taskId")
-
-        if not task_id:
-            error_desc = create_json.get("errorDescription") or create_json.get("errorMessage") or str(create_json)
-            raise RuntimeError(f"{method} createTask failed: {error_desc}")
-
-        for _ in range(40):
-            poll_resp = await session.post(
-                get_url,
-                json={"clientKey": client_key, "taskId": task_id},
-                impersonate="chrome120",
-                timeout=30,
-                proxies=proxies
-            )
-            poll_json = poll_resp.json()
-            if poll_json.get("status") == "ready":
-                solution = poll_json.get("solution", {}) or {}
-                token = solution.get("gRecaptchaResponse") or solution.get("token")
-                if token:
-                    return token
-                raise RuntimeError(f"{method} result is missing the token: {poll_json}")
-
-            if poll_json.get("errorId") not in (None, 0):
-                error_desc = poll_json.get("errorDescription") or poll_json.get("errorMessage") or str(poll_json)
-                raise RuntimeError(f"{method} getTaskResult failed: {error_desc}")
-
-            await asyncio.sleep(3)
-
-    raise RuntimeError(f"{method} timed out getting token")
-
-
-async def _score_test_with_remote_browser_service(
-    website_url: str,
-    website_key: str,
-    verify_url: str,
-    action: str,
-    enterprise: bool = False,
-) -> Dict[str, Any]:
-    """Call the remote headed captcha service to solve in-page and verify the score."""
-    base_url, api_key, timeout = _get_remote_browser_client_config()
-    endpoint = f"{base_url}/api/v1/custom-score"
-    request_payload = {
-        "website_url": website_url,
-        "website_key": website_key,
-        "verify_url": verify_url,
-        "action": action,
-        "enterprise": enterprise,
-    }
-
-    status_code, response_payload, response_text = await _sync_json_http_request(
-        method="POST",
-        url=endpoint,
-        headers={"Authorization": f"Bearer {api_key}"},
-        payload=request_payload,
-        timeout=timeout,
-    )
-
-    if status_code >= 400:
-        detail = ""
-        if isinstance(response_payload, dict):
-            detail = response_payload.get("detail") or response_payload.get("message") or str(response_payload)
-        if not detail:
-            detail = (response_text or "").strip()
-        raise RuntimeError(f"Remote captcha service request failed (HTTP {status_code}): {detail or 'unknown error'}")
-
-    if not isinstance(response_payload, dict):
-        raise RuntimeError("Remote captcha service returned an invalid format")
-    return response_payload
 
 
 def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database, cm: Optional[ConcurrencyManager] = None):
@@ -648,14 +184,6 @@ class ProxyTestRequest(BaseModel):
     proxy_url: str
     test_url: Optional[str] = "https://labs.google/"
     timeout_seconds: Optional[int] = 15
-
-
-class CaptchaScoreTestRequest(BaseModel):
-    website_url: Optional[str] = "https://antcpt.com/score_detector/"
-    website_key: Optional[str] = "6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf"
-    action: Optional[str] = "homepage"
-    verify_url: Optional[str] = "https://antcpt.com/score_detector/verify.php"
-    enterprise: Optional[bool] = False
 
 
 class ClientPolicyRequest(BaseModel):
@@ -1166,8 +694,8 @@ async def refresh_at(
     token: str = Depends(verify_admin_token)
 ):
     """Manually refresh a token's AT (converted from ST)
-    
-    If AT refresh fails in personal mode, it automatically tries to refresh the ST via the browser
+
+    If the ST has expired, it tries an ST refresh (protocol login, else the worker extension)
     """
     from ..core.logger import debug_logger
     from ..core.config import config
@@ -1437,16 +965,6 @@ async def ip_debug(token: str = Depends(verify_admin_token)):
         _probe_egress_ip("request_proxy (redeem/generate)", request_proxy),
         _probe_egress_ip("media_proxy (image up/download)", media_proxy),
     ]
-
-    # Server-side captcha-browser proxies (used by built-in browser/personal modes,
-    # NOT the extension). Comma-separated list in captcha_config.browser_proxy_url.
-    try:
-        cap = await db.get_captcha_config() if db else None
-        raw = (getattr(cap, "browser_proxy_url", "") or "").strip() if cap else ""
-        for i, part in enumerate([p.strip() for p in raw.split(",") if p.strip()]):
-            tasks.append(_probe_egress_ip(f"captcha_browser_proxy[{i}]", part))
-    except Exception:
-        pass
 
     probes = await asyncio.gather(*tasks)
 
@@ -2281,28 +1799,7 @@ async def update_captcha_config(
 ):
     """Update captcha configuration"""
     captcha_method = request.get("captcha_method")
-    yescaptcha_api_key = request.get("yescaptcha_api_key")
-    yescaptcha_base_url = request.get("yescaptcha_base_url")
-    yescaptcha_task_type = normalize_yescaptcha_task_type(request.get("yescaptcha_task_type"))
-    capmonster_api_key = request.get("capmonster_api_key")
-    capmonster_base_url = request.get("capmonster_base_url")
-    ezcaptcha_api_key = request.get("ezcaptcha_api_key")
-    ezcaptcha_base_url = request.get("ezcaptcha_base_url")
-    capsolver_api_key = request.get("capsolver_api_key")
-    capsolver_base_url = request.get("capsolver_base_url")
-    remote_browser_base_url = request.get("remote_browser_base_url")
-    remote_browser_api_key = request.get("remote_browser_api_key")
-    remote_browser_timeout = request.get("remote_browser_timeout", 60)
-    browser_proxy_enabled = request.get("browser_proxy_enabled", False)
-    browser_proxy_url = request.get("browser_proxy_url", "")
-    browser_count = request.get("browser_count", 1)
     personal_project_pool_size = request.get("personal_project_pool_size")
-    personal_max_resident_tabs = request.get("personal_max_resident_tabs")
-    browser_personal_fresh_restart_every_n_solves = request.get(
-        "browser_personal_fresh_restart_every_n_solves",
-        10,
-    )
-    personal_idle_tab_ttl_seconds = request.get("personal_idle_tab_ttl_seconds")
     server_fallback_enabled = request.get("server_fallback_enabled")
     server_fallback_max_browsers = request.get("server_fallback_max_browsers")
     if server_fallback_max_browsers is not None:
@@ -2311,66 +1808,13 @@ async def update_captcha_config(
         except Exception:
             return {"success": False, "message": "Server fallback browsers must be a number from 1 to 6"}
 
-    # Validate browser proxy URL format
-    if browser_proxy_enabled and browser_proxy_url:
-        is_valid, error_msg = _validate_browser_proxy_url_local(browser_proxy_url)
-        if not is_valid:
-            return {"success": False, "message": error_msg}
-
-    if remote_browser_base_url:
-        try:
-            remote_browser_base_url = _normalize_http_base_url(remote_browser_base_url)
-        except RuntimeError as e:
-            return {"success": False, "message": str(e)}
-
-    try:
-        remote_browser_timeout = max(5, int(remote_browser_timeout or 60))
-    except Exception:
-        return {"success": False, "message": "Remote captcha timeout must be a whole number of seconds"}
-    try:
-        browser_count = max(1, min(20, int(browser_count or 1)))
-    except Exception:
-        return {"success": False, "message": "Browser instance count must be an integer"}
-    try:
-        browser_personal_fresh_restart_every_n_solves = max(
-            0,
-            int(browser_personal_fresh_restart_every_n_solves if browser_personal_fresh_restart_every_n_solves is not None else 10),
-        )
-    except Exception:
-        return {"success": False, "message": "Restart-after-solves count must be an integer (0 = disabled)"}
-
-    # 2026-11-04: the page had no "extension" option, so a Save sent "" and stopped all generation.
-    if captcha_method not in ("extension", "yescaptcha", "capmonster", "ezcaptcha", "capsolver",
-                              "browser", "personal", "remote_browser"):
-        return {"success": False, "message": f"Unknown captcha method: {captcha_method!r}"}
-
-    if captcha_method == "remote_browser":
-        if not (remote_browser_base_url or "").strip():
-            return {"success": False, "message": "remote_browser mode needs the remote captcha service URL"}
-        if not (remote_browser_api_key or "").strip():
-            return {"success": False, "message": "remote_browser mode needs the remote captcha service API key"}
+    # 2026-11-04: only the worker extension mints; the other captcha modes were removed.
+    if captcha_method != "extension":
+        return {"success": False, "message": f"Unsupported captcha method: {captcha_method!r} (only 'extension')"}
 
     await db.update_captcha_config(
         captcha_method=captcha_method,
-        yescaptcha_api_key=yescaptcha_api_key,
-        yescaptcha_base_url=yescaptcha_base_url,
-        yescaptcha_task_type=yescaptcha_task_type,
-        capmonster_api_key=capmonster_api_key,
-        capmonster_base_url=capmonster_base_url,
-        ezcaptcha_api_key=ezcaptcha_api_key,
-        ezcaptcha_base_url=ezcaptcha_base_url,
-        capsolver_api_key=capsolver_api_key,
-        capsolver_base_url=capsolver_base_url,
-        remote_browser_base_url=remote_browser_base_url,
-        remote_browser_api_key=remote_browser_api_key,
-        remote_browser_timeout=remote_browser_timeout,
-        browser_proxy_enabled=browser_proxy_enabled,
-        browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
-        browser_count=browser_count,
         personal_project_pool_size=personal_project_pool_size,
-        personal_max_resident_tabs=personal_max_resident_tabs,
-        browser_personal_fresh_restart_every_n_solves=browser_personal_fresh_restart_every_n_solves,
-        personal_idle_tab_ttl_seconds=personal_idle_tab_ttl_seconds,
         server_fallback_enabled=(bool(server_fallback_enabled) if server_fallback_enabled is not None else None),
         server_fallback_max_browsers=server_fallback_max_browsers,
     )
@@ -2386,49 +1830,21 @@ async def update_captcha_config(
     except Exception:
         pass
 
-    runtime_prepare_started = False
-    runtime_prepare_message = ""
-    runtime_status_method = None
-
-    if captcha_method in {"browser", "personal"}:
-        runtime_status_method = captcha_method
-        runtime_prepare_started = _schedule_captcha_runtime_prepare(captcha_method)
-        if captcha_method == "browser":
-            runtime_prepare_message = (
-                "Started preparing the headed-browser captcha runtime; install progress will show automatically."
-            )
-        else:
-            runtime_prepare_message = (
-                "Started preparing the built-in browser captcha runtime; install progress will show automatically."
-            )
-
-    return {
-        "success": True,
-        "message": "Captcha config updated",
-        "runtime_prepare_started": runtime_prepare_started,
-        "runtime_prepare_message": runtime_prepare_message,
-        "runtime_status_method": runtime_status_method,
-    }
+    return {"success": True, "message": "Captcha config updated"}
 
 
 @router.get("/api/captcha/runtime-status")
 async def get_captcha_runtime_status(
-    method: str = "browser",
+    method: str = "extension",
     token: str = Depends(verify_admin_token)
 ):
-    """Get background browser runtime preparation status."""
-    if (method or "").strip().lower() == "extension":
-        # Extension mode has no runtime to prepare; report the server fallback pool instead.
-        from ..services.flow_page_captcha import FlowPageCaptchaService
-        service = await FlowPageCaptchaService.get_instance()
-        status = {"state": "idle", "active": False, "message": "", "error": "", "method": "extension", "task_running": False}
-        status["server_fallback"] = service.status()
-        return status
-    runtime_method = _normalize_runtime_method(method)
-    task = captcha_runtime_prepare_tasks.get(runtime_method)
-    status = get_runtime_status(runtime_method)
-    status["method"] = runtime_method
-    status["task_running"] = bool(task and not task.done())
+    """Captcha runtime status: extension mode has no runtime to prepare; reports the server fallback pool."""
+    if (method or "").strip().lower() != "extension":
+        raise HTTPException(status_code=400, detail="Invalid runtime method")
+    from ..services.flow_page_captcha import FlowPageCaptchaService
+    service = await FlowPageCaptchaService.get_instance()
+    status = {"state": "idle", "active": False, "message": "", "error": "", "method": "extension", "task_running": False}
+    status["server_fallback"] = service.status()
     return status
 
 
@@ -2438,365 +1854,10 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
     captcha_config = await db.get_captcha_config()
     return {
         "captcha_method": captcha_config.captcha_method,
-        "yescaptcha_api_key": captcha_config.yescaptcha_api_key,
-        "yescaptcha_base_url": captcha_config.yescaptcha_base_url,
-        "yescaptcha_task_type": captcha_config.yescaptcha_task_type,
-        "capmonster_api_key": captcha_config.capmonster_api_key,
-        "capmonster_base_url": captcha_config.capmonster_base_url,
-        "ezcaptcha_api_key": captcha_config.ezcaptcha_api_key,
-        "ezcaptcha_base_url": captcha_config.ezcaptcha_base_url,
-        "capsolver_api_key": captcha_config.capsolver_api_key,
-        "capsolver_base_url": captcha_config.capsolver_base_url,
-        "remote_browser_base_url": captcha_config.remote_browser_base_url,
-        "remote_browser_api_key": captcha_config.remote_browser_api_key,
-        "remote_browser_timeout": captcha_config.remote_browser_timeout,
-        "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
-        "browser_proxy_url": captcha_config.browser_proxy_url or "",
-        "browser_count": captcha_config.browser_count,
         "personal_project_pool_size": captcha_config.personal_project_pool_size,
-        "personal_max_resident_tabs": captcha_config.personal_max_resident_tabs,
-        "browser_personal_fresh_restart_every_n_solves": captcha_config.browser_personal_fresh_restart_every_n_solves,
-        "personal_idle_tab_ttl_seconds": captcha_config.personal_idle_tab_ttl_seconds,
         "server_fallback_enabled": bool(captcha_config.server_fallback_enabled),
         "server_fallback_max_browsers": captcha_config.server_fallback_max_browsers,
     }
-
-
-@router.post("/api/captcha/score-test")
-async def test_captcha_score(
-    _request: Optional[CaptchaScoreTestRequest] = None,
-    _token: str = Depends(verify_admin_token)
-):
-    """Get a token with the current captcha method and submit it to antcpt to check the score."""
-    req = _request or CaptchaScoreTestRequest()
-    website_url = (req.website_url or "https://antcpt.com/score_detector/").strip()
-    website_key = (req.website_key or "6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf").strip()
-    action = (req.action or "homepage").strip()
-    verify_url = (req.verify_url or "https://antcpt.com/score_detector/verify.php").strip()
-    enterprise = bool(req.enterprise)
-
-    started_at = time.time()
-    captcha_config = await db.get_captcha_config()
-    captcha_method = (captcha_config.captcha_method or config.captcha_method or "").strip().lower()
-    browser_proxy_enabled = bool(captcha_config.browser_proxy_enabled)
-    browser_proxy_url = captcha_config.browser_proxy_url or ""
-
-    token_value: Optional[str] = None
-    fingerprint: Optional[Dict[str, Any]] = None
-    token_elapsed_ms = 0
-    verify_elapsed_ms = 0
-    verify_http_status = None
-    verify_result: Dict[str, Any] = {}
-    verify_headers: Dict[str, str] = {}
-    verify_proxy_used = False
-    verify_proxy_source = "none"
-    verify_proxy_url = ""
-    verify_impersonate = "chrome120"
-    page_verify_only = captcha_method in {"browser", "personal", "remote_browser"}
-    verify_mode = "browser_page" if page_verify_only else "server_post"
-
-    try:
-        token_start = time.time()
-        if captcha_method == "browser":
-            from ..services.browser_captcha import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(db)
-            score_payload, browser_id = await service.get_custom_score(
-                website_url=website_url,
-                website_key=website_key,
-                verify_url=verify_url,
-                action=action,
-                enterprise=enterprise
-            )
-            if isinstance(score_payload, dict):
-                token_value = score_payload.get("token")
-                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
-                verify_http_status = score_payload.get("verify_http_status")
-                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
-                verify_mode = score_payload.get("verify_mode") or "browser_page"
-                score_token_elapsed = score_payload.get("token_elapsed_ms")
-                if isinstance(score_token_elapsed, (int, float)):
-                    token_elapsed_ms = int(score_token_elapsed)
-            if token_value:
-                fingerprint = await service.get_fingerprint(browser_id)
-                verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
-                verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
-                verify_proxy_url = browser_proxy_url if verify_proxy_used else ""
-        elif captcha_method == "personal":
-            from ..services.browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(db)
-            score_payload = await service.get_custom_score(
-                website_url=website_url,
-                website_key=website_key,
-                verify_url=verify_url,
-                action=action,
-                enterprise=enterprise
-            )
-            if isinstance(score_payload, dict):
-                token_value = score_payload.get("token")
-                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
-                verify_http_status = score_payload.get("verify_http_status")
-                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
-                verify_mode = score_payload.get("verify_mode") or "browser_page"
-                score_token_elapsed = score_payload.get("token_elapsed_ms")
-                if isinstance(score_token_elapsed, (int, float)):
-                    token_elapsed_ms = int(score_token_elapsed)
-            if token_value:
-                fingerprint = service.get_last_fingerprint()
-                verify_proxy_used = bool(browser_proxy_enabled and browser_proxy_url)
-                verify_proxy_source = "captcha_browser_proxy" if verify_proxy_used else "browser_direct"
-                verify_proxy_url = browser_proxy_url if verify_proxy_used else ""
-        elif captcha_method == "remote_browser":
-            score_payload = await _score_test_with_remote_browser_service(
-                website_url=website_url,
-                website_key=website_key,
-                verify_url=verify_url,
-                action=action,
-                enterprise=enterprise,
-            )
-            if isinstance(score_payload, dict):
-                if score_payload.get("success") is False:
-                    raise RuntimeError(score_payload.get("message") or "Remote captcha score test failed")
-                token_value = score_payload.get("token")
-                verify_elapsed_ms = int(score_payload.get("verify_elapsed_ms") or 0)
-                verify_http_status = score_payload.get("verify_http_status")
-                verify_result = score_payload.get("verify_result") if isinstance(score_payload.get("verify_result"), dict) else {}
-                verify_mode = score_payload.get("verify_mode") or "remote_browser_page"
-                score_token_elapsed = score_payload.get("token_elapsed_ms")
-                if isinstance(score_token_elapsed, (int, float)):
-                    token_elapsed_ms = int(score_token_elapsed)
-                fingerprint = score_payload.get("fingerprint") if isinstance(score_payload.get("fingerprint"), dict) else None
-        elif captcha_method in SUPPORTED_API_CAPTCHA_METHODS:
-            if captcha_method == "capsolver" and "antcpt.com" in website_url:
-                # CapSolver specifically blocks antcpt.com. Test against labs.google to verify API key config.
-                token_value = await _solve_recaptcha_with_api_service(
-                    method=captcha_method,
-                    website_url="https://labs.google/",
-                    website_key="6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV",
-                    action="IMAGE_GENERATION",
-                    enterprise=True
-                )
-                if token_value:
-                    if token_elapsed_ms <= 0:
-                        token_elapsed_ms = int((time.time() - token_start) * 1000)
-                    return {
-                        "success": True,
-                        "message": "CapSolver does not support antcpt. Connectivity tested successfully against Google Labs",
-                        "captcha_method": captcha_method,
-                        "website_url": "https://labs.google/",
-                        "website_key": "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV",
-                        "action": "IMAGE_GENERATION",
-                        "verify_url": "",
-                        "enterprise": True,
-                        "token_acquired": True,
-                        "token_preview": _mask_token(token_value),
-                        "token_elapsed_ms": token_elapsed_ms,
-                        "verify_elapsed_ms": 0,
-                        "verify_http_status": 200,
-                        "score": 0.9,
-                        "verify_result": {"success": True, "message": "Score check skipped"},
-                        "verify_request_meta": {},
-                        "browser_proxy_enabled": browser_proxy_enabled,
-                        "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
-                        "fingerprint": fingerprint,
-                        "elapsed_ms": int((time.time() - started_at) * 1000)
-                    }
-            else:
-                token_value = await _solve_recaptcha_with_api_service(
-                    method=captcha_method,
-                    website_url=website_url,
-                    website_key=website_key,
-                    action=action,
-                    enterprise=enterprise
-                )
-        else:
-            return {
-                "success": False,
-                "message": f"Current captcha method does not support score tests: {captcha_method}",
-                "captcha_method": captcha_method,
-                "website_url": website_url,
-                "website_key": website_key,
-                "action": action,
-                "verify_url": verify_url,
-                "enterprise": enterprise,
-                "token_acquired": False,
-                "elapsed_ms": int((time.time() - started_at) * 1000)
-            }
-        if token_elapsed_ms <= 0:
-            token_elapsed_ms = int((time.time() - token_start) * 1000)
-
-        # Remote headed captcha custom-score may verify inside the page and, in some
-        # implementations, not return the token; fall back to verify_result locally.
-        if captcha_method == "remote_browser" and not token_value and isinstance(verify_result, dict):
-            if verify_result.get("success") is True:
-                token_value = verify_result.get("token") or verify_result.get("gRecaptchaResponse") or "__verified_by_remote__"
-
-        if not token_value:
-            return {
-                "success": False,
-                "message": "No reCAPTCHA token obtained",
-                "captcha_method": captcha_method,
-                "website_url": website_url,
-                "website_key": website_key,
-                "action": action,
-                "verify_url": verify_url,
-                "enterprise": enterprise,
-                "token_acquired": False,
-                "token_elapsed_ms": token_elapsed_ms,
-                "browser_proxy_enabled": browser_proxy_enabled,
-                "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
-                "fingerprint": fingerprint,
-                "elapsed_ms": int((time.time() - started_at) * 1000)
-            }
-
-        if verify_mode == "server_post" and not page_verify_only:
-            verify_start = time.time()
-            verify_headers = {
-                "accept": "application/json, text/javascript, */*; q=0.01",
-                "content-type": "application/json",
-                "origin": "https://antcpt.com",
-                "referer": website_url,
-                "x-requested-with": "XMLHttpRequest",
-            }
-            if isinstance(fingerprint, dict):
-                ua = (fingerprint.get("user_agent") or "").strip()
-                lang = (fingerprint.get("accept_language") or "").strip()
-                sec_ch_ua = (fingerprint.get("sec_ch_ua") or "").strip()
-                sec_ch_ua_mobile = (fingerprint.get("sec_ch_ua_mobile") or "").strip()
-                sec_ch_ua_platform = (fingerprint.get("sec_ch_ua_platform") or "").strip()
-
-                if ua:
-                    verify_headers["user-agent"] = ua
-                if lang:
-                    verify_headers["accept-language"] = lang if "," in lang else f"{lang},zh;q=0.9"
-                if sec_ch_ua:
-                    verify_headers["sec-ch-ua"] = sec_ch_ua
-                if sec_ch_ua_mobile:
-                    verify_headers["sec-ch-ua-mobile"] = sec_ch_ua_mobile
-                if sec_ch_ua_platform:
-                    verify_headers["sec-ch-ua-platform"] = sec_ch_ua_platform
-
-            if verify_headers.get("user-agent"):
-                for header_name, header_value in _guess_client_hints_from_user_agent(
-                    verify_headers.get("user-agent", "")
-                ).items():
-                    if header_value and not verify_headers.get(header_name):
-                        verify_headers[header_name] = header_value
-                verify_impersonate = _guess_impersonate_from_user_agent(verify_headers.get("user-agent", ""))
-
-            verify_proxies, verify_proxy_used, verify_proxy_source, verify_proxy_url = (
-                await _resolve_score_test_verify_proxy(
-                    captcha_method=captcha_method,
-                    browser_proxy_enabled=browser_proxy_enabled,
-                    browser_proxy_url=browser_proxy_url
-                )
-            )
-
-            async with AsyncSession() as session:
-                verify_resp = await session.post(
-                    verify_url,
-                    json={"g-recaptcha-response": token_value},
-                    headers=verify_headers,
-                    proxies=verify_proxies,
-                    impersonate=verify_impersonate,
-                    timeout=30
-                )
-            verify_elapsed_ms = int((time.time() - verify_start) * 1000)
-            verify_http_status = verify_resp.status_code
-
-            try:
-                verify_result = verify_resp.json()
-            except Exception:
-                verify_result = {"raw": verify_resp.text}
-        else:
-            verify_headers = {
-                "origin": "https://antcpt.com",
-                "referer": website_url,
-                "x-requested-with": "XMLHttpRequest",
-            }
-            if isinstance(fingerprint, dict):
-                verify_headers.update({
-                    "user-agent": fingerprint.get("user_agent", ""),
-                    "accept-language": fingerprint.get("accept_language", ""),
-                    "sec-ch-ua": fingerprint.get("sec_ch_ua", ""),
-                    "sec-ch-ua-mobile": fingerprint.get("sec_ch_ua_mobile", ""),
-                    "sec-ch-ua-platform": fingerprint.get("sec_ch_ua_platform", ""),
-                })
-
-        verify_success = bool(verify_result.get("success")) if isinstance(verify_result, dict) else False
-        score_value = verify_result.get("score") if isinstance(verify_result, dict) else None
-
-        return {
-            "success": verify_success,
-            "message": "Score check passed" if verify_success else "Score check failed",
-            "captcha_method": captcha_method,
-            "website_url": website_url,
-            "website_key": website_key,
-            "action": action,
-            "verify_url": verify_url,
-            "enterprise": enterprise,
-            "token_acquired": True,
-            "token_preview": _mask_token(token_value),
-            "token_elapsed_ms": token_elapsed_ms,
-            "verify_elapsed_ms": verify_elapsed_ms,
-            "verify_http_status": verify_http_status,
-            "score": score_value,
-            "verify_result": verify_result,
-            "verify_request_meta": {
-                "mode": verify_mode,
-                "proxy_used": verify_proxy_used,
-                "user_agent": verify_headers.get("user-agent", ""),
-                "accept_language": verify_headers.get("accept-language", ""),
-                "sec_ch_ua": verify_headers.get("sec-ch-ua", ""),
-                "sec_ch_ua_mobile": verify_headers.get("sec-ch-ua-mobile", ""),
-                "sec_ch_ua_platform": verify_headers.get("sec-ch-ua-platform", ""),
-                "origin": verify_headers.get("origin", ""),
-                "referer": verify_headers.get("referer", ""),
-                "x_requested_with": verify_headers.get("x-requested-with", ""),
-                "proxy_source": verify_proxy_source,
-                "proxy_url": verify_proxy_url,
-                "impersonate": verify_impersonate,
-            },
-            "browser_proxy_enabled": browser_proxy_enabled,
-            "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
-            "fingerprint": fingerprint,
-            "elapsed_ms": int((time.time() - started_at) * 1000)
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"Score test failed: {str(e)}",
-            "captcha_method": captcha_method,
-            "website_url": website_url,
-            "website_key": website_key,
-            "action": action,
-            "verify_url": verify_url,
-            "enterprise": enterprise,
-            "token_acquired": bool(token_value),
-            "token_preview": _mask_token(token_value),
-            "token_elapsed_ms": token_elapsed_ms,
-            "verify_elapsed_ms": verify_elapsed_ms,
-            "verify_http_status": verify_http_status,
-            "verify_result": verify_result,
-            "verify_request_meta": {
-                "mode": verify_mode,
-                "proxy_used": verify_proxy_used,
-                "user_agent": verify_headers.get("user-agent", ""),
-                "accept_language": verify_headers.get("accept-language", ""),
-                "sec_ch_ua": verify_headers.get("sec-ch-ua", ""),
-                "sec_ch_ua_mobile": verify_headers.get("sec-ch-ua-mobile", ""),
-                "sec_ch_ua_platform": verify_headers.get("sec-ch-ua-platform", ""),
-                "origin": verify_headers.get("origin", ""),
-                "referer": verify_headers.get("referer", ""),
-                "x_requested_with": verify_headers.get("x-requested-with", ""),
-                "proxy_source": verify_proxy_source,
-                "proxy_url": verify_proxy_url,
-                "impersonate": verify_impersonate,
-            },
-            "browser_proxy_enabled": browser_proxy_enabled,
-            "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
-            "fingerprint": fingerprint,
-            "elapsed_ms": int((time.time() - started_at) * 1000)
-        }
 
 
 # ========== Plugin Configuration Endpoints ==========

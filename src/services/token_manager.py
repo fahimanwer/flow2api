@@ -121,21 +121,11 @@ def _is_captcha_mint_failure(error_message: Optional[str]) -> bool:
 # IP reputation either — so unlike environmental errors these get NO reCAPTCHA
 # cooldown (pausing an account for Flow being busy or a solver outage is wrong)
 # and NO auto-disable count. Absorbed from upstream's _should_count_token_error.
+# 2026-11-04: the paid-solver markers (yescaptcha & co.) went with those captcha modes.
 _CAPACITY_ERROR_MARKERS = (
     "too much traffic",
-    "error_no_slot_available",
-    "打码服务资源不足",
-    "captcha service out of capacity",
-    "打码服务资源阻塞",
-    "captcha service blocked",
-    "captcha solver out of slots",   # flow_client._get_retry_reason wording
-    "captcha solver blocked",
     "没有可用的token进行",
     "no available token for",
-    "yescaptcha",
-    "capsolver",
-    "capmonster",
-    "ezcaptcha",
 )
 
 
@@ -748,47 +738,6 @@ class TokenManager:
     async def _get_credits_for_token(self, token: Token, at: str) -> Dict[str, Any]:
         return await self._flow_call_for_token(token, lambda: self.flow_client.get_credits(at))
 
-    async def get_personal_warmup_project_ids(
-        self,
-        tokens: Optional[List[Token]] = None,
-        limit: Optional[int] = None,
-    ) -> List[str]:
-        """Return project IDs to warm up when personal mode starts."""
-        token_list = tokens if tokens is not None else await self.get_all_tokens()
-        pool_size = self._get_project_pool_size()
-        warmup_ids: List[str] = []
-        seen_projects: set[str] = set()
-
-        try:
-            warmup_limit = None if limit is None else max(1, int(limit))
-        except Exception:
-            warmup_limit = None
-
-        for token in token_list:
-            if not token or not token.is_active:
-                continue
-
-            candidate_ids: List[str] = []
-            current_project_id = str(token.current_project_id or "").strip()
-            if current_project_id:
-                candidate_ids.append(current_project_id)
-
-            projects = [project for project in await self.db.get_projects_by_token(token.id) if project.is_active]
-            for project in self._sort_projects(projects):
-                project_id = str(project.project_id or "").strip()
-                if project_id and project_id not in candidate_ids:
-                    candidate_ids.append(project_id)
-
-            for project_id in candidate_ids[:pool_size]:
-                if project_id in seen_projects:
-                    continue
-                seen_projects.add(project_id)
-                warmup_ids.append(project_id)
-                if warmup_limit is not None and len(warmup_ids) >= warmup_limit:
-                    return warmup_ids
-
-        return warmup_ids
-
     async def _create_project_for_token(self, token: Token, pool_index: int, base_name: Optional[str] = None) -> Project:
         """Create a new pooled project for a token and persist it."""
         project_name = self._build_project_name(pool_index, base_name)
@@ -836,18 +785,6 @@ class TokenManager:
 
     async def delete_token(self, token_id: int):
         """Delete token"""
-        token = await self.db.get_token(token_id)
-        project_ids: List[str] = []
-        if token:
-            current_project_id = str(token.current_project_id or "").strip()
-            if current_project_id:
-                project_ids.append(current_project_id)
-
-        for project in await self.db.get_projects_by_token(token_id):
-            project_id = str(project.project_id or "").strip()
-            if project_id and project_id not in project_ids:
-                project_ids.append(project_id)
-
         await self.db.delete_token(token_id)
 
         refresh_task = self._refresh_futures.pop(token_id, None)
@@ -861,15 +798,6 @@ class TokenManager:
                 pass
         self._refresh_locks.pop(token_id, None)
         self._project_locks.pop(token_id, None)
-
-        if config.captcha_method == "personal" and project_ids:
-            try:
-                from .browser_captcha_personal import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.db)
-                for project_id in project_ids:
-                    await service.stop_resident_mode(project_id)
-            except Exception as e:
-                debug_logger.log_warning(f"[DELETE_TOKEN] Failed to clean personal browser state: {e}")
 
     async def enable_token(self, token_id: int):
         """Enable a token and reset error count"""
@@ -1315,7 +1243,7 @@ class TokenManager:
         if outcome.success:
             return outcome
 
-        # Only attempt a (browser/personal/protocol) ST refresh when the failure
+        # Only attempt a (protocol/extension) ST refresh when the failure
         # is an expired/invalid ST. A network blip must NOT trigger a session
         # refresh nor be treated as a dead credential.
         if outcome.reason == "st_expired":
@@ -1734,9 +1662,7 @@ class TokenManager:
             return None
 
     async def _try_refresh_st(self, token_id: int, token) -> Optional[str]:
-        """Try to refresh the Session Token through the browser
-
-        Uses the resident tab to get a new __Secure-next-auth.session-token
+        """Try to refresh the Session Token (protocol login, else the account's worker extension)
 
         Args:
             token_id: Token ID
@@ -1758,46 +1684,7 @@ class TokenManager:
             if config.captcha_method == "extension":
                 return await self._try_refresh_st_via_extension(token_id, token)
 
-            # ST auto-refresh only works in personal mode
-            if config.captcha_method != "personal":
-                debug_logger.log_info(f"[ST_REFRESH] Not personal mode, skipping ST auto-refresh")
-                return None
-
-            if not token.current_project_id:
-                debug_logger.log_warning(f"[ST_REFRESH] Token {token_id} has no project_id, cannot refresh ST")
-                return None
-
-            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: trying browser ST refresh...")
-
-            from .browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(self.db)
-
-            refresh_timeout_seconds = 45.0
-            try:
-                new_st = await asyncio.wait_for(
-                    service.refresh_session_token(token.current_project_id),
-                    timeout=refresh_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                debug_logger.log_error(
-                    f"[ST_REFRESH] Token {token_id}: ST refresh timed out ({refresh_timeout_seconds:.0f}s)"
-                )
-                record_token_refresh("st", "failure")
-                return None
-            if new_st and new_st != token.st:
-                # CANDIDATE only: the caller commits st+at together under the lock after
-                # the API accepts the AT (validate-then-promote). No unlocked st write.
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: got new ST (candidate, pending verification)")
-                record_token_refresh("st", "success")
-                return new_st
-            elif new_st == token.st:
-                debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: new ST same as old, login may be dead")
-                record_token_refresh("st", "failure")
-                return None
-            else:
-                debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: could not get new ST")
-                record_token_refresh("st", "failure")
-                return None
+            return None
 
         except Exception as e:
             debug_logger.log_error(f"[ST_REFRESH] Token {token_id}: ST refresh failed - {str(e)}")

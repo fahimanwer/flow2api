@@ -162,9 +162,6 @@ class LoadBalancer:
 
     async def _check_extension_route(self, token: Token) -> tuple[bool, str]:
         """Ensure extension captcha requests are routed to the selected account."""
-        if config.captcha_method != "extension":
-            return True, ""
-
         try:
             from .browser_captcha_extension import ExtensionCaptchaService
 

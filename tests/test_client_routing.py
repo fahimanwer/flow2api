@@ -4,7 +4,7 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from src.core.client_policy import (
     DEFAULT_CLIENT,
@@ -113,13 +113,14 @@ class Selection(unittest.TestCase):
             {"client": "default", "image_tier": "any", "video_tier": "any"},
             {"client": "pinterest-factory", "image_tier": "ultra", "video_tier": "ultra"},
         ])
-        self._saved_captcha, self._saved_mode = config.captcha_method, config.call_logic_mode
-        config.set_captcha_method("yescaptcha")  # no extension route checks
+        self._saved_mode = config.call_logic_mode
+        route_patch = patch.object(LoadBalancer, "_check_extension_route", AsyncMock(return_value=(True, "")))  # no extension route checks
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
         config.set_call_logic_mode("default")
 
     def tearDown(self):
         cp.client_policy_store._policies = self._saved_store
-        config.set_captcha_method(self._saved_captcha)
         config.set_call_logic_mode(self._saved_mode)
 
     def _pick(self, lb, client, n=1, **kw):
@@ -244,13 +245,14 @@ class NamedOnlySelection(unittest.TestCase):
     def setUp(self):
         self._saved_store = cp.client_policy_store._policies
         cp.client_policy_store._policies = _capped_store()._policies
-        self._saved_captcha, self._saved_mode = config.captcha_method, config.call_logic_mode
-        config.set_captcha_method("yescaptcha")
+        self._saved_mode = config.call_logic_mode
+        route_patch = patch.object(LoadBalancer, "_check_extension_route", AsyncMock(return_value=(True, "")))
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
         config.set_call_logic_mode("default")
 
     def tearDown(self):
         cp.client_policy_store._policies = self._saved_store
-        config.set_captcha_method(self._saved_captcha)
         config.set_call_logic_mode(self._saved_mode)
 
     def _pick(self, lb, client, media="image", n=12):

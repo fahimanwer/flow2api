@@ -1,27 +1,7 @@
 """Configuration management for Flow2API"""
-import os
 import tomli
 from pathlib import Path
 from typing import Dict, Any, Optional
-
-DEFAULT_YESCAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1S9"
-YESCAPTCHA_TASK_TYPE_OPTIONS = {
-    "RecaptchaV3TaskProxyless": None,
-    "RecaptchaV3TaskProxylessM1": None,
-    "RecaptchaV3TaskProxylessM1S7": 0.7,
-    "RecaptchaV3TaskProxylessM1S9": 0.9,
-}
-
-
-def normalize_yescaptcha_task_type(task_type: Optional[str]) -> str:
-    normalized = (task_type or "").strip()
-    if normalized in YESCAPTCHA_TASK_TYPE_OPTIONS:
-        return normalized
-    return DEFAULT_YESCAPTCHA_TASK_TYPE
-
-
-def get_yescaptcha_min_score(task_type: Optional[str]) -> Optional[float]:
-    return YESCAPTCHA_TASK_TYPE_OPTIONS.get(normalize_yescaptcha_task_type(task_type))
 
 
 class Config:
@@ -167,78 +147,6 @@ class Config:
                 False
             )
         )
-
-    @property
-    def flow_image_slot_wait_timeout(self) -> float:
-        """Wait timeout (seconds) for an image hard-concurrency slot."""
-        timeout = self._config.get("flow", {}).get("image_slot_wait_timeout", 120)
-        try:
-            return max(1.0, min(600.0, float(timeout)))
-        except Exception:
-            return 120.0
-
-    @property
-    def flow_image_launch_soft_limit(self) -> int:
-        """Image pre-launch soft concurrency cap (0 = soft shaping off, hard concurrency only)."""
-        value = self._config.get("flow", {}).get("image_launch_soft_limit", 0)
-        try:
-            return max(0, min(200, int(value)))
-        except Exception:
-            return 0
-
-    @property
-    def flow_image_launch_wait_timeout(self) -> float:
-        """Image pre-launch soft concurrency wait timeout (seconds)."""
-        timeout = self._config.get("flow", {}).get("image_launch_wait_timeout", 180)
-        try:
-            return max(1.0, min(600.0, float(timeout)))
-        except Exception:
-            return 180.0
-
-    @property
-    def flow_image_launch_stagger_ms(self) -> int:
-        """Image request pre-launch spacing (ms), to smooth same-batch bursts."""
-        value = self._config.get("flow", {}).get("image_launch_stagger_ms", 0)
-        try:
-            return max(0, min(5000, int(value)))
-        except Exception:
-            return 0
-
-    @property
-    def flow_video_slot_wait_timeout(self) -> float:
-        """Wait timeout (seconds) for a video hard-concurrency slot."""
-        timeout = self._config.get("flow", {}).get("video_slot_wait_timeout", 120)
-        try:
-            return max(1.0, min(600.0, float(timeout)))
-        except Exception:
-            return 120.0
-
-    @property
-    def flow_video_launch_soft_limit(self) -> int:
-        """Video pre-launch soft concurrency cap (0 = soft shaping off, hard concurrency only)."""
-        value = self._config.get("flow", {}).get("video_launch_soft_limit", 0)
-        try:
-            return max(0, min(200, int(value)))
-        except Exception:
-            return 0
-
-    @property
-    def flow_video_launch_wait_timeout(self) -> float:
-        """Video pre-launch soft concurrency wait timeout (seconds)."""
-        timeout = self._config.get("flow", {}).get("video_launch_wait_timeout", 180)
-        try:
-            return max(1.0, min(600.0, float(timeout)))
-        except Exception:
-            return 180.0
-
-    @property
-    def flow_video_launch_stagger_ms(self) -> int:
-        """Video request pre-launch spacing (ms), to smooth same-batch bursts."""
-        value = self._config.get("flow", {}).get("video_launch_stagger_ms", 0)
-        try:
-            return max(0, min(5000, int(value)))
-        except Exception:
-            return 0
 
     @property
     def poll_interval(self) -> float:
@@ -427,24 +335,13 @@ class Config:
     @property
     def captcha_method(self) -> str:
         """Get captcha method"""
-        return self._config.get("captcha", {}).get("captcha_method", "yescaptcha")
+        return self._config.get("captcha", {}).get("captcha_method", "extension")
 
     def set_captcha_method(self, method: str):
         """Set captcha method"""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["captcha_method"] = method
-
-    @property
-    def browser_launch_background(self) -> bool:
-        """Whether headed-browser captcha starts in the background by default, so it does not steal focus."""
-        return self._config.get("captcha", {}).get("browser_launch_background", True)
-
-    def set_browser_launch_background(self, enabled: bool):
-        """Set whether headed-browser captcha starts in the background."""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["browser_launch_background"] = bool(enabled)
 
     @property
     def captcha_server_fallback_enabled(self) -> bool:
@@ -472,47 +369,6 @@ class Config:
             self._config["captcha"]["server_fallback_max_browsers"] = max(1, min(6, int(value)))
         except Exception:
             self._config["captcha"]["server_fallback_max_browsers"] = 3
-
-    @property
-    def browser_count(self) -> int:
-        """Number of browser captcha instances, shared by browser/personal modes."""
-        value = self._config.get("captcha", {}).get("browser_count", 1)
-        try:
-            return max(1, min(20, int(value)))
-        except Exception:
-            return 1
-
-    def set_browser_count(self, value: int):
-        """Set the number of browser captcha instances."""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["browser_count"] = max(1, min(20, int(value)))
-
-    @property
-    def browser_recaptcha_settle_seconds(self) -> float:
-        """Extra seconds headed captcha waits after reload/clr is ready."""
-        value = self._config.get("captcha", {}).get("browser_recaptcha_settle_seconds", 3.0)
-        try:
-            return max(0.0, min(10.0, float(value)))
-        except Exception:
-            return 3.0
-
-    @property
-    def browser_idle_ttl_seconds(self) -> int:
-        value = self._config.get("captcha", {}).get("browser_idle_ttl_seconds", 600)
-        try:
-            return max(60, int(value))
-        except Exception:
-            return 600
-
-    @property
-    def browser_captcha_max_retries(self) -> int:
-        """Max retries for one solve in browser mode."""
-        value = self._config.get("captcha", {}).get("browser_captcha_max_retries", 5)
-        try:
-            return max(1, min(20, int(value)))
-        except Exception:
-            return 5
 
     @property
     def browser_captcha_generation_retries(self) -> int:
@@ -558,15 +414,6 @@ class Config:
             return 1.0
 
     @property
-    def personal_max_resident_tabs(self) -> int:
-        """Max shared captcha tabs per built-in browser instance"""
-        value = self._config.get("captcha", {}).get("personal_max_resident_tabs", 5)
-        try:
-            return max(1, min(50, int(value)))  # Clamp to 1-50
-        except Exception:
-            return 5
-
-    @property
     def personal_project_pool_size(self) -> int:
         """Default project pool size per token; only affects project rotation."""
         value = self._config.get("captcha", {}).get("personal_project_pool_size", 4)
@@ -575,200 +422,11 @@ class Config:
         except Exception:
             return 4
 
-    @property
-    def personal_idle_tab_ttl_seconds(self) -> int:
-        """Built-in browser captcha tab idle timeout (seconds)"""
-        value = self._config.get("captcha", {}).get("personal_idle_tab_ttl_seconds", 600)
-        try:
-            return max(60, int(value))
-        except Exception:
-            return 600
-
-    @property
-    def personal_headless(self) -> bool:
-        """Whether the personal built-in browser is forced headless; runs headed by default."""
-        env_value = os.getenv("PERSONAL_BROWSER_HEADLESS")
-        if env_value is not None:
-            return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
-        return bool(self._config.get("captcha", {}).get("personal_headless", False))
-
-    def set_personal_max_resident_tabs(self, value: int):
-        """Set the max shared captcha tabs per built-in browser instance"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["personal_max_resident_tabs"] = max(1, min(50, int(value)))
-
     def set_personal_project_pool_size(self, value: int):
         """Set the default project pool size per token; only affects project rotation"""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["personal_project_pool_size"] = max(1, min(50, int(value)))
-
-    def set_personal_idle_tab_ttl_seconds(self, value: int):
-        """Set the built-in browser captcha tab idle timeout (seconds)"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["personal_idle_tab_ttl_seconds"] = max(60, int(value))
-
-    @property
-    def browser_personal_fresh_restart_every_n_solves(self) -> int:
-        """Restart the built-in browser with a fresh profile after this many successful solves, 0 = disabled."""
-        value = self._config.get("captcha", {}).get("browser_personal_fresh_restart_every_n_solves", 10)
-        try:
-            return max(0, int(value))
-        except Exception:
-            return 10
-
-    def set_browser_personal_fresh_restart_every_n_solves(self, value: int):
-        """Set the built-in browser fresh-profile rotation threshold."""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["browser_personal_fresh_restart_every_n_solves"] = max(0, int(value))
-
-    @property
-    def yescaptcha_api_key(self) -> str:
-        """Get YesCaptcha API key"""
-        return self._config.get("captcha", {}).get("yescaptcha_api_key", "")
-
-    def set_yescaptcha_api_key(self, api_key: str):
-        """Set YesCaptcha API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["yescaptcha_api_key"] = api_key
-
-    @property
-    def yescaptcha_base_url(self) -> str:
-        """Get YesCaptcha base URL"""
-        return self._config.get("captcha", {}).get("yescaptcha_base_url", "https://api.yescaptcha.com")
-
-    def set_yescaptcha_base_url(self, base_url: str):
-        """Set YesCaptcha base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["yescaptcha_base_url"] = base_url
-
-    @property
-    def yescaptcha_task_type(self) -> str:
-        """Get YesCaptcha reCAPTCHA V3 task type"""
-        return normalize_yescaptcha_task_type(
-            self._config.get("captcha", {}).get(
-                "yescaptcha_task_type",
-                DEFAULT_YESCAPTCHA_TASK_TYPE,
-            )
-        )
-
-    def set_yescaptcha_task_type(self, task_type: str):
-        """Set YesCaptcha reCAPTCHA V3 task type"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["yescaptcha_task_type"] = normalize_yescaptcha_task_type(task_type)
-
-    @property
-    def capmonster_api_key(self) -> str:
-        """Get CapMonster API key"""
-        return self._config.get("captcha", {}).get("capmonster_api_key", "")
-
-    def set_capmonster_api_key(self, api_key: str):
-        """Set CapMonster API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["capmonster_api_key"] = api_key
-
-    @property
-    def capmonster_base_url(self) -> str:
-        """Get CapMonster base URL"""
-        return self._config.get("captcha", {}).get("capmonster_base_url", "https://api.capmonster.cloud")
-
-    def set_capmonster_base_url(self, base_url: str):
-        """Set CapMonster base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["capmonster_base_url"] = base_url
-
-    @property
-    def ezcaptcha_api_key(self) -> str:
-        """Get EzCaptcha API key"""
-        return self._config.get("captcha", {}).get("ezcaptcha_api_key", "")
-
-    def set_ezcaptcha_api_key(self, api_key: str):
-        """Set EzCaptcha API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["ezcaptcha_api_key"] = api_key
-
-    @property
-    def ezcaptcha_base_url(self) -> str:
-        """Get EzCaptcha base URL"""
-        return self._config.get("captcha", {}).get("ezcaptcha_base_url", "https://api.ez-captcha.com")
-
-    def set_ezcaptcha_base_url(self, base_url: str):
-        """Set EzCaptcha base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["ezcaptcha_base_url"] = base_url
-
-    @property
-    def capsolver_api_key(self) -> str:
-        """Get CapSolver API key"""
-        return self._config.get("captcha", {}).get("capsolver_api_key", "")
-
-    def set_capsolver_api_key(self, api_key: str):
-        """Set CapSolver API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["capsolver_api_key"] = api_key
-
-    @property
-    def capsolver_base_url(self) -> str:
-        """Get CapSolver base URL"""
-        return self._config.get("captcha", {}).get("capsolver_base_url", "https://api.capsolver.com")
-
-    def set_capsolver_base_url(self, base_url: str):
-        """Set CapSolver base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["capsolver_base_url"] = base_url
-
-    @property
-    def remote_browser_base_url(self) -> str:
-        """Get remote browser captcha service base URL"""
-        return self._config.get("captcha", {}).get("remote_browser_base_url", "")
-
-    def set_remote_browser_base_url(self, base_url: str):
-        """Set remote browser captcha service base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["remote_browser_base_url"] = (base_url or "").strip()
-
-    @property
-    def remote_browser_api_key(self) -> str:
-        """Get remote browser captcha service API key"""
-        return self._config.get("captcha", {}).get("remote_browser_api_key", "")
-
-    def set_remote_browser_api_key(self, api_key: str):
-        """Set remote browser captcha service API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["remote_browser_api_key"] = (api_key or "").strip()
-
-    @property
-    def remote_browser_timeout(self) -> int:
-        """Get remote browser captcha request timeout (seconds)"""
-        timeout = self._config.get("captcha", {}).get("remote_browser_timeout", 60)
-        try:
-            return max(5, int(timeout))
-        except Exception:
-            return 60
-
-    def set_remote_browser_timeout(self, timeout: int):
-        """Set remote browser captcha request timeout (seconds)"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        try:
-            normalized = max(5, int(timeout))
-        except Exception:
-            normalized = 60
-        self._config["captcha"]["remote_browser_timeout"] = normalized
 
 
 # Global config instance
