@@ -1437,11 +1437,13 @@ class FlowClient:
         if (token is None or getattr(token, "at", None) != handle) and self.db is not None:
             token = await self.db.get_token_by_at(handle)
         if token is None:
-            # A push replaced this account's handle while this request still held the old one: use the
-            # account's newest live session (same account, by the email hash inside the handle).
-            newer = self._cookie_sessions.newest_for_handle(handle)
-            if newer is not None:
-                return newer
+            # A push replaced this account's handle while this request still held the old one: follow the
+            # row's current handle (written only by a guarded promotion), never another session by guess.
+            retired_for = self._cookie_sessions.retired_token_id(handle)
+            current = await self.db.get_token(retired_for) if (retired_for is not None and self.db is not None) else None
+            current_at = str(getattr(current, "at", "") or "") if current is not None else ""
+            if current_at and current_at != handle and flow_ck.is_session_handle(current_at):
+                return await self._cookie_session_for_handle(current_at)
             raise FlowAPIError(401, "UNAUTHENTICATED: unknown cookie session; refresh the account", "UNAUTHENTICATED")
         proxy = self._token_cookie_proxy(token)
         if not proxy:
