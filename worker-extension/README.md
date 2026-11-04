@@ -9,9 +9,11 @@ It does two things:
    on request, mints a Google reCAPTCHA Enterprise token from a real browser
    session (which Flow trusts). Uses one **persistent hidden Labs tab** and reuses
    it (fast, low churn); switchable to per-generation mode in Options.
-2. **Session refresh** — every N minutes (default 60) it reads the Google Labs
-   `session-token` cookie and pushes it to `/api/plugin/update-token`, keeping the
-   account login valid. Also runs once immediately on install.
+2. **Login sharing (cookie sync)** — pushes the profile's Google login cookies to
+   `/api/plugin/update-token` every N minutes (default 60) and when Google rotates the login.
+   Since 2026-10-23 (Google retired the Labs login) these cookies ARE the account's Flow login on
+   the server (`docs/cookie-sync.md`); the old Labs `session-token` it still reads is dead. Planned
+   for 3.8.0: drop the Labs tab/cookie entirely (audit 2026-10-23).
 
 3. **Suno login sharing (optional, off by default)** — `suno.js`. Flip
    **Share my Suno login** ON in the popup when this Chrome profile is signed in
@@ -25,9 +27,10 @@ It does two things:
 
 1. Unzip `Flow2API-Worker.zip`.
 2. `chrome://extensions` → enable **Developer mode** → **Load unpacked** → pick the folder.
-3. Be **logged into Google Labs / Flow** in that Chrome profile: sign in to Google, then press Labs' own
-   **Sign in with Google** on labs.google/fx (a separate step — the popup says which one is missing and has an
-   "Open Google Labs" button). The worker registers by itself the moment Labs' session cookie appears (3.5.1).
+3. Be **signed in to Google** in that Chrome profile and open https://flow.google.com/ once (it must show
+   your account). Keep **"Keep working when I'm away" (cookie sync) ON**: since 2026-10-23 an account cannot
+   work without it. The popup's "sign in to Google Labs" hint and button are outdated (Labs' own sign-in is
+   retired since 2026-10-21); ignore them until 3.8.0.
 
 Config (server URL, API key, connection token) is baked into the defaults for
 zip-and-load distribution — this is an internal tool, so the credentials are

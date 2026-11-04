@@ -1478,7 +1478,8 @@ class TokenManager:
         return "unknown"
 
     async def validate_and_promote(self, token_id: int, st: str, source: str = "push",
-                                   push_route_key: Optional[str] = None) -> RefreshOutcome:
+                                   push_route_key: Optional[str] = None,
+                                   cookie_seq: Optional[int] = None) -> RefreshOutcome:
         """Public entry for credential PUSHES (worker extension / admin import): verify the
         session's access token against the API and only then commit st/at. Serialized
         with the refresh path via the per-token lock. ``at_stale`` ⇒ nothing stored —
@@ -1488,13 +1489,15 @@ class TokenManager:
         refresh_lock = await self._get_token_lock(self._refresh_locks, self._refresh_lock_guard, token_id)
         async with refresh_lock:
             token = await self.db.get_token(token_id)
-            outcome = await self._do_refresh_at(token_id, st, token, push_route_key=push_route_key)
+            outcome = await self._do_refresh_at(token_id, st, token, push_route_key=push_route_key,
+                                                cookie_seq=cookie_seq)
             if outcome.success:
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: credential promoted via {source}")
             return outcome
 
     async def _do_refresh_at(self, token_id: int, st: str, token: Optional[Token] = None,
-                             push_route_key: Optional[str] = None) -> RefreshOutcome:
+                             push_route_key: Optional[str] = None,
+                             cookie_seq: Optional[int] = None) -> RefreshOutcome:
         """Core AT refresh logic
 
         Args:
@@ -1588,7 +1591,12 @@ class TokenManager:
             # came from that browser's route key.
             guarded = getattr(self.db, "promote_credential_guarded", None)
             if push_route_key is not None and inspect.iscoroutinefunction(guarded):
-                if not await guarded(token_id, push_route_key, st=st, at=new_at, at_expires=new_at_expires, **credits_fields):
+                if not await guarded(token_id, push_route_key, min_cookie_seq=cookie_seq,
+                                     st=st, at=new_at, at_expires=new_at_expires, **credits_fields):
+                    latest = await self.db.get_token(token_id) if cookie_seq else None
+                    if latest is not None and int(getattr(latest, "google_cookies_seq", 0) or 0) > int(cookie_seq):
+                        debug_logger.log_info(f"[COOKIE_SYNC] token={token_id} older push not promoted (a newer one is stored)")
+                        return RefreshOutcome(False, "stale_push", verified=False)
                     debug_logger.op_warning(f"[ULTRA_GUARD] token={token_id} credential write refused: push from another route key")
                     return RefreshOutcome(False, "ultra_guard", verified=False)
             else:
@@ -1672,9 +1680,21 @@ class TokenManager:
             return None
         if self.flow_client.cookie_rpc_enabled():
             # 2026-10-23: the Labs login this replays is retired (CSRF 410). The stored cookies ARE the
-            # credential now: hand back the row's key so validate-then-promote re-logs in to Flow with them.
+            # credential now. Check them HERE: if they no longer sign in (the browser rotated its login and
+            # has not pushed yet), return None so _try_refresh_st goes on to ask the worker browser to push
+            # now, instead of re-trying the same dead cookies and disabling the account (Fable audit #1).
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: cookie session mode, re-checking the stored Google cookies")
-            return (token.st or "").strip() or None
+            st = (token.st or "").strip()
+            if not st:
+                return None
+            try:
+                result = await self._st_to_at_for_token(token, st)
+            except Exception as e:
+                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: stored cookies no longer sign in ({str(e)[:100]}); asking the browser")
+                return None
+            if not isinstance(result, dict) or not result.get("access_token"):
+                return None
+            return st
 
         try:
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: trying protocol ST refresh...")
@@ -1812,6 +1832,12 @@ class TokenManager:
             if status == "refreshed":
                 updated = await self.db.get_token(token_id)
                 new_st = updated.st if updated else None
+                if new_st and self.flow_client.cookie_rpc_enabled():
+                    # Cookie sessions: the push stored fresh Google cookies and promoted a verified session;
+                    # the row keeps its st key, so an unchanged st is success here.
+                    debug_logger.event(f"[ST_REFRESH] token={token_id} worker browser pushed fresh Google cookies")
+                    record_token_refresh("st", "success")
+                    return new_st
                 if new_st and new_st != token.st:
                     debug_logger.event(f"[ST_REFRESH] token={token_id} ST refreshed via extension")
                     record_token_refresh("st", "success")

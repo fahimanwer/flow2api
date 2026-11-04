@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..core.config import config
@@ -35,16 +36,35 @@ PAGE_LOAD_TIMEOUT_MS = 15000
 EXECUTE_TIMEOUT_MS = 10000
 READY_TIMEOUT_MS = 15000
 IDLE_BROWSER_TTL_SECONDS = 600
+# Routing breaker (2026-10-23: 223/223 mints failed after a Google page change, while the load balancer kept
+# picking worker-less accounts "because the server can mint" — every such request failed).
+ROUTING_BREAKER_FAILURES = 6
+ROUTING_BREAKER_PROBE_SECONDS = 300
 IDLE_PAGE_PARK_SECONDS = 60      # park a warm page on about:blank after this (the /about page animates = CPU)
 _BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 WARMUP_DWELL_SECONDS = 4.0
 
 _PROXY_RE = re.compile(r"^(https?|socks5h?)://(?:([^:]+):([^@]+)@)?([^:/]+):(\d+)/?$")
 
-# Runs before any page script: hide the automation flag, mark the page as ours.
+# The worker extension's document_start hook (worker-extension/recaptcha_hook.js, shipped in the
+# image): it captures the GENUINE grecaptcha.enterprise.execute as window.__f2aRealExecute the moment
+# reCAPTCHA defines it, before Flow's bundle wraps it with the "extension_hijack_detected" trap.
+# Needed since ~2026-10-23: flow.google.com/about now loads reCAPTCHA itself, and the old
+# "page loaded reCAPTCHA itself" refusal made every server mint fail (223/223 on 2026-10-23).
+_HOOK_PATH = Path(__file__).resolve().parents[2] / "worker-extension" / "recaptcha_hook.js"
+
+
+def _load_execute_hook() -> str:
+    try:
+        return _HOOK_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+# Runs before any page script: hide the automation flag, capture the genuine execute.
 _INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-"""
+""" + _load_execute_hook()
 
 # Load reCAPTCHA enterprise on a page that has none, marked as OUR instance.
 # Resolves with a verdict object; never rejects (a rejection would lose the reason).
@@ -52,7 +72,9 @@ _INJECT_SCRIPT = """
 ([siteKey]) => new Promise((resolve) => {
   try {
     if (window.grecaptcha && window.grecaptcha.enterprise && !window.__f2aServerInjected) {
-      resolve({ ok: false, err: 'page loaded reCAPTCHA itself (possible execute trap)' });
+      // The page loaded reCAPTCHA itself: usable only through the genuine execute the hook captured.
+      if (window.__f2aRealExecute) { resolve({ ok: true, reused: true, page: true }); return; }
+      resolve({ ok: false, err: 'page loaded reCAPTCHA itself and the genuine execute was not captured (trap)' });
       return;
     }
     if (window.__f2aServerInjected && window.grecaptcha && window.grecaptcha.enterprise) {
@@ -78,8 +100,16 @@ _EXECUTE_SCRIPT = """
     if (!(window.grecaptcha && window.grecaptcha.enterprise && window.grecaptcha.enterprise.execute)) {
       done({ ok: false, err: 'grecaptcha.enterprise not ready' }); return;
     }
+    const pageProvided = !window.__f2aServerInjected;
     grecaptcha.enterprise.ready(() => {
-      grecaptcha.enterprise.execute(siteKey, { action })
+      // Decide inside ready(): the genuine execute has had every chance to be captured by then. Never
+      // call the public execute of a page-provided instance (it is Flow's trap wrapper).
+      const real = window.__f2aRealExecute;
+      let run;
+      if (real) run = () => real(siteKey, { action });
+      else if (!pageProvided) run = () => grecaptcha.enterprise.execute(siteKey, { action });
+      else { done({ ok: false, err: 'page reCAPTCHA without a captured genuine execute (trap)' }); return; }
+      run()
         .then((t) => done(t ? { ok: true, token: t } : { ok: false, err: 'empty token' }))
         .catch((e) => done({ ok: false, err: String(e && e.message || e) }));
     });
@@ -162,6 +192,15 @@ class FlowPageCaptchaService:
             return cls._instance
 
     # ------------------------------------------------------------ capability
+    def routing_healthy(self) -> bool:
+        """May the load balancer pick an account ONLY because this service could mint for it? False after
+        ROUTING_BREAKER_FAILURES failed mints in a row, until the probe time; then True until a mint actually
+        STARTS (mint() moves the probe time), so filtering candidates never uses up the probe window.
+        A successful mint closes the breaker."""
+        if getattr(self, "_consecutive_failures", 0) < ROUTING_BREAKER_FAILURES:
+            return True
+        return time.monotonic() >= getattr(self, "_breaker_probe_at", 0.0)
+
     def is_available(self) -> bool:
         """Cheap, cached: can this process mint at all? Never launches a browser."""
         if self._available is not None:
@@ -242,6 +281,9 @@ class FlowPageCaptchaService:
             debug_logger.op_warning(f"[FALLBACK_MINT] token={token_id} no usable proxy; refusing to mint from the server IP")
             return None
         started = time.monotonic()
+        if getattr(self, "_consecutive_failures", 0) >= ROUTING_BREAKER_FAILURES:
+            # Breaker open: this mint is the probe; the next window opens only after the probe period.
+            self._breaker_probe_at = started + ROUTING_BREAKER_PROBE_SECONDS
         deadline = deadline_at if deadline_at is not None else started + DEFAULT_MINT_DEADLINE_SECONDS
         egress = mask_proxy_url(proxy_url)
         outcome = "fail"
@@ -287,6 +329,16 @@ class FlowPageCaptchaService:
             return None
         finally:
             self.stats[outcome] = self.stats.get(outcome, 0) + 1
+            if outcome == "ok":
+                self._consecutive_failures = 0
+            else:
+                self._consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
+                if self._consecutive_failures == ROUTING_BREAKER_FAILURES:
+                    self._breaker_probe_at = time.monotonic() + ROUTING_BREAKER_PROBE_SECONDS
+                    debug_logger.op_warning(
+                        f"[FALLBACK_MINT] {ROUTING_BREAKER_FAILURES} server mints failed in a row: worker-less "
+                        f"accounts are not picked for {ROUTING_BREAKER_PROBE_SECONDS}s"
+                    )
             if slot is not None:
                 slot.busy = False
                 slot.last_used = time.monotonic()

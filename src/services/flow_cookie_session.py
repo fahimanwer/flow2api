@@ -216,8 +216,11 @@ def extract_rpc_payload(frames: List[List[Any]], rpc_id: str) -> Any:
                 code = item[5] if len(item) > 5 and item[5] is not None else (item[6] if len(item) > 6 else None)
                 if str(code) == "401":
                     raise FlowCookieAuthError(f"Flow refused the Google login (rpc={rpc_id}, code=401)")
-                raise FlowRpcError(rpc_id, f"code={code if code is not None else 'unknown'}",
-                                   status_code=int(code) if str(code).isdigit() and 400 <= int(code) < 600 else 400)
+                # Any other `er` code means the RPC envelope was refused (xsrf, bl/f.sid drift, a format
+                # change): never the account, so never a strike (Fable audit #3).
+                raise FlowRpcError(rpc_id, f"{TRANSIENT_MARKER} (rpc envelope refused, code={code if code is not None else 'unknown'})",
+                                   status_code=int(code) if str(code).isdigit() and 400 <= int(code) < 600 else 400,
+                                   transient=True)
             if item[0] != "wrb.fr" or item[1] != rpc_id:
                 continue
             detail = item[5] if len(item) > 5 else None
@@ -328,6 +331,9 @@ class FlowCookieSessions:
     def put(self, session: FlowCookieSession) -> None:
         if self._expired(session):
             return  # built from cookies that were cleared meanwhile
+        revoked = self._revoked_at.get(session.email)
+        if revoked is not None and session.created_at > revoked + SESSION_TTL_SECONDS:
+            self._revoked_at.pop(session.email, None)  # every older session has aged out by now
         self._make_room()
         self._by_handle[session.handle] = session
 
@@ -400,6 +406,10 @@ async def load_bootstrap(
             url = urljoin(url, location)
             host = (urlparse(url).hostname or "").lower()
             if urlparse(url).scheme != "https" or host not in BOUNCE_HOSTS:
+                if host == "google.com" or host.endswith(".google.com"):
+                    # e.g. www.google.com/sorry (IP reputation) or a consent page: about the IP or a
+                    # Google-side step, never proof that the login itself is dead (Fable audit #2).
+                    raise FlowTransientError(f"the Flow login was sent to {host}{urlparse(url).path[:40]} instead of Flow")
                 raise FlowCookieAuthError(f"Flow login bounced off Google to {host or 'nowhere'}")
         else:
             raise FlowTransientError("the Flow login exceeded the redirect limit")
@@ -424,13 +434,17 @@ async def load_bootstrap(
     email = _find_email(text)
     if not bl or not fsid:
         raise FlowTransientError("Flow page loaded without its bootstrap data (bl / f.sid); Google may have changed the page")
+    xsrf = _XSRF_PAGE_RE.search(text)
     if not email:
-        # The full Flow app, but signed OUT (no login bounce, no account). Seen 2026-10-23 on device-bound
-        # (DBSC, __Secure-1PSIDRTS) logins whose copied cookies went stale: a real "log in again" verdict.
+        if xsrf:
+            # Signed-in page (it has the xsrf token) but the account field is gone: Google renamed it.
+            # Never a login verdict, or one frontend change would disable every account at once.
+            raise FlowTransientError("Flow page has no account field (oPEP7c) although it is signed in; Google may have changed the page")
+        # The full Flow app, signed OUT: no account AND no xsrf token (checked 2026-10-23 on an anonymous
+        # visit; seen on device-bound logins whose copied cookies went stale): a real "log in again" verdict.
         raise FlowCookieAuthError("Flow shows the signed-out page; the copied Google cookies are stale (the browser must push again)")
     if session.email and email != session.email:
         raise FlowIdentityError(f"these cookies now sign in as {email}, not {session.email}")
-    xsrf = _XSRF_PAGE_RE.search(text)
     session.bl = bl.group(0)
     session.fsid = fsid.group(1)
     session.xsrf = _json_unescape(xsrf.group(1)) if xsrf else ""
@@ -530,16 +544,26 @@ async def call_rpc(
     for cookie in list(session.jar):
         jar_copy.set_cookie(copy.copy(cookie))
     async with AsyncSession(trust_env=False, cookies=jar_copy, impersonate=impersonate) as http:
-        response = await _network(http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout))
+        response = await _network(http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout,
+                                               allow_redirects=False))
         text = response.text
         xsrf = _XSRF_RPC_RE.search(text or "")
-        if xsrf and response.status_code < 500:
+        answered = f'"wrb.fr","{rpc_id}"' in (text or "").replace(", ", ",")
+        if xsrf and response.status_code < 500 and not answered:
             # Google rotated the page token: retry once with the one it handed back.
             session.xsrf = _json_unescape(xsrf.group(1))
             fields["at"] = session.xsrf
-            response = await _network(http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout))
+            response = await _network(http.post(url, data=urlencode(fields), headers=headers, proxy=egress, timeout=timeout,
+                                               allow_redirects=False))
             text = response.text
         _merge_changed(session.jar, before, http.cookies.jar)
+    if 300 <= response.status_code < 400:
+        # A dead session's RPC is sent to a sign-in page; anything else is Google-side trouble.
+        target = (urlparse(urljoin(url, response.headers.get("location") or "")).hostname or "").lower()
+        session.bootstrap_at = 0.0
+        if target == "accounts.google.com":
+            raise FlowCookieAuthError(f"Flow RPC {rpc_id} was sent to the Google sign-in page")
+        raise FlowTransientError(f"Flow RPC {rpc_id} was redirected to {target or 'nowhere'}")
     if response.status_code == 401 and "wrb.fr" not in (text or ""):
         # Reload the page next time: if the login is really dead the reload lands on accounts.google.com.
         session.bootstrap_at = 0.0
@@ -548,7 +572,13 @@ async def call_rpc(
         session.bootstrap_at = 0.0
         raise FlowRpcError(rpc_id, f"{TRANSIENT_MARKER} (HTTP {response.status_code}): {(text or '')[:120]}",
                            status_code=response.status_code, transient=True)
-    return extract_rpc_payload(parse_batchexecute_frames(text), rpc_id)
+    frames = parse_batchexecute_frames(text)
+    if not any(isinstance(i, list) and i and i[0] in ("wrb.fr", "er") for f in frames for i in f):
+        # 2xx without any RPC frame (an HTML page, an empty body): never pass this on as "no data", which
+        # the video status normaliser would read as "still running".
+        session.bootstrap_at = 0.0
+        raise FlowTransientError(f"Flow RPC {rpc_id} got an answer without RPC frames (HTTP {response.status_code})")
+    return extract_rpc_payload(frames, rpc_id)
 
 
 async def establish(

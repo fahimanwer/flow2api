@@ -47,7 +47,7 @@ The platform offers several selectable groups and a public status page, so devel
 - 🎨 **Text-to-image** / **image-to-image**
 - 🎬 **Text-to-video** / **image-to-video**
 - 🎞️ **First/last-frame video**
-- 🔄 **AT/ST auto-refresh** - AT refreshes automatically when it expires; an expired ST is renewed through the browser (personal mode)
+- 🔄 **Login renewal** - since 2026-10-23 each account runs on its worker browser's pushed Google cookies (cookie sessions, `docs/cookie-sync.md`); the old Labs ST/AT renewal is retired with Google's Labs login
 - 📊 **Balance display** - live lookup and display of VideoFX Credits
 - 🚀 **Load balancing** - round-robin across multiple tokens, with concurrency control
 - 🌐 **Proxy support** - HTTP/SOCKS5 proxies
@@ -69,7 +69,7 @@ Sign up at [YesCaptcha](https://yescaptcha.com/i/13Xd8K), get an API key, and en
 - The default `docker-compose.yml` is meant to be used with a third-party solver (yescaptcha/capmonster/ezcaptcha/capsolver).
 For headed browser solving inside Docker (browser/personal), use `docker-compose.headed.yml` below.
 
-- Browser extension that auto-updates the ST: [Flow2API-Token-Updater](https://github.com/TheSmallHanCat/Flow2API-Token-Updater)
+- Our worker extension is in `worker-extension/` (pushes the Google login cookies; upstream's ST updater no longer applies to this fork)
 
 ### Option 1: Docker (recommended)
 

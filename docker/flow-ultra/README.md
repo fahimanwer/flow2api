@@ -44,7 +44,8 @@ Log: `/profile/logs/register-ext.log`. Nothing to do by hand.
 ## Signing in (a human does this)
 On the box: `systemd-run --unit flow-ultra-novnc /usr/bin/websockify --web /usr/share/novnc 127.0.0.1:6081 <container-ip>:5900`.
 On the Mac: `ssh -N -L 6081:127.0.0.1:6081 root@178.63.65.20`, open http://localhost:6081/vnc.html → Connect.
-Sign in to Google, then Labs' own "Sign in with Google" on labs.google/fx; open flow.google.com once.
+Sign in to Google, then open https://flow.google.com/ once and check it shows the account (Labs' own
+"Sign in with Google" is retired since 2026-10-21; the server logs in to Flow with the pushed cookies).
 Stop the screen afterwards: `systemctl stop flow-ultra-novnc`.
 
 ## Ultra browsers managed from the dashboard (host agent, 2026-10-05)

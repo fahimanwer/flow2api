@@ -1395,15 +1395,21 @@ class Database:
             raise UltraOwnershipError(f"{email_n} is owned by Ultra browser {by_email[0]}")
         return by_email[0], by_email[1]
 
-    async def promote_credential_guarded(self, token_id: int, push_route_key: Optional[str], **fields) -> bool:
+    async def promote_credential_guarded(self, token_id: int, push_route_key: Optional[str],
+                                         min_cookie_seq: Optional[int] = None, **fields) -> bool:
         """Credential write of a device push, with Ultra ownership decided in the SAME write transaction
         (by the token's normalized email, the route and the bound token). A managed browser's own route on a
         still-unbound onboarding row binds it and puts the account on the onboarding hold atomically. Returns
-        False (nothing written) for a foreign route."""
+        False (nothing written) for a foreign route, or (min_cookie_seq set) when a NEWER cookie push is
+        already stored: since 2026-10-23 the cookies are the credential, so an older push must not win."""
         rk = (push_route_key or "").strip()
         async with self._connect(write=True) as db:
-            row = await (await db.execute("SELECT email FROM tokens WHERE id = ?", (int(token_id),))).fetchone()
+            row = await (await db.execute("SELECT email, COALESCE(google_cookies_seq, 0) FROM tokens WHERE id = ?",
+                                          (int(token_id),))).fetchone()
             if row is None:
+                await db.commit()
+                return False
+            if min_cookie_seq and int(row[1] or 0) > int(min_cookie_seq):
                 await db.commit()
                 return False
             email_n = (row[0] or "").strip().lower()

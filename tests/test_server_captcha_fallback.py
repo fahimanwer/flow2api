@@ -13,11 +13,12 @@ from src.services.load_balancer import LoadBalancer
 
 
 class _FakePage:
-    def __init__(self, token="tok", verdict_ok=True, page_has_grecaptcha=False):
+    def __init__(self, token="tok", verdict_ok=True, page_has_grecaptcha=False, real_execute_captured=False):
         self.url = "about:blank"
         self.token = token
         self.verdict_ok = verdict_ok
         self.page_has_grecaptcha = page_has_grecaptcha
+        self.real_execute_captured = real_execute_captured
         self.mouse = MagicMock(move=AsyncMock(), wheel=AsyncMock())
         self.execs = 0
 
@@ -35,9 +36,11 @@ class _FakePage:
             return "Mozilla/5.0 (X11; Linux x86_64) Chrome/153"
         if script.startswith("!!(window.grecaptcha"):
             return True
-        if "__f2aServerInjected" in script:  # inject
+        if isinstance(arg, list) and len(arg) == 1:  # inject ([siteKey]); execute gets [siteKey, action, timeout]
             if self.page_has_grecaptcha:
-                return {"ok": False, "err": "page loaded reCAPTCHA itself (possible execute trap)"}
+                if self.real_execute_captured:  # the init hook caught the genuine execute (2026-10-23)
+                    return {"ok": True, "reused": True, "page": True}
+                return {"ok": False, "err": "page loaded reCAPTCHA itself and the genuine execute was not captured (trap)"}
             return {"ok": True, "reused": False}
         self.execs += 1  # execute
         return {"ok": True, "token": self.token} if self.verdict_ok else {"ok": False, "err": "empty token"}
@@ -95,10 +98,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await svc.mint("IMAGE_GENERATION", "http://u:p@a:1", token_id=1))
         self.assertEqual(svc.stats["fail"], 1)
 
+    async def test_page_provided_recaptcha_mints_with_the_captured_genuine_execute(self):
+        # flow.google.com/about loads reCAPTCHA itself since ~2026-10-23 (223/223 server mints failed).
+        svc = _service(lambda p: _FakePage(page_has_grecaptcha=True, real_execute_captured=True))
+        r = await svc.mint("IMAGE_GENERATION", "http://u:p@a:1", token_id=1)
+        self.assertEqual(r["token"], "tok")
+
+    def test_init_script_carries_the_execute_hook(self):
+        self.assertIn("__f2aRealExecute", fpc._INIT_SCRIPT)
+
     async def test_deadline_returns_none_and_marks_page_dirty(self):
         class SlowPage(_FakePage):
             async def evaluate(self, script, arg=None):
-                if script.startswith("!!(") or script == "navigator.userAgent" or "__f2aServerInjected" in script:
+                if script.startswith("!!(") or script == "navigator.userAgent" or (isinstance(arg, list) and len(arg) == 1):
                     return await super().evaluate(script, arg)
                 await asyncio.sleep(5)
 
