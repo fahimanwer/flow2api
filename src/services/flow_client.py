@@ -1442,7 +1442,9 @@ class FlowClient:
             retired_for = self._cookie_sessions.retired_token_id(handle)
             current = await self.db.get_token(retired_for) if (retired_for is not None and self.db is not None) else None
             current_at = str(getattr(current, "at", "") or "") if current is not None else ""
-            if current_at and current_at != handle and flow_ck.is_session_handle(current_at):
+            # Only for an email held by exactly one row: with two rows a session's row binding can be wrong.
+            single_row = current is not None and await self.db.count_tokens_by_email(current.email or "") == 1
+            if single_row and current_at and current_at != handle and flow_ck.is_session_handle(current_at):
                 return await self._cookie_session_for_handle(current_at)
             raise FlowAPIError(401, "UNAUTHENTICATED: unknown cookie session; refresh the account", "UNAUTHENTICATED")
         proxy = self._token_cookie_proxy(token)
