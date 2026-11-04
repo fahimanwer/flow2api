@@ -380,3 +380,10 @@ def test_signed_in_page_without_account_field_is_transient():
     with patch.object(ck, "AsyncSession", lambda **kw: Http()):
         with pytest.raises(ck.FlowTransientError):
             asyncio.run(ck.load_bootstrap(session))
+def test_image_aspect_codes_match_what_google_makes():
+    # Measured live 2026-11-04: 1 -> 1024x1024, 2 -> 768x1376, 3 -> 1376x768, 4 -> 896x1200, 5 -> 1200x896.
+    assert flow_rpc.IMAGE_ASPECT["IMAGE_ASPECT_RATIO_SQUARE"] == 1
+    assert flow_rpc.IMAGE_ASPECT["IMAGE_ASPECT_RATIO_PORTRAIT"] == 2
+    assert flow_rpc.IMAGE_ASPECT["IMAGE_ASPECT_RATIO_LANDSCAPE"] == 3
+    assert flow_rpc.IMAGE_ASPECT["IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"] == 4
+    assert flow_rpc.IMAGE_ASPECT["IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"] == 5
