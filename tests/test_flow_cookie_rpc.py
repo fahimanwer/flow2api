@@ -387,3 +387,25 @@ def test_image_aspect_codes_match_what_google_makes():
     assert flow_rpc.IMAGE_ASPECT["IMAGE_ASPECT_RATIO_LANDSCAPE"] == 3
     assert flow_rpc.IMAGE_ASPECT["IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"] == 4
     assert flow_rpc.IMAGE_ASPECT["IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"] == 5
+
+
+def test_protocol_healer_stamps_a_failed_cookie_recheck():
+    # 2026-11-04: a failed re-check returned before stamping last_st_refresh_at, so the healer
+    # retried every disabled account every 60 s instead of once per refresh interval.
+    import asyncio
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+    from src.services.token_manager import TokenManager
+
+    tm = TokenManager.__new__(TokenManager)
+    row = SimpleNamespace(id=7, auto_refresh_enabled=True, is_active=False, ban_reason="auto_st_expired",
+                          protocol_mode="protocol", google_cookies='[{"name":"SID","value":"x"}]')
+    tm.db = MagicMock()
+    tm.db.get_token = AsyncMock(return_value=row)
+    tm.db.update_token = AsyncMock()
+    tm._try_protocol_refresh_st = AsyncMock(return_value=None)
+    now = datetime.now(timezone.utc)
+    asyncio.run(tm._refresh_protocol_token(row, now))
+    kwargs = tm.db.update_token.await_args.kwargs
+    assert kwargs["last_st_refresh_at"] == now

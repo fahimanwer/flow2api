@@ -1881,6 +1881,10 @@ class TokenManager:
 
         new_st = await self._try_protocol_refresh_st(token_id, latest)
         if not new_st:
+            # Stamp the try even when the stored cookies do not sign in, or this account is re-tried every
+            # 60 s instead of once per refresh interval (2026-11-04: 400+ Google logins in 70 min for 25 rows).
+            await self.db.update_token(token_id, last_st_refresh_at=now,
+                                       last_st_refresh_result="stored cookies do not sign in")
             return
 
         # Re-read after the network round-trip: an admin disable or a cookie-sync OFF

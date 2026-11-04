@@ -2339,6 +2339,11 @@ async def update_captcha_config(
     except Exception:
         return {"success": False, "message": "Restart-after-solves count must be an integer (0 = disabled)"}
 
+    # 2026-11-04: the page had no "extension" option, so a Save sent "" and stopped all generation.
+    if captcha_method not in ("extension", "yescaptcha", "capmonster", "ezcaptcha", "capsolver",
+                              "browser", "personal", "remote_browser"):
+        return {"success": False, "message": f"Unknown captcha method: {captcha_method!r}"}
+
     if captcha_method == "remote_browser":
         if not (remote_browser_base_url or "").strip():
             return {"success": False, "message": "remote_browser mode needs the remote captcha service URL"}
