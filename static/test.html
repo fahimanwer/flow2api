@@ -155,6 +155,11 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
           <input type="file" id="imageFileInput" accept="image/*" multiple style="display:none;">
         </div>
 
+        <div class="form-group" id="videoSourceGroup" style="display:none;">
+          <label>Source video media id <span style="color:#666;font-size:12px;">(the video to extend; idea from upstream 84adc62)</span></label>
+          <input type="text" id="videoMediaId" placeholder="mediaGenerationId of the video to extend" autocomplete="off">
+        </div>
+
         <button class="btn-generate" id="btnGenerate" disabled>Select a model to start</button>
       </div>
 
@@ -323,6 +328,9 @@ function selectModel(modelId) {
   } else {
     uploadGroup.style.display = "none";
   }
+  // Extend models take the source video's media id instead of images.
+  document.getElementById("videoSourceGroup").style.display = meta.requiresVideoId ? "block" : "none";
+  document.getElementById("videoMediaId").value = "";
 
   // Reset image previews
   document.getElementById("imagePreviewList").innerHTML = "";
@@ -331,7 +339,7 @@ function selectModel(modelId) {
   if (!STATE.generating) setGenerateButton(meta);
 }
 
-// Extend needs a source video id, which this page cannot send: keep its button off.
+// Extend needs a source video id: the button waits until one is typed in.
 function setGenerateButton(meta) {
   const btn = document.getElementById("btnGenerate");
   if (!meta) {
@@ -339,9 +347,9 @@ function setGenerateButton(meta) {
     btn.textContent = "Select a model to start";
     return;
   }
-  if (meta.requiresVideoId) {
+  if (meta.requiresVideoId && !document.getElementById("videoMediaId").value.trim()) {
     btn.disabled = true;
-    btn.textContent = "Extend needs a source video: call the API with image_url extend://<media id>";
+    btn.textContent = "Enter the source video's media id to extend it";
     return;
   }
   btn.disabled = false;
@@ -403,10 +411,15 @@ function removeImage(idx) {
 
 // Generation
 document.getElementById("btnGenerate").onclick = generate;
+document.getElementById("videoMediaId").addEventListener("input", () => {
+  if (!STATE.generating) setGenerateButton(STATE.modelConfig);
+});
 
 async function generate() {
   if (!STATE.selectedModel || STATE.generating) return;
-  if (STATE.modelConfig && STATE.modelConfig.requiresVideoId) return;
+  const videoMediaId = STATE.modelConfig && STATE.modelConfig.requiresVideoId
+    ? document.getElementById("videoMediaId").value.trim() : "";
+  if (STATE.modelConfig && STATE.modelConfig.requiresVideoId && !videoMediaId) return;
 
   const baseUrl = (document.getElementById("baseUrl").value || "").trim();
   const apiKey = (document.getElementById("apiKey").value || "").trim();
@@ -435,6 +448,9 @@ async function generate() {
   STATE.images.forEach(dataUrl => {
     content.push({ type: "image_url", image_url: { url: dataUrl } });
   });
+  if (videoMediaId) {
+    content.push({ type: "image_url", image_url: { url: `extend://${videoMediaId}` } });
+  }
 
   const messages = [{ role: "user", content: content.length === 1 ? prompt : content }];
 
