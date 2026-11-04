@@ -16,7 +16,8 @@ function sanitizeSiteConfig(raw) {
   return out;
 }
 
-/** PAC script: Flow + reCAPTCHA through the proxy (staff default), or everything except local hosts (site). */
+/** PAC script: Flow + reCAPTCHA through the proxy (staff default), or everything except local hosts (site).
+ *  3.8.0: no labs.google line — it only served the retired Labs tab; the mint tab is on flow.google.com. */
 function buildPacScript(proxyToken, allHosts) {
   const q = String(proxyToken).replace(/'/g, "");
   const lines = ["function FindProxyForURL(url, host) {", "  var P = '" + q + "';"];
@@ -24,7 +25,6 @@ function buildPacScript(proxyToken, allHosts) {
     lines.push("  if (isPlainHostName(host) || host === '127.0.0.1' || host === 'localhost') return 'DIRECT';");
     lines.push("  return P;");
   } else {
-    lines.push("  if (dnsDomainIs(host, 'labs.google')) return P;");
     lines.push("  if (dnsDomainIs(host, 'flow.google.com')) return P;");
     lines.push("  if (shExpMatch(url, '*://www.google.com/recaptcha/*')) return P;");
     lines.push("  if (shExpMatch(url, '*://www.gstatic.com/recaptcha/*')) return P;");

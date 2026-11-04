@@ -26,6 +26,29 @@ test("buildPacScript: staff default proxies Flow + reCAPTCHA only; site mode pro
   assert.equal(fn("http://localhost/", "localhost"), "DIRECT");
 });
 
+test("buildPacScript (staff, 3.8.0): flow.google.com + the reCAPTCHA mint go through the proxy; labs.google no longer", () => {
+  // Minimal PAC helpers (Chrome's semantics for what the script uses).
+  const env = {
+    dnsDomainIs: (h, d) => h === d || h.endsWith("." + d.replace(/^\./, "")),
+    shExpMatch: (s, p) => new RegExp("^" + p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$").test(s),
+  };
+  const pac = buildPacScript("PROXY h:8005", false);
+  assert.doesNotMatch(pac, /labs\.google/);
+  const fn = new Function("dnsDomainIs", "shExpMatch", pac + "; return FindProxyForURL;")(env.dnsDomainIs, env.shExpMatch);
+  const via = (url) => fn(url, new URL(url).hostname);
+  for (const url of [
+    "https://flow.google.com/about",                                       // the mint tab
+    "https://flow.google.com/project/b157461c-fa6f-486f-ba90-5bec305f4959", // Flow itself
+    "https://www.google.com/recaptcha/enterprise.js?trustedtypes=true&render=k",
+    "https://www.google.com/recaptcha/enterprise/reload?k=k",
+    "https://www.gstatic.com/recaptcha/releases/x/recaptcha__en.js",
+    "https://www.recaptcha.net/recaptcha/api2/anchor",
+  ]) assert.equal(via(url), "PROXY h:8005", url);
+  for (const url of ["https://labs.google/fx", "https://www.google.com/search?q=x", "https://flow.ashuthefire.com/captcha_ws", "https://accounts.google.com/"]) {
+    assert.equal(via(url), "DIRECT", url);
+  }
+});
+
 test("sanitizeBootstrapConfig accepts only https server, a token and a sane route key (3.7.5)", () => {
   assert.deepEqual(sanitizeBootstrapConfig({ serverBase: "https://flow.example.com/", connectionToken: " tok ", routeKey: "ultra-flow-ultra-03-ab12", extra: 1 }),
     { serverBase: "https://flow.example.com", connectionToken: "tok", routeKey: "ultra-flow-ultra-03-ab12" });

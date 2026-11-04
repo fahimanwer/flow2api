@@ -440,3 +440,19 @@ def test_protocol_healer_stamps_a_failed_cookie_recheck():
     asyncio.run(tm._refresh_protocol_token(row, now))
     kwargs = tm.db.update_token.await_args.kwargs
     assert kwargs["last_st_refresh_at"] == now
+
+
+def test_a_replaced_handle_finds_the_accounts_newest_live_session():
+    # 2026-11-04: requests in flight when a push replaced the handle failed with "unknown cookie session".
+    import time as _t
+    reg = ck.FlowCookieSessions()
+    old = _session("a@x.com")
+    _t.sleep(0.01)
+    new = _session("a@x.com", fp="g")
+    other = _session("b@x.com")
+    for s_ in (new, other):
+        reg.put(s_)
+    assert reg.newest_for_handle(old.handle) is new          # old handle no longer registered
+    assert reg.newest_for_handle("FLOWCK.nohash") is None
+    reg.drop_email("a@x.com")                                 # cookies cleared: nothing may serve
+    assert reg.newest_for_handle(old.handle) is None
