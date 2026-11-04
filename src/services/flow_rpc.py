@@ -24,8 +24,11 @@ IMAGE_ASPECT = {
     "IMAGE_ASPECT_RATIO_PORTRAIT": 2,
     "IMAGE_ASPECT_RATIO_16_9": 3,
     "IMAGE_ASPECT_RATIO_LANDSCAPE": 3,
-    "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE": 4,
-    "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR": 5,
+    # Measured live 2026-11-04 (one image each, account 76): code 4 makes 896x1200 (portrait 3:4) and
+    # code 5 makes 1200x896 (landscape 4:3). Upstream's table (copied 2026-10-23) has these two swapped;
+    # 1 = 1024x1024, 2 = 768x1376, 3 = 1376x768 were measured correct the same day.
+    "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE": 5,
+    "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR": 4,
 }
 
 
