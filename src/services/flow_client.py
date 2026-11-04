@@ -182,6 +182,8 @@ class FlowClient:
         # so an account's "AT" is now a FLOWCK.* handle onto a flow.google.com cookie session.
         # hint = cookies a worker just pushed (admin push endpoint); token = the row being worked on.
         self._cookie_sessions = flow_ck.FlowCookieSessions()
+        # character id -> photos attached by this process (Flow web has no batch read for characters)
+        self._character_photos: Dict[str, int] = {}
         self._cookie_hint_ctx: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
             "flow_cookie_hint", default=None
         )
@@ -544,8 +546,14 @@ class FlowClient:
             # flow.google.com RPC through the captcha fingerprint's proxy (the mint's egress), else the
             # account's own proxy. Never the global/media proxy: the cookie login lives on the account IP.
             fp = fingerprint if isinstance(fingerprint, dict) and respect_fingerprint_proxy else {}
+            body = json_data
+            if body is None and raw_body:
+                try:  # control-plane calls (characters) send their JSON as a text body
+                    body = json.loads(raw_body if isinstance(raw_body, str) else raw_body.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    body = None
             return await self._cookie_rpc_request(
-                method, url, json_data, at_token,
+                method, url, body, at_token,
                 proxy_url=(fp.get("proxy_url") or None),
                 user_agent=(fp.get("user_agent") or None),
                 timeout=timeout or self.timeout,
@@ -3103,6 +3111,15 @@ class FlowClient:
         ({"entity": …} or {"error": {"code": 5, …}} for a missing one)."""
         if not entity_ids:
             return []
+        if flow_ck.is_session_handle(at):
+            # Cookie sessions (2026-11-04): the Flow web app has no batch read; a character is created and
+            # filled in the same request (C4BZMd + Sc7aEb, each checked), so report what this process attached.
+            return [
+                {"entity": {"entityId": e, "entityInfo": {"characterInfo": {
+                    "imageReferences": [{} for _ in range(self._character_photos.get(str(e), 0))]}}}}
+                if str(e) in self._character_photos else {"error": {"code": 5, "message": "not known to this process"}}
+                for e in entity_ids
+            ]
         query = "&".join(f"entityIds={urllib.parse.quote(str(e), safe='')}" for e in entity_ids)
         result = await self._aisandbox_request(
             "GET", f"/flow/entities:batchGet?{query}", at=at, account_id=account_id,
@@ -3132,13 +3149,16 @@ class FlowClient:
                 }
             },
         }
-        return await self._aisandbox_request(
+        result = await self._aisandbox_request(
             "POST",
             "/flow:copyProjectMedia",
             at=at,
             raw_body=self._compact_json_dumps(payload),
             account_id=account_id,
         )
+        self._character_photos[str(entity_id)] = max(self._character_photos.get(str(entity_id), 0),
+                                                     int(image_reference_index) + 1)
+        return result
 
     async def stream_flow_creation_agent(
         self,

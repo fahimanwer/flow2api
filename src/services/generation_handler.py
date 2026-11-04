@@ -1231,7 +1231,7 @@ UPSAMPLE_TRAFFIC_COOLDOWN_MIN = 15
 
 
 CHARACTERS_UNAVAILABLE = (
-    "Flow Characters are not available since Google's Flow change of 2026-10-21 (the character API our server used was retired with the Labs login). Send the request without \"characters\", or describe the person in the prompt."
+    "Flow Characters work for images only since Google's Flow change of 2026-10-21; videos with characters are not available yet. Send the video without \"characters\", or describe the person in the prompt."
 )
 
 class GenerationHandler:
@@ -1953,11 +1953,6 @@ class GenerationHandler:
         # Flow Characters: validated and created BEFORE any upload or generation, so a bad
         # request or a Google-side setup failure costs nothing and is never an account strike.
         character_entities: Dict[str, str] = {}
-        if characters and str(getattr(token, "at", "") or "").startswith("FLOWCK."):
-            # Cookie sessions (2026-10-23): no Flow web RPC for characters yet; say so before any work.
-            self._mark_generation_failed(generation_result, CHARACTERS_UNAVAILABLE, caller_fault=True)
-            yield self._create_error_response(CHARACTERS_UNAVAILABLE, status_code=501)
-            return
         if characters:
             char_error = validate_characters(characters, MAX_CHARACTERS_IMAGE)
             if char_error:

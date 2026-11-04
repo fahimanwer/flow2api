@@ -88,14 +88,45 @@ def test_image_translation_matches_upstream_layout():
     assert len(arg[4]) == 1 and flow_rpc.UUID_RE.fullmatch(arg[4][0]) and arg[4][0] != req[12]
 
 
-def test_image_translation_refuses_characters_and_unknown_models():
+def test_image_translation_refuses_unknown_parts_and_models():
     url = "https://aisandbox-pa.googleapis.com/v1/projects/p/flowMedia:batchGenerateImages"
-    with pytest.raises(flow_rpc.CookieModeUnsupported):
-        flow_rpc.translate_request("POST", url, _image_body(referenceEntities=[{"entityId": "e"}]))
     with pytest.raises(flow_rpc.CookieModeUnsupported):
         flow_rpc.translate_request("POST", url, _image_body(structuredPrompt={"parts": [{"entity": "x"}]}))
     with pytest.raises(flow_rpc.CookieModeUnsupported):
         flow_rpc.translate_request("POST", url, _image_body(imageModelName="IMAGEN_3"))
+
+
+CHAR = "cdc65f26-97bf-45a4-9802-56fdb72e6776"
+PROJ = "ac31097d-1391-4fcd-a6ad-f6aea1d14043"
+
+
+def test_image_with_a_character_matches_the_flow_web_app():
+    # HAR of the real Flow app, 2026-11-04: the character goes in request slot 10 as [[id]], the prompt stays text.
+    body = _image_body(referenceEntities=[{"entityId": CHAR}], imageInputs=[],
+                       structuredPrompt={"parts": [{"reference": {"entity": {"entityId": CHAR, "handle": "Bikey"}}},
+                                                   {"text": " parked next to a green door, photo"}]})
+    call = flow_rpc.translate_request(
+        "POST", f"https://aisandbox-pa.googleapis.com/v1/projects/{PROJ}/flowMedia:batchGenerateImages", body)
+    req = call.argument[1][0]
+    assert req[10] == [[CHAR]] and req[8] == [[["Bikey parked next to a green door, photo"]]] and req[2] is None
+
+
+def test_character_create_and_photo_slot_match_the_flow_web_app():
+    create = flow_rpc.translate_request("POST", "https://aisandbox-pa.googleapis.com/v1/flow/entities", {
+        "entity": {"projectId": PROJ, "entityInfo": {"entityType": "CHARACTER", "displayName": "Untitled character",
+                                                     "characterInfo": {}}}})
+    assert create.rpc_id == "C4BZMd"
+    assert create.argument == [[PROJ, None, None, [1, "Untitled character", []]]]
+    out = create.normalize([[PROJ, CHAR, None, [1, "Untitled character", []], None, None, [1, 2], [1, 2]]])
+    assert out["entity"]["entityId"] == CHAR
+    media = "814e7827-f3dd-45e3-8122-5cae073375a1"
+    slot = flow_rpc.translate_request("POST", "https://aisandbox-pa.googleapis.com/v1/flow:copyProjectMedia", {
+        "mediaId": media, "destinationProjectId": PROJ,
+        "destinationMediaContext": {"entityContext": {"entityId": CHAR, "characterSlot": {"imageReferenceIndex": 0}}}})
+    assert slot.rpc_id == "Sc7aEb"
+    assert slot.argument[:9] == [media, None, None, PROJ, None, None, None, [None, None, [CHAR, [0]]], None]
+    with pytest.raises(RuntimeError):
+        slot.normalize(None)
 
 
 def test_image_response_normalizes_to_rest_shape():
