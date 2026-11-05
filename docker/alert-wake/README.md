@@ -17,6 +17,13 @@ wake you up so that you can fix it automatically".
    app bugs per `/home/cc/fleet-guard/README.md`.
 4. Recoveries never wake anyone. At most 4 wakes per hour (storm guard); Telegram still gets every row.
 
+## The box watcher can wake this thread too
+`wake-flow2api "<the facts>"` (installed at `/usr/local/bin/wake-flow2api`, runs as `cc`) posts a message into the flow2api
+thread from the CC box, so the fleet-guard watch can hand a flow2api problem to this session. Config and token (cc, 0600):
+`/home/cc/.flow2api-wake/env` + `mac.token` (issued on the Mac, label `fleet-guard-wake-flow2api`, 365 d); log
+`/home/cc/.flow2api-wake/log`. Proven both ways 2026-11-05: this thread posted into the watch thread, the watch ran
+`wake-flow2api` and its message arrived here (11:56Z). The watch's README (`/home/cc/fleet-guard/README.md`) names it.
+
 ## On the host
 | What | Where |
 |---|---|
@@ -36,10 +43,12 @@ app's server: `ELECTRON_RUN_AS_NODE=1 "/Applications/T3 Code (Nightly).app/Conte
 
 ## Install / update
 ```
+ssh root@78.46.131.169 'install -d -m 755 /usr/local/lib/flow2api-alert-wake && install -d -m 700 /etc/flow2api-alert-wake'   # the lib folder must stay readable for cc
 scp docker/alert-wake/flow2api-alert-wake.sh root@78.46.131.169:/usr/local/bin/flow2api-alert-wake
 scp docker/alert-wake/t3-post.mjs root@78.46.131.169:/usr/local/lib/flow2api-alert-wake/t3-post.mjs
 scp docker/alert-wake/flow2api-alert-wake.{service,timer} root@78.46.131.169:/etc/systemd/system/
-ssh root@78.46.131.169 'chmod 755 /usr/local/bin/flow2api-alert-wake && systemctl daemon-reload && systemctl enable --now flow2api-alert-wake.timer'
+scp docker/alert-wake/wake-flow2api root@78.46.131.169:/usr/local/bin/wake-flow2api
+ssh root@78.46.131.169 'chmod 755 /usr/local/bin/flow2api-alert-wake /usr/local/bin/wake-flow2api /usr/local/lib/flow2api-alert-wake && systemctl daemon-reload && systemctl enable --now flow2api-alert-wake.timer'
 ```
 If the flow2api thread moves (a new Mac, a new thread), change `MAC_ORIGIN` / `MAC_THREAD` and issue a new
 `mac.token` on that machine.

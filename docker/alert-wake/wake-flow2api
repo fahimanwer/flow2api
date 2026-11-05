@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# wake-flow2api — post a message into the flow2api T3 thread on the owner's Mac from the CC box (2026-11-05).
+# For the fleet-guard watch (user cc): it can hand a flow2api problem straight to the flow2api session, which wakes
+# even when idle or settled. Same poster as flow2api-alert-wake (/usr/local/lib/flow2api-alert-wake/t3-post.mjs).
+# Usage: wake-flow2api "text"   (or the text on stdin)   -> prints SENT <seq> | FAILED <why>
+# Config (cc, 0600): ~/.flow2api-wake/env (MAC_ORIGIN, MAC_THREAD) and ~/.flow2api-wake/mac.token
+#   (T3 bearer issued on the Mac, label fleet-guard-wake-flow2api, 365 d). Log: ~/.flow2api-wake/log
+set -uo pipefail
+D=${WAKE_FLOW2API_DIR:-$HOME/.flow2api-wake}
+# shellcheck disable=SC1091
+. "$D/env"
+if [ $# -gt 0 ]; then text="$*"; else text=$(cat); fi
+[ -n "$text" ] || { echo "FAILED empty message"; exit 1; }
+out=$(printf '[from the CC box, %s] %s\n' "$(id -un)" "$text" \
+  | timeout 30 node /usr/local/lib/flow2api-alert-wake/t3-post.mjs "$MAC_ORIGIN" "$D/mac.token" "$MAC_THREAD" 2>&1 | tail -1)
+echo "$(date -u +%FT%TZ) $out" >> "$D/log"
+echo "$out"
+case "$out" in SENT*) exit 0;; *) exit 1;; esac
