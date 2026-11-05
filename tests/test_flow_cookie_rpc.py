@@ -375,7 +375,7 @@ def test_fleet_watch_needs_a_success_to_report_recovery():
 
     pages = []
     watch = FleetWatch(db=None)
-    numbers = iter([(20, 0, 5), (0, 0, 5), (3, 1, 5)])
+    numbers = iter([(20, 0, 5, 20, 0), (0, 0, 5, 20, 0), (3, 1, 5, 23, 1)])
 
     async def fake_numbers():
         return next(numbers)
@@ -388,6 +388,37 @@ def test_fleet_watch_needs_a_success_to_report_recovery():
     asyncio.run(watch.check_once())   # quiet: stays down, no "recovered"
     asyncio.run(watch.check_once())   # a real success -> recovered
     assert pages == ["fleet_down", "fleet_ok"]
+
+
+def test_fleet_watch_degraded_pages_and_needs_70_percent_to_recover():
+    import asyncio
+    from src.services.fleet_watch import FleetWatch
+
+    assert FleetWatch.diagnose(total=10, ok=3, active=5, hour_total=40, hour_ok=10)[0] == "fleet_degraded"
+    assert FleetWatch.diagnose(total=10, ok=6, active=5, hour_total=40, hour_ok=24) is None    # 60 %: fine
+    assert FleetWatch.diagnose(total=10, ok=3, active=5, hour_total=20, hour_ok=2) is None     # too few to judge
+
+    pages = []
+    watch = FleetWatch(db=None)
+    numbers = iter([
+        (10, 3, 5, 40, 10),   # 25 % of the hour -> degraded page
+        (10, 6, 5, 40, 24),   # 60 %: below 70 %, stays degraded, no new page
+        (2, 1, 5, 12, 6),     # too quiet to judge: stays degraded, silently
+        (10, 0, 5, 40, 20),   # 0 of 10 in 15 min -> down page right away
+        (10, 6, 5, 40, 24),   # some success again; 60 % is still below 70 % after a degraded spell -> degraded page
+        (10, 9, 5, 40, 30),   # 75 % -> recovered
+    ])
+
+    async def fake_numbers():
+        return next(numbers)
+
+    async def fake_page(kind, text):
+        pages.append(kind)
+
+    watch._numbers, watch._page = fake_numbers, fake_page
+    for _ in range(6):
+        asyncio.run(watch.check_once())
+    assert pages == ["fleet_degraded", "fleet_down", "fleet_degraded", "fleet_ok"]
 
 
 def test_signed_in_page_without_account_field_is_transient():

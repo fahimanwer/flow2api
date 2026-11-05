@@ -1,0 +1,8 @@
+[Unit]
+Description=flow2api-alert-wake: post new flow2api problem alerts into the flow2api T3 thread
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/flow2api-alert-wake
+TimeoutStartSec=120
