@@ -88,6 +88,11 @@ Code: `src/services/flow_cookie_session.py` (login + transport), `src/services/f
 6. **Tier** is never guessed: the stored tier wins; a new row takes Flow's 2nd credits number
    (1 = Pro, 2 = Ultra, matching every account seen on 2026-10-23).
 7. There is no switch back; the Labs path was deleted (2026-11, stage 2).
+8. **New accounts come only from a push** (stage 2 step 4, 2026-11-05). The admin page has no Add
+   button and `POST /api/tokens` is gone; the edit form shows the row key read-only (a changed key
+   is refused with 400); Import updates only accounts the server already has (an unknown one is
+   listed as failed, with no Google call); `POST /api/tokens/st2at` checks that a row's stored login
+   still signs in to Flow and writes nothing.
 
 Not on the new API yet (clear 501, never an account strike): Flow Characters, stitching an
 extended video.

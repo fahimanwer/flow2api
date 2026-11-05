@@ -132,28 +132,8 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class AddTokenRequest(BaseModel):
-    st: str
-    project_id: Optional[str] = None  # Optional user-supplied project_id
-    project_name: Optional[str] = None
-    remark: Optional[str] = None
-    captcha_proxy_url: Optional[str] = None
-    extension_route_key: Optional[str] = None
-    image_enabled: bool = True
-    video_enabled: bool = True
-    image_concurrency: int = -1
-    video_concurrency: int = -1
-    protocol_mode: str = "session"
-    google_cookies: Optional[str] = None
-    login_account: Optional[str] = None
-    login_password: Optional[str] = None
-    proxy_url: Optional[str] = None
-    auto_refresh_enabled: bool = True
-    refresh_interval_minutes: int = 120
-
-
 class UpdateTokenRequest(BaseModel):
-    st: Optional[str] = ""  # Session Token; since 2026-10-23 only the row key (keep it = plain edit, no Google login)
+    st: Optional[str] = ""  # the row key; it cannot be changed here (empty or the same value = plain edit)
     project_id: Optional[str] = None  # Optional user-supplied project_id
     project_name: Optional[str] = None
     remark: Optional[str] = None
@@ -224,7 +204,7 @@ class UpdateAdminConfigRequest(BaseModel):
 
 
 class ST2ATRequest(BaseModel):
-    """ST-to-AT request"""
+    """Login probe for an existing row: its key (`st`)"""
     st: str
 
 
@@ -387,8 +367,8 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
 
     return [{
         "id": row.get("id"),
-        "st": row.get("st"),  # Session Token for editing
-        "at": row.get("at"),  # Access Token for editing (converted from ST)
+        "st": row.get("st"),  # row key, shown read-only in the editor
+        "at": row.get("at"),  # FLOWCK. session handle
         "at_expires": to_iso(row.get("at_expires")) if row.get("at_expires") else None,  # AT expiry time
         "at_expired": bool(normalize_dt(row.get("at_expires")) and normalize_dt(row.get("at_expires")) <= now),
         "at_expiring_within_1h": bool(
@@ -514,92 +494,28 @@ async def _compute_skip_reasons(token_rows, now) -> Dict[int, Dict[str, Any]]:
     return reasons
 
 
-@router.post("/api/tokens")
-async def add_token(
-    request: AddTokenRequest,
-    token: str = Depends(verify_admin_token)
-):
-    """Add a new token"""
-    try:
-        new_token = await token_manager.add_token(
-            st=request.st,
-            project_id=request.project_id,  # User may specify project_id
-            project_name=request.project_name,
-            remark=request.remark,
-            captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
-            extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
-            image_enabled=request.image_enabled,
-            video_enabled=request.video_enabled,
-            image_concurrency=request.image_concurrency,
-            video_concurrency=request.video_concurrency,
-            protocol_mode=request.protocol_mode,
-            google_cookies=request.google_cookies,
-            login_account=request.login_account,
-            login_password=request.login_password,
-            proxy_url=request.proxy_url,
-            auto_refresh_enabled=request.auto_refresh_enabled,
-            refresh_interval_minutes=request.refresh_interval_minutes
-        )
-
-        # Hot-reload concurrency limits so no restart is needed
-        if concurrency_manager:
-            await concurrency_manager.reset_token(
-                new_token.id,
-                image_concurrency=new_token.image_concurrency,
-                video_concurrency=new_token.video_concurrency
-            )
-
-        return {
-            "success": True,
-            "message": "Token added",
-            "token": {
-                "id": new_token.id,
-                "email": new_token.email,
-                "credits": new_token.credits,
-                "project_id": new_token.current_project_id,
-                "project_name": new_token.current_project_name
-            }
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to add token: {str(e)}")
-
-
 @router.put("/api/tokens/{token_id}")
 async def update_token(
     token_id: int,
     request: UpdateTokenRequest,
     token: str = Depends(verify_admin_token)
 ):
-    """Update token - auto-refresh AT from ST"""
+    """Edit a token's settings. The row key (`st`) cannot be changed: accounts sign in with the
+    Google cookies their worker browser pushes (docs/cookie-sync.md), so a pasted key proves nothing."""
     try:
         existing = await token_manager.get_token(token_id)
         if existing is None:
             raise HTTPException(status_code=404, detail=f"Token {token_id} not found")
         st_in = (request.st or "").strip()
-        # Cookie sessions (2026-10-23): the ST is only the row's key now. A save that keeps it is a plain
-        # field edit and must not need a working Google login (an account whose cookies went stale is
-        # exactly the one you want to edit). A changed ST still goes through the login as before.
-        plain_edit = (not st_in or st_in == (existing.st or ""))
-        at = at_expires = None
-        if not plain_edit:
-            result = await token_manager.flow_client.st_to_at(st_in)
-            at = result["access_token"]
-            expires = result.get("expires")
-            from datetime import datetime
-            if expires:
-                try:
-                    at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-                except Exception:
-                    pass
+        if st_in and st_in != (existing.st or ""):
+            raise HTTPException(
+                status_code=400,
+                detail="The row key cannot be changed; re-login happens through the worker browser",
+            )
 
-        # Update token (AT, ST, AT expiry, project_id and project_name); None = unchanged
+        # None = unchanged
         await token_manager.update_token(
             token_id=token_id,
-            st=(None if plain_edit else st_in),
-            at=at,
-            at_expires=at_expires,  # Update AT expiry time
             project_id=request.project_id,
             project_name=request.project_name,
             remark=request.remark,
@@ -692,9 +608,9 @@ async def refresh_at(
     token_id: int,
     token: str = Depends(verify_admin_token)
 ):
-    """Manually refresh a token's AT (converted from ST)
+    """Manually re-sign a token in to Flow with its stored Google cookies (a new session handle).
 
-    If the ST has expired, it tries an ST refresh (protocol login, else the worker extension)
+    If that login fails, the account's worker browser is asked to push fresh cookies.
     """
     from ..core.logger import debug_logger
     from ..core.config import config
@@ -706,17 +622,17 @@ async def refresh_at(
     # can safely retry / re-supply credentials without losing the row.
     reason_messages = {
         "st_expired": (
-            "Session Token expired or invalid — supply a fresh ST "
-            "(re-login in the worker browser or paste a new ST). "
-            "This fails in any captcha mode; the token was not disabled."
+            "The stored Google login no longer signs in — reconnect the worker browser so it "
+            "pushes fresh cookies (sign out of Google there and back in if needed). "
+            "The token was not disabled."
         ),
         "network": (
-            "Network or proxy error reaching Google Labs while refreshing — "
+            "Network or proxy error reaching Google while refreshing — "
             "check proxy/connection and retry. The token was not disabled."
         ),
         "st_refresh_unavailable": (
-            "The backend cannot auto-refresh the ST in this mode — supply a fresh "
-            "ST or trigger the extension push. The token was not disabled."
+            "The server cannot re-sign this account in by itself — reconnect the worker "
+            "browser so it pushes fresh cookies. The token was not disabled."
         ),
     }
 
@@ -760,10 +676,10 @@ async def set_token_route_key(
     request: dict,
     token: str = Depends(verify_admin_token)
 ):
-    """Bind/unbind a token to a browser extension Route Key (metadata only, no valid ST needed).
+    """Bind/unbind a token to a browser extension Route Key (metadata only, no Google login).
 
     Used to target on-demand session refresh. Empty means unbind (NULL). Deliberately not via PUT /api/tokens/{id}
-    (that path forces st_to_at, so rows with an expired ST could not be bound).
+    (that path cannot write NULL: token_manager.update_token treats None as "unchanged").
     """
     from ..core.logger import debug_logger
 
@@ -794,7 +710,7 @@ async def refresh_session_via_extension(
     token_id: int,
     token: str = Depends(verify_admin_token)
 ):
-    """On-demand Google Labs session refresh: tell the worker browser bound to this account to read live cookies and push a new ST.
+    """On-demand session refresh: tell the worker browser bound to this account to push its live Google cookies now.
 
     Works only while that browser is still logged in; a logged-out/expired session cannot be recovered by any command
     (a human must log in again in that browser). The result is reported honestly via status, never a false "refreshed".
@@ -826,7 +742,7 @@ async def refresh_session_via_extension(
             "Token not disabled."
         ),
         "logged_out": (
-            "Target browser is logged OUT of Google Labs — a human must re-login there, then retry. "
+            "Target browser is logged OUT of Google — a human must sign in there again, then retry. "
             "No command can refresh a logged-out session. Token not disabled."
         ),
         "busy": (
@@ -836,7 +752,7 @@ async def refresh_session_via_extension(
             "Timed out waiting for the browser (busy, or its service worker slept) — retry. Token not disabled."
         ),
         "network": (
-            "Network/proxy or server error pushing the new ST — check and retry. Token not disabled."
+            "Network/proxy or server error pushing the new cookies — check and retry. Token not disabled."
         ),
         "not_configured": (
             "The worker extension is missing its Server URL / Connection Token."
@@ -1001,12 +917,14 @@ async def st_to_at(
     request: ST2ATRequest,
     token: str = Depends(verify_admin_token)
 ):
-    """Convert Session Token to Access Token (convert only, not saved to the database)"""
+    """Check that a row's stored Google login still signs in to Flow (give the row's `st`); nothing is written.
+
+    An unknown key has no stored cookies and answers 400."""
     try:
         result = await token_manager.flow_client.st_to_at(request.st)
         return {
             "success": True,
-            "message": "ST converted to AT successfully",
+            "message": "The stored Google login signed in to Flow",
             "access_token": result["access_token"],
             "email": result.get("user", {}).get("email"),
             "expires": result.get("expires")
@@ -1015,20 +933,27 @@ async def st_to_at(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+def _import_not_in_database(idx: int, email: Optional[str]) -> str:
+    return f"Item {idx+1}: {email or 'unknown email'} is not in the database; new accounts come from the worker extension"
+
+
 @router.post("/api/tokens/import")
 async def import_tokens(
     request: ImportTokensRequest,
     token: str = Depends(verify_admin_token)
 ):
-    """Bulk import tokens"""
+    """Bulk import: updates the settings of accounts this server already has (matched by the export's
+    email or row key). New accounts come only from the worker extension's push, so an unknown item is
+    reported in `errors` without any Google login."""
     from datetime import datetime, timezone
 
-    added = 0
     updated = 0
     errors = []
+    all_tokens = await token_manager.get_all_tokens()
+    known_keys = {t.st for t in all_tokens if t.st}
     # Match legacy behavior: in created_at DESC order, the newest row for the same email wins
     existing_by_email = {}
-    for existing_token in await token_manager.get_all_tokens():
+    for existing_token in all_tokens:
         if existing_token.email and existing_token.email not in existing_by_email:
             existing_by_email[existing_token.email] = existing_token
 
@@ -1040,7 +965,11 @@ async def import_tokens(
                 errors.append(f"Item {idx+1}: missing session_token")
                 continue
 
-            # Convert ST to AT to get user info
+            if not ((item.email and item.email in existing_by_email) or st in known_keys):
+                errors.append(_import_not_in_database(idx, item.email))
+                continue
+
+            # Sign in with the row's stored Google login (looked up by its key) to get the email
             try:
                 result = await token_manager.flow_client.st_to_at(st)
                 at = result["access_token"]
@@ -1109,31 +1038,7 @@ async def import_tokens(
                     existing.refresh_interval_minutes = item.refresh_interval_minutes
                     updated += 1
                 else:
-                    # Add new token
-                    new_token = await token_manager.add_token(
-                        st=st,
-                        captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
-                        extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
-                        image_enabled=item.image_enabled,
-                        video_enabled=item.video_enabled,
-                        image_concurrency=item.image_concurrency,
-                        video_concurrency=item.video_concurrency,
-                        protocol_mode=item.protocol_mode or "session",
-                        google_cookies=item.google_cookies,
-                        login_account=item.login_account,
-                        login_password=item.login_password,
-                        proxy_url=item.proxy_url,
-                        # Import fields are None when absent from the file — for a brand-new
-                        # token coalesce to the normal add-time defaults.
-                        auto_refresh_enabled=True if item.auto_refresh_enabled is None else item.auto_refresh_enabled,
-                        refresh_interval_minutes=item.refresh_interval_minutes or 120
-                    )
-                    # Disable if expired
-                    if is_expired:
-                        await token_manager.disable_token(new_token.id)
-                        new_token.is_active = False
-                    existing_by_email[email] = new_token
-                    added += 1
+                    errors.append(_import_not_in_database(idx, email))
 
             except Exception as e:
                 errors.append(f"Item {idx+1}: {str(e)}")
@@ -1143,10 +1048,9 @@ async def import_tokens(
 
     return {
         "success": True,
-        "added": added,
         "updated": updated,
         "errors": errors if errors else None,
-        "message": f"Import done: {added} added, {updated} updated" + (f", {len(errors)} failed" if errors else "")
+        "message": f"Import done: {updated} updated" + (f", {len(errors)} failed" if errors else "")
     }
 
 
@@ -2173,7 +2077,7 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
     cookie_seq = _parse_cookie_sync_seq(request.get("cookie_sync_seq"))
 
     if not session_token and not google_cookies:
-        raise HTTPException(status_code=400, detail="Missing session_token")
+        raise HTTPException(status_code=400, detail="Missing google_cookies (worker extension 3.7.0+ required)")
 
     # Optional explicit attribution for admin-triggered on-demand refresh. When
     # absent (autonomous extension pushes), we fall back to email matching below.
@@ -2233,8 +2137,10 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
         derived_from_cookies = True
         return (bound_row.st if bound_row else "") or ""
 
-    # Step 1: Convert ST to AT to get user info (including email). A dead pushed ST is
-    # replaced by one derived from the cookies when the worker sent them.
+    # Step 1: sign in to Flow (st_to_at; with pushed cookies it logs in with the hint set above) to get the
+    # session handle and the email. When the pushed ST is refused and cookies came with it, a still-valid
+    # stored session is reused, else the bound row's key (or "" when the push names no row) is validated
+    # instead, so the cookies sign in.
     async def _validate(st_value: str):
         result = await token_manager.flow_client.st_to_at(st_value)
         at = result["access_token"]
@@ -2294,7 +2200,7 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
         raise
     except Exception as e:
         if not _is_dead_session_error(e):
-            # Google/Labs unreachable: not a verdict on the session. The worker retries.
+            # Google unreachable: not a verdict on the session. The worker retries.
             raise HTTPException(status_code=503, detail=f"Could not verify session with Google ({str(e)[:120]}); retry")
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
 
@@ -2375,20 +2281,12 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                         debug_logger.log_info(f"[COOKIE_SYNC] token={existing_token.id} stored session still valid; no Google login needed")
                         outcome = reused_outcome
                     else:
-                        try:
-                            session_token = await _derive_st_from_cookies()
-                        except HTTPException:
-                            if outcome.reason == "st_expired":
-                                raise
-                            # at_stale: the push still proved the account, so the cookie
-                            # backup is stored below and the healer retries the login later.
-                            debug_logger.log_info(f"[COOKIE_SYNC] token={existing_token.id} at_stale and the cookie login failed now; cookies kept for the healer")
-                        else:
-                            outcome = await token_manager.validate_and_promote(
-                                existing_token.id, session_token, source="plugin_push_cookies",
-                                push_route_key=reported_route_key or "",
-                                **({"cookie_seq": cookie_seq} if cookie_mode else {}),
-                            )
+                        session_token = await _derive_st_from_cookies()
+                        outcome = await token_manager.validate_and_promote(
+                            existing_token.id, session_token, source="plugin_push_cookies",
+                            push_route_key=reported_route_key or "",
+                            **({"cookie_seq": cookie_seq} if cookie_mode else {}),
+                        )
             if not outcome.success and outcome.reason == "st_expired":
                 raise HTTPException(status_code=400, detail="Invalid session token (expired)")
             if not outcome.success and outcome.reason == "account_mismatch":
@@ -2467,7 +2365,7 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                 )
                 return {
                     "success": True,
-                    "message": f"Google is no longer renewing this account's access token — sign out of Google Labs and back in, then Reconnect ({email})",
+                    "message": f"Google is no longer renewing this account's access token — sign out of Google in that browser and back in, then Reconnect ({email})",
                     "action": "relogin_required" if ext_supports_relogin else "updated",
                     "token_id": existing_token.id,
                     "cookie_sync": cookie_sync,
@@ -2583,7 +2481,7 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
                 )
                 return {
                     "success": True,
-                    "message": f"Account added but Google is not renewing its access token — sign out of Google Labs and back in, then Reconnect ({new_token.email})",
+                    "message": f"Account added but Google is not renewing its access token — sign out of Google in that browser and back in, then Reconnect ({new_token.email})",
                     "action": "relogin_required" if ext_supports_relogin else "added",
                     "token_id": new_token.id,
                     "cookie_sync": cookie_sync,
@@ -2619,8 +2517,8 @@ def _cookie_recovery_lock(token_id: int) -> asyncio.Lock:
 
 
 def _is_dead_session_error(error: Exception) -> bool:
-    """A Labs answer that means "this session token is dead" (401/UNAUTHENTICATED, or a
-    200 without access_token/email) — as opposed to a transport failure, which must never
+    """A sign-in answer that means "this account's login is dead" (401/UNAUTHENTICATED, or a
+    result without access_token/email) — as opposed to a transport failure, which must never
     start a Google login replay."""
     if token_manager is not None:
         try:
@@ -2714,7 +2612,7 @@ async def _apply_cookie_sync(token_row, google_cookies: Optional[str], cookie_se
 @router.post("/api/plugin/cookie-sync")
 async def plugin_cookie_sync(request: dict, authorization: Optional[str] = Header(None)):
     """Cookie-sync control that needs NO Google round-trip: the worker's OFF switch must
-    delete the server copy even when its Labs login is broken or Google is down.
+    delete the server copy even when its Flow login is broken or Google is down.
     Body: {"action": "clear", "token_id": <bound id>, "cookie_sync_seq": <int>}."""
     await _verify_plugin_connection_token(authorization)
     action = str(request.get("action") or "").strip().lower()
