@@ -62,11 +62,6 @@ class Config:
 
     # Flow2API specific properties
     @property
-    def flow_labs_base_url(self) -> str:
-        """Google Labs base URL for project management"""
-        return self._config["flow"]["labs_base_url"]
-
-    @property
     def flow_api_base_url(self) -> str:
         """Google AI Sandbox API base URL for generation"""
         return self._config["flow"]["api_base_url"]

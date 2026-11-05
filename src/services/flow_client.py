@@ -7,13 +7,8 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import random
 import base64
-import gzip
-import ssl
 import re
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
-from urllib.parse import urlparse
-import urllib.error
-import urllib.request
 from curl_cffi.requests import AsyncSession
 from ..core.logger import debug_logger, mask_proxy_url
 from ..core.config import config
@@ -78,31 +73,10 @@ class FlowPhotoRefusedError(Exception):
         return {"code": "photo_refused_by_google", "google_reason": self.reason, **more}
 
 
-def flow_api_error_from_body(status_code: int, body_text: str) -> FlowAPIError:
-    """FlowAPIError for the urllib path: "HTTP Error <n>: <reason>: <message>" with the
-    structured reason set. The reason is read from the FULL body: cutting it to 200 characters first split
-    PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD in half (Codex review, 2026-10-11)."""
-    reason, message = "", ""
-    try:
-        info = json.loads(body_text).get("error")
-        if isinstance(info, dict):
-            message = str(info.get("message") or "")
-            for detail in info.get("details") or []:
-                if isinstance(detail, dict) and detail.get("reason"):
-                    reason = str(detail["reason"])
-                    break
-    except Exception:
-        pass
-    if reason:
-        # Keep the "HTTP Error <n>" prefix: _get_retry_reason matches 500/403/429 on it.
-        return FlowAPIError(status_code, f"HTTP Error {status_code}: {reason}: {message}".rstrip(": "), reason)
-    return FlowAPIError(status_code, f"HTTP Error {status_code}: {body_text[:200]}")
-
-
 def photo_refusal_reason(error: BaseException) -> Optional[str]:
     """The Google reason when `error` is a 4xx content refusal of an upload, else None.
-    The structured reason is preferred; the text is the fallback for the urllib path,
-    whose FlowAPIError carries only the raw body."""
+    The structured reason is preferred; the text is a defensive fallback for an error that
+    carries Google's reason only in its message (the urllib path that made those is gone)."""
     if not isinstance(error, FlowAPIError) or not 400 <= int(error.status_code or 0) < 500:
         return None
     reason = (error.reason or "").upper()
@@ -138,19 +112,11 @@ UPSAMPLE_NO_RETRY_KINDS = ("quota", "access", "traffic", "refused")
 class FlowClient:
     """VideoFX API client"""
 
-    FLOW_BROWSER_CHANNEL_HEADER = "stable"
-    FLOW_BROWSER_COPYRIGHT_HEADER = "Copyright 2026 Google LLC. All Rights Reserved."
-    FLOW_BROWSER_VALIDATION_HEADER = "MRCPrt/rS3JY47x2Yiz9h3ag4U8="
-    FLOW_BROWSER_YEAR_HEADER = "2026"
-
     def __init__(self, proxy_manager, db=None):
         self.proxy_manager = proxy_manager
         self.db = db  # Database instance for captcha config
-        self.labs_base_url = config.flow_labs_base_url  # https://labs.google/fx/api
         self.api_base_url = config.flow_api_base_url    # https://aisandbox-pa.googleapis.com/v1
         self.timeout = config.flow_timeout
-        # Cached User-Agent per account
-        self._user_agent_cache = {}
         # Browser fingerprint bound to the current request (contextvar, so concurrent requests do not mix)
         self._request_fingerprint_ctx: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
             "flow_request_fingerprint",
@@ -181,54 +147,8 @@ class FlowClient:
         self._cookie_token_ctx: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
             "flow_cookie_token", default=None
         )
-
-        # Minimal browser-style headers only (what current Flow upstream still expects).
-        # UA / Accept-Language / UA-CH all come from the runtime fingerprint bound to
-        # the request chain (extension-reported real browser), not a random platform.
-        self._default_client_headers = {
-            "sec-ch-ua-mobile": "?0",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-        }
         # Dispatch policy is "send as soon as requested":
         # no local batching or queuing of submits, so a burst is not staggered into steps.
-
-
-    def _generate_user_agent(self, account_id: str = None) -> str:
-        """Build a stable User-Agent from the account ID
-        
-        Args:
-            account_id: account key (e.g. email or token_id); same account gets the same UA
-            
-        Returns:
-            User-Agent string
-        """
-        # No account ID: return a random UA
-        if not account_id:
-            account_id = f"random_{random.randint(1, 999999)}"
-        
-        # Return the cached value if present
-        if account_id in self._user_agent_cache:
-            return self._user_agent_cache[account_id]
-        
-        # Seed the RNG with the account ID so the same account always gets the same UA
-        import hashlib
-        seed = int(hashlib.md5(account_id.encode()).hexdigest()[:8], 16)
-        rng = random.Random(seed)
-        
-        # Fallback only when there is no runtime fingerprint; matches current upstream Windows Chrome style
-        chrome_versions = ["149.0.0.0"]
-        ch_version = rng.choice(chrome_versions)
-        user_agent = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{ch_version} Safari/537.36"
-        )
-        
-        # Cache the result
-        self._user_agent_cache[account_id] = user_agent
-        
-        return user_agent
 
     def _set_request_fingerprint(self, fingerprint: Optional[Dict[str, Any]]):
         """Set the browser fingerprint for the current request."""
@@ -276,580 +196,47 @@ class FlowClient:
         """Clear the browser fingerprint bound to the current request."""
         self._set_request_fingerprint(None)
 
-    def _get_primary_accept_language(self, fallback: str = "en-US,en;q=0.9") -> str:
-        fingerprint = self.get_request_fingerprint()
-        if isinstance(fingerprint, dict):
-            accept_language = str(fingerprint.get("accept_language") or "").strip()
-            if accept_language:
-                return self._normalize_accept_language_header(accept_language, fallback=fallback)
-        return self._normalize_accept_language_header(fallback, fallback=fallback)
-
-    def _infer_sec_ch_ua_from_user_agent(self, user_agent: Optional[str]) -> str:
-        ua = str(user_agent or "").strip()
-        if not ua:
-            return ""
-        import re
-        match = re.search(r"(?:Chrome|Chromium)/(\d+)", ua, re.IGNORECASE)
-        major = match.group(1) if match else "124"
-        return f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not)A;Brand";v="24"'
-
-    def _normalize_sec_ch_ua_header(
-        self,
-        sec_ch_ua: Optional[str],
-        *,
-        user_agent: Optional[str] = None,
-    ) -> str:
-        raw = str(sec_ch_ua or "").strip()
-        inferred = self._infer_sec_ch_ua_from_user_agent(user_agent)
-        if not raw:
-            return inferred
-        ua_text = str(user_agent or "").lower()
-        if "chrome/" in ua_text and "google chrome" not in raw.lower():
-            return inferred
-        return raw or inferred
-
-    def _build_fingerprint_from_user_agent(
-        self,
-        user_agent: Optional[str],
-        *,
-        accept_language: Optional[str] = None,
-        proxy_url: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        ua = str(user_agent or "").strip()
-        if not ua:
-            return {}
-        ua_lower = ua.lower()
-        platform = '"Windows"'
-        mobile = "?0"
-        if "android" in ua_lower:
-            platform = '"Android"'
-            mobile = "?1"
-        elif "iphone" in ua_lower or "ipad" in ua_lower or "ios" in ua_lower:
-            platform = '"iOS"'
-            mobile = "?1"
-        elif "mac" in ua_lower:
-            platform = '"macOS"'
-        elif "linux" in ua_lower or "x11" in ua_lower:
-            platform = '"Linux"'
-        fingerprint: Dict[str, Any] = {
-            "user_agent": ua,
-            "sec_ch_ua": self._infer_sec_ch_ua_from_user_agent(ua),
-            "sec_ch_ua_mobile": mobile,
-            "sec_ch_ua_platform": platform,
-        }
-        normalized_accept_language = self._normalize_accept_language_header(accept_language)
-        if normalized_accept_language:
-            fingerprint["accept_language"] = normalized_accept_language
-        if proxy_url:
-            fingerprint["proxy_url"] = proxy_url
-        return fingerprint
-
-    def _normalize_accept_language_header(
-        self,
-        accept_language: Optional[str],
-        fallback: str = "en-US,en;q=0.9",
-    ) -> str:
-        raw = str(accept_language or "").strip()
-        if not raw:
-            return fallback
-        if "," in raw:
-            normalized_parts: list[str] = []
-            for index, item in enumerate(raw.split(",")):
-                candidate = str(item or "").strip()
-                if not candidate:
-                    continue
-                language = candidate.split(";", 1)[0].strip()
-                if not language:
-                    continue
-                if index == 0:
-                    normalized_parts.append(language)
-                    continue
-                q_match = re.search(r";\s*q=([0-9.]+)", candidate, re.IGNORECASE)
-                q_value = q_match.group(1) if q_match else f"{max(0.1, 1 - (index * 0.1)):.1f}"
-                normalized_parts.append(f"{language};q={q_value}")
-            if normalized_parts:
-                return ",".join(normalized_parts)
-            return fallback
-        if "-" in raw:
-            primary = raw.split("-", 1)[0].strip()
-            if len(primary) == 2 and primary.isalpha():
-                return f"{raw},{primary};q=0.9"
-        return raw
-
-    def _get_effective_request_user_agent(self, account_id: Optional[str] = None) -> str:
-        fingerprint = self.get_request_fingerprint()
-        if isinstance(fingerprint, dict):
-            user_agent = str(fingerprint.get("user_agent") or "").strip()
-            if user_agent:
-                return user_agent
-        return self._generate_user_agent(account_id)
-
-    @staticmethod
-    def _should_attach_runtime_session_cookies(url: str) -> bool:
-        host = str(urlparse(str(url or "")).hostname or "").lower()
-        if not host:
-            return False
-        return any(
-            host == candidate or host.endswith(f".{candidate}")
-            for candidate in (
-                "google.com",
-                "googleapis.com",
-                "labs.google",
-                "recaptcha.net",
-            )
-        )
-
-    @staticmethod
-    def _merge_cookie_header(
-        existing_cookie_header: Optional[str],
-        extra_cookies: Optional[Dict[str, Any]],
-    ) -> Optional[str]:
-        cookie_items: Dict[str, str] = {}
-        raw_existing = str(existing_cookie_header or "").strip()
-        if raw_existing:
-            for part in raw_existing.split(";"):
-                item = str(part or "").strip()
-                if not item or "=" not in item:
-                    continue
-                key, value = item.split("=", 1)
-                key = str(key or "").strip()
-                value = str(value or "").strip()
-                if key:
-                    cookie_items[key] = value
-
-        if isinstance(extra_cookies, dict):
-            for key, value in extra_cookies.items():
-                normalized_key = str(key or "").strip()
-                normalized_value = str(value or "").strip()
-                if normalized_key and normalized_value and normalized_key not in cookie_items:
-                    cookie_items[normalized_key] = normalized_value
-
-        if not cookie_items:
-            return raw_existing or None
-        return "; ".join(f"{key}={value}" for key, value in cookie_items.items())
-
-    def _build_flow_project_page_url(self, project_id: str) -> str:
-        return f"https://labs.google/fx/tools/flow/project/{project_id}"
-
-    def _build_current_flow_media_headers(
-        self,
-        *,
-        content_type: str = "application/json",
-    ) -> Dict[str, str]:
-        headers = {
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": self._get_primary_accept_language(fallback="en-US,en;q=0.9"),
-            "Content-Type": content_type,
-            "Origin": "https://labs.google",
-            "Priority": "u=1, i",
-            "Referer": "https://labs.google/",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-            "sec-fetch-storage-access": "active",
-        }
-        headers.setdefault("x-browser-channel", self.FLOW_BROWSER_CHANNEL_HEADER)
-        headers.setdefault("x-browser-copyright", self.FLOW_BROWSER_COPYRIGHT_HEADER)
-        headers.setdefault("x-browser-validation", self.FLOW_BROWSER_VALIDATION_HEADER)
-        headers.setdefault("x-browser-year", self.FLOW_BROWSER_YEAR_HEADER)
-        return headers
-
-    def _build_labs_request_context_headers(self, project_id: Optional[str]) -> Dict[str, str]:
-        return self._build_current_flow_media_headers()
-
     def _compact_json_dumps(self, payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-    @staticmethod
-    def _extract_project_id_from_request_payload(payload: Optional[Dict[str, Any]]) -> Optional[str]:
-        if not isinstance(payload, dict):
-            return None
-        client_context = payload.get("clientContext")
-        if isinstance(client_context, dict):
-            project_id = str(client_context.get("projectId") or "").strip()
-            if project_id:
-                return project_id
-        requests = payload.get("requests")
-        if isinstance(requests, list):
-            for item in requests:
-                if not isinstance(item, dict):
-                    continue
-                item_client_context = item.get("clientContext")
-                if not isinstance(item_client_context, dict):
-                    continue
-                project_id = str(item_client_context.get("projectId") or "").strip()
-                if project_id:
-                    return project_id
-        return None
 
     async def _make_request(
         self,
         method: str,
         url: str,
-        headers: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
         raw_body: Optional[Union[str, bytes]] = None,
-        use_st: bool = False,
-        st_token: Optional[str] = None,
         use_at: bool = False,
         at_token: Optional[str] = None,
         timeout: Optional[int] = None,
-        use_media_proxy: bool = False,
         respect_fingerprint_proxy: bool = True,
-        force_no_proxy: bool = False,
-        allow_urllib_fallback: bool = True,
-        apply_default_client_headers: bool = True,
-        impersonate: str = "chrome124",
     ) -> Dict[str, Any]:
-        """Shared HTTP request handler"""
+        """The transport seam: every aisandbox-style REST call our code builds goes out as the matching
+        flow.google.com RPC (cookie sessions, 2026-10-23). The REST/Labs transport was deleted in stage 2
+        (2026-11); an account without a cookie session gets a 401 here, which starts its refresh."""
+        if not (use_at and flow_ck.is_session_handle(at_token)):
+            raise FlowAPIError(
+                401,
+                "UNAUTHENTICATED: this account has no Flow cookie session yet (its access token is not a FLOWCK handle); refreshing",
+                "UNAUTHENTICATED",
+            )
+        if not url.startswith(self.api_base_url):
+            raise FlowAPIError(501, f"Not supported on the new Flow API: {method.upper()} {url}", "COOKIE_MODE_UNSUPPORTED")
+        # Run the call as a flow.google.com RPC through the captcha fingerprint's proxy (the mint's egress), else the
+        # account's own proxy. Never the global/media proxy: the cookie login lives on the account IP.
         fingerprint = self._request_fingerprint_ctx.get()
-
-        if use_at and flow_ck.is_session_handle(at_token) and url.startswith(self.api_base_url):
-            # Cookie session (2026-10-23): the REST endpoint is gone for us; run the same call as a
-            # flow.google.com RPC through the captcha fingerprint's proxy (the mint's egress), else the
-            # account's own proxy. Never the global/media proxy: the cookie login lives on the account IP.
-            fp = fingerprint if isinstance(fingerprint, dict) and respect_fingerprint_proxy else {}
-            body = json_data
-            if body is None and raw_body:
-                try:  # control-plane calls (characters) send their JSON as a text body
-                    body = json.loads(raw_body if isinstance(raw_body, str) else raw_body.decode("utf-8"))
-                except (ValueError, UnicodeDecodeError):
-                    body = None
-            return await self._cookie_rpc_request(
-                method, url, body, at_token,
-                proxy_url=(fp.get("proxy_url") or None),
-                user_agent=(fp.get("user_agent") or None),
-                timeout=timeout or self.timeout,
-            )
-
-        proxy_url = None
-        if not force_no_proxy:
-            if self.proxy_manager:
-                if use_media_proxy and hasattr(self.proxy_manager, "get_media_proxy_url"):
-                    proxy_url = await self.proxy_manager.get_media_proxy_url()
-                elif hasattr(self.proxy_manager, "get_request_proxy_url"):
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                else:
-                    proxy_url = await self.proxy_manager.get_proxy_url()
-
-            if respect_fingerprint_proxy and isinstance(fingerprint, dict) and "proxy_url" in fingerprint:
-                proxy_url = fingerprint.get("proxy_url")
-                if proxy_url == "":
-                    proxy_url = None
-        request_timeout = timeout or self.timeout
-
-        if headers is None:
-            headers = {}
-        else:
-            headers = dict(headers)
-
-        if use_st and st_token:
-            headers["Cookie"] = f"__Secure-next-auth.session-token={st_token}"
-
-        if use_at and at_token:
-            headers["authorization"] = f"Bearer {at_token}"
-
-        account_id = None
-        if st_token:
-            account_id = st_token[:16]
-        elif at_token:
-            account_id = at_token[:16]
-
-        fingerprint_user_agent = None
-        if isinstance(fingerprint, dict):
-            _fp_log = dict(fingerprint)
-            if "proxy_url" in _fp_log:
-                _fp_log["proxy_url"] = mask_proxy_url(_fp_log.get("proxy_url"))
-            debug_logger.log_info(f"[FINGERPRINT] Browser fingerprint bound to this request: {_fp_log}")
-            fingerprint_user_agent = fingerprint.get("user_agent")
-
-        # UA comes from the request-chain fingerprint (real browser); generated UA is the
-        # never-None fallback. Accept-Language falls back to en-US — every worker browser
-        # in this fleet is English; a zh-CN default would contradict the minted fingerprint.
-        effective_user_agent = str(fingerprint_user_agent or self._generate_user_agent(account_id)).strip()
-        headers.setdefault("Content-Type", "application/json")
-        headers.setdefault("User-Agent", effective_user_agent)
-        headers.setdefault("Accept-Language", self._get_primary_accept_language(fallback="en-US,en;q=0.9"))
-
-        if isinstance(fingerprint, dict):
-            if fingerprint.get("accept_language"):
-                headers.setdefault("Accept-Language", fingerprint["accept_language"])
-            if fingerprint.get("sec_ch_ua"):
-                headers["sec-ch-ua"] = self._normalize_sec_ch_ua_header(
-                    fingerprint["sec_ch_ua"],
-                    user_agent=headers.get("User-Agent"),
-                )
-            if fingerprint.get("sec_ch_ua_mobile"):
-                headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
-            if fingerprint.get("sec_ch_ua_platform"):
-                headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
-
-        if apply_default_client_headers:
-            for key, value in self._default_client_headers.items():
-                headers.setdefault(key, value)
-
-        inferred_fingerprint = self._build_fingerprint_from_user_agent(
-            headers.get("User-Agent"),
-            accept_language=headers.get("Accept-Language"),
-            proxy_url=proxy_url,
+        fp = fingerprint if isinstance(fingerprint, dict) and respect_fingerprint_proxy else {}
+        body = json_data
+        if body is None and raw_body:
+            try:  # control-plane calls (characters) send their JSON as a text body
+                body = json.loads(raw_body if isinstance(raw_body, str) else raw_body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                body = None
+        return await self._cookie_rpc_request(
+            method, url, body, at_token,
+            proxy_url=(fp.get("proxy_url") or None),
+            user_agent=(fp.get("user_agent") or None),
+            timeout=timeout or self.timeout,
         )
-        if not headers.get("sec-ch-ua") and inferred_fingerprint.get("sec_ch_ua"):
-            headers["sec-ch-ua"] = inferred_fingerprint["sec_ch_ua"]
-        if not headers.get("sec-ch-ua-platform") and inferred_fingerprint.get("sec_ch_ua_platform"):
-            headers["sec-ch-ua-platform"] = inferred_fingerprint["sec_ch_ua_platform"]
-        if not headers.get("sec-ch-ua-mobile") and inferred_fingerprint.get("sec_ch_ua_mobile"):
-            headers["sec-ch-ua-mobile"] = inferred_fingerprint["sec_ch_ua_mobile"]
-
-        if isinstance(fingerprint, dict) and self._should_attach_runtime_session_cookies(url):
-            origin = str(fingerprint.get("origin") or "").strip() or "https://labs.google"
-            referer = str(fingerprint.get("referer") or "").strip()
-            if not referer:
-                fingerprint_project_id = str(fingerprint.get("project_id") or "").strip()
-                if fingerprint_project_id:
-                    referer = self._build_flow_project_page_url(fingerprint_project_id)
-            if origin:
-                headers.setdefault("Origin", origin)
-            if referer:
-                headers.setdefault("Referer", referer)
-            merged_cookie_header = self._merge_cookie_header(
-                headers.get("Cookie"),
-                fingerprint.get("session_cookies"),
-            )
-            if merged_cookie_header:
-                headers["Cookie"] = merged_cookie_header
-
-        if self._should_attach_runtime_session_cookies(url):
-            derived_project_id = self._extract_project_id_from_request_payload(json_data)
-            headers.setdefault("Origin", "https://labs.google")
-            if derived_project_id:
-                headers.setdefault("Referer", self._build_flow_project_page_url(derived_project_id))
-
-        request_body_for_log = raw_body if raw_body is not None else json_data
-        if config.debug_enabled:
-            if isinstance(fingerprint, dict):
-                debug_logger.log_info(
-                    f"[FINGERPRINT] Submitting with captcha browser fingerprint: UA={headers.get('User-Agent', '')[:120]}, proxy={mask_proxy_url(proxy_url)}"
-                )
-            debug_logger.log_request(
-                method=method,
-                url=url,
-                headers=headers,
-                body=request_body_for_log,
-                proxy=mask_proxy_url(proxy_url)
-            )
-
-        start_time = time.time()
-
-        try:
-            async with AsyncSession(trust_env=False) as session:
-                if method.upper() == "GET":
-                    response = await session.get(
-                        url,
-                        headers=headers,
-                        proxy=proxy_url,
-                        timeout=request_timeout,
-                        impersonate=impersonate,
-                    )
-                else:
-                    request_kwargs = {
-                        "headers": headers,
-                        "proxy": proxy_url,
-                        "timeout": request_timeout,
-                        "impersonate": impersonate,
-                    }
-                    if raw_body is not None:
-                        request_kwargs["data"] = raw_body
-                    else:
-                        request_kwargs["json"] = json_data
-                    response = await session.post(url, **request_kwargs)
-
-                duration_ms = (time.time() - start_time) * 1000
-
-                if config.debug_enabled:
-                    debug_logger.log_response(
-                        status_code=response.status_code,
-                        headers=dict(response.headers),
-                        body=response.text,
-                        duration_ms=duration_ms
-                    )
-
-                if response.status_code >= 400:
-                    error_reason = f"HTTP Error {response.status_code}"
-                    parsed_reason = ""
-                    try:
-                        error_body = response.json()
-                        if "error" in error_body:
-                            error_info = error_body["error"]
-                            error_message = error_info.get("message", "")
-                            details = error_info.get("details", [])
-                            for detail in details:
-                                if detail.get("reason"):
-                                    parsed_reason = detail.get("reason")
-                                    error_reason = parsed_reason
-                                    break
-                            if error_message:
-                                error_reason = f"{error_reason}: {error_message}"
-                    except Exception:
-                        error_reason = f"HTTP Error {response.status_code}: {response.text[:200]}"
-
-                    debug_logger.log_error(f"[API FAILED] URL: {url}")
-                    debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
-                    debug_logger.log_error(f"[API FAILED] Response: {response.text}")
-
-                    # Always-on operational signal: classify anti-bot failures and
-                    # expose the egress used, so reCAPTCHA/quota/auth failures are
-                    # visible in `docker logs` WITHOUT the gated firehose. The redeem
-                    # IP printed here is what to compare against the mint IP.
-                    _cls = self._classify_flow_fail(response.status_code, f"{error_reason} {response.text[:300]}")
-                    debug_logger.op_warning(
-                        f"[FLOW_FAIL] class={_cls} http={response.status_code} "
-                        f"egress={mask_proxy_url(proxy_url)} reason={error_reason[:160]}"
-                    )
-
-                    api_error = FlowAPIError(response.status_code, error_reason, parsed_reason)
-                    api_error.flow_fail_class = _cls
-                    raise api_error
-
-                return response.json()
-
-        except FlowAPIError:
-            # Structured HTTP error (4xx/5xx). Not a transport failure, so never
-            # retry via urllib and never re-wrap — preserve status_code/reason
-            # so callers can classify (e.g. 401/UNAUTHENTICATED => ST expired).
-            raise
-        except Exception as e:
-            error_msg = str(e)
-            if "HTTP Error" not in error_msg and not any(x in error_msg for x in ["PUBLIC_ERROR", "INVALID_ARGUMENT"]):
-                debug_logger.log_error(f"[API FAILED] URL: {url}")
-                debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
-                debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
-
-            if allow_urllib_fallback and self._should_fallback_to_urllib(error_msg):
-                debug_logger.log_warning(
-                    f"[HTTP FALLBACK] curl_cffi request failed, falling back to urllib: {method.upper()} {url}"
-                )
-                try:
-                    return await asyncio.to_thread(
-                        self._sync_json_request_via_urllib,
-                        method.upper(),
-                        url,
-                        headers,
-                        json_data,
-                        proxy_url,
-                        request_timeout,
-                    )
-                except FlowAPIError:
-                    # urllib reached the server and got an HTTP error — preserve
-                    # the structured status/reason instead of masking it as a
-                    # generic transport failure.
-                    raise
-                except Exception as fallback_error:
-                    debug_logger.log_error(
-                        f"[HTTP FALLBACK] urllib fallback also failed: {fallback_error}"
-                    )
-                    raise Exception(
-                        f"Flow API request failed: curl={error_msg}; urllib={fallback_error}"
-                    )
-
-            wrapped = Exception(f"Flow API request failed: {error_msg}")
-            inherited = getattr(e, "flow_fail_class", None)
-            if inherited is None and ("HTTP Error" in error_msg or "PUBLIC_ERROR" in error_msg):
-                inherited = self._classify_flow_fail(None, error_msg)  # urllib fallback path: same classifier
-            wrapped.flow_fail_class = inherited
-            raise wrapped
-
-    def _should_fallback_to_urllib(self, error_message: str) -> bool:
-        """Decide whether to fall back from curl_cffi to urllib."""
-        error_lower = (error_message or "").lower()
-        return any(
-            keyword in error_lower
-            for keyword in [
-                "curl: (6)",
-                "curl: (7)",
-                "curl: (28)",
-                "curl: (35)",
-                "curl: (52)",
-                "curl: (56)",
-                "connection timed out",
-                "could not connect",
-                "failed to connect",
-                "ssl connect error",
-                "tls connect error",
-                "network is unreachable",
-            ]
-        )
-
-    def _sync_json_request_via_urllib(
-        self,
-        method: str,
-        url: str,
-        headers: Optional[Dict[str, Any]],
-        json_data: Optional[Dict[str, Any]],
-        proxy_url: Optional[str],
-        timeout: int,
-    ) -> Dict[str, Any]:
-        """Run a JSON request with urllib as the network fallback for curl_cffi."""
-        request_headers = dict(headers or {})
-        request_headers.setdefault("Accept", "application/json")
-        request_headers["Accept-Encoding"] = "identity"
-
-        data = None
-        if method.upper() != "GET" and json_data is not None:
-            data = json.dumps(json_data, ensure_ascii=False).encode("utf-8")
-            request_headers["Content-Type"] = "application/json"
-
-        handlers = [urllib.request.HTTPSHandler(context=ssl.create_default_context())]
-        if proxy_url:
-            handlers.append(
-                urllib.request.ProxyHandler(
-                    {"http": proxy_url, "https": proxy_url}
-                )
-            )
-
-        opener = urllib.request.build_opener(*handlers)
-        request = urllib.request.Request(
-            url=url,
-            data=data,
-            headers=request_headers,
-            method=method.upper(),
-        )
-
-        try:
-            with opener.open(
-                request,
-                timeout=timeout,
-            ) as response:
-                payload = response.read()
-                status_code = int(response.getcode() or 0)
-                content_encoding = str(response.headers.get("Content-Encoding") or "").lower()
-        except urllib.error.HTTPError as exc:
-            payload = exc.read() if hasattr(exc, "read") else b""
-            status_code = int(getattr(exc, "code", 500) or 500)
-            content_encoding = str(getattr(exc, "headers", {}).get("Content-Encoding") or "").lower()
-            if content_encoding == "gzip" and payload:
-                try:
-                    payload = gzip.decompress(payload)
-                except Exception:
-                    pass
-            body_text = payload.decode("utf-8", errors="replace")
-            raise flow_api_error_from_body(status_code, body_text) from exc
-        except Exception as exc:
-            raise Exception(str(exc)) from exc
-
-        if content_encoding == "gzip" and payload:
-            try:
-                payload = gzip.decompress(payload)
-            except Exception:
-                pass
-        body_text = payload.decode("utf-8", errors="replace")
-        if status_code >= 400:
-            raise flow_api_error_from_body(status_code, body_text)
-
-        try:
-            return json.loads(body_text) if body_text else {}
-        except Exception as exc:
-            raise Exception(f"Invalid JSON response: {body_text[:200]}") from exc
 
     def _is_timeout_error(self, error: Exception) -> bool:
         """Detect a network timeout so we can fail fast and retry."""
@@ -927,53 +314,6 @@ class FlowClient:
             return max(1, int(config.browser_captcha_generation_retries or 2))
         return effective_max_retries
 
-    def _build_realistic_video_submit_headers(self) -> Dict[str, str]:
-        """Build video submit headers matching captured upstream traffic."""
-        return self._build_current_flow_media_headers(content_type="text/plain;charset=UTF-8")
-
-    def _resolve_runtime_impersonate(self, fallback: str = "chrome124") -> str:
-        resolved = self._resolve_impersonate_from_fingerprint(fallback=fallback)
-        return resolved or fallback
-
-    def _resolve_impersonate_from_fingerprint(self, fallback: str = "chrome124") -> str:
-        """Pick the closest curl_cffi impersonate target for the bound browser fingerprint."""
-        fingerprint = self.get_request_fingerprint()
-        if not isinstance(fingerprint, dict):
-            return fallback
-
-        ua = str(fingerprint.get("user_agent") or "").strip()
-        ua_lower = ua.lower()
-        if not ua_lower:
-            return fallback
-
-        if "android" in ua_lower:
-            return "chrome_android"
-        if "edg/" in ua_lower or " edge/" in ua_lower:
-            return "edge"
-        if "safari/" in ua_lower and "chrome/" not in ua_lower and "chromium/" not in ua_lower:
-            if "iphone" in ua_lower or "ipad" in ua_lower or "ios" in ua_lower:
-                return "safari_ios"
-            return "safari"
-
-        if "chrome/" not in ua_lower and "chromium/" not in ua_lower:
-            return fallback
-
-        import re
-        match = re.search(r"(?:chrome|chromium)/(\d+)", ua_lower)
-        if not match:
-            return "chrome"
-
-        major = int(match.group(1))
-        supported = [99, 100, 101, 104, 107, 110, 116, 119, 120, 123, 124]
-        if major in supported:
-            return f"chrome{major}"
-        if major > max(supported):
-            return "chrome"
-        lower_or_equal = [v for v in supported if v <= major]
-        if lower_or_equal:
-            return f"chrome{max(lower_or_equal)}"
-        return fallback
-
     async def _make_video_api_request(
         self,
         url: str,
@@ -984,26 +324,21 @@ class FlowClient:
         token_id: Optional[int] = None,
         action: str = "VIDEO_GENERATION",
     ) -> Dict[str, Any]:
-        """Hard deadline for video API calls, so a rare curl_cffi hang does not stall the request."""
+        """Hard deadline for video API calls, so a rare transport hang does not stall the request.
+        project_id / token_id / action are kept for the seven callers; the RPC adapter does not need them."""
         raw_body = json.dumps(json_data, ensure_ascii=False, separators=(",", ":"))
-        headers = self._build_realistic_video_submit_headers()
-        headers.update(self._build_labs_request_context_headers(project_id))
         try:
             return await asyncio.wait_for(
                 self._make_request(
                     method="POST",
                     url=url,
-                    headers=headers,
                     json_data=json_data,
                     raw_body=raw_body,
                     use_at=True,
                     at_token=at,
                     timeout=timeout,
-                    allow_urllib_fallback=False,
-                    apply_default_client_headers=False,
-                    impersonate=self._resolve_runtime_impersonate(),
                 ),
-                timeout=timeout + 5
+                timeout=timeout + 5,
             )
         except asyncio.TimeoutError as exc:
             raise Exception(f"Flow video API request timed out after {timeout}s") from exc
@@ -1068,12 +403,10 @@ class FlowClient:
                 result = await self._make_request(
                     method="POST",
                     url=url,
-                    headers=self._build_labs_request_context_headers(project_id),
                     json_data=json_data,
                     use_at=True,
                     at_token=at,
                     timeout=request_timeout,
-                    use_media_proxy=prefer_media_proxy,
                     respect_fingerprint_proxy=not prefer_media_proxy,
                 )
                 if http_attempt_info is not None:
@@ -1528,19 +861,18 @@ class FlowClient:
         """Upload an image and return mediaId
 
         Args:
-            at: Access Token
+            at: Access Token (the account's FLOWCK cookie session handle)
             image_bytes: image bytes
-            aspect_ratio: image or video aspect ratio (converted to image format)
-            project_id: project ID (used by the new upload endpoint)
+            aspect_ratio: unused since stage 2 (only the deleted legacy :uploadUserImage payload read it);
+                kept for the two callers (generation_handler, characters)
+            project_id: project ID (the Flow web upload needs one)
 
         Returns:
             mediaId
         """
-        # Convert video aspect_ratio to image aspect_ratio
-        # VIDEO_ASPECT_RATIO_LANDSCAPE -> IMAGE_ASPECT_RATIO_LANDSCAPE
-        # VIDEO_ASPECT_RATIO_PORTRAIT -> IMAGE_ASPECT_RATIO_PORTRAIT
-        if aspect_ratio.startswith("VIDEO_"):
-            aspect_ratio = aspect_ratio.replace("VIDEO_", "IMAGE_")
+        if not flow_ck.is_session_handle(at):
+            # Same local 401 as _make_request, before any cookie login or captcha mint for a dead credential.
+            raise FlowAPIError(401, "UNAUTHENTICATED: this account has no Flow cookie session yet", "UNAUTHENTICATED")
 
         # Detect image MIME type
         mime_type = self._detect_image_mime_type(image_bytes)
@@ -1548,8 +880,7 @@ class FlowClient:
         # Encode as base64 (no prefix)
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
 
-        # Try the new upload endpoint first: /v1/flow/uploadImage
-        # On failure fall back to the old endpoint for compatibility
+        # Flow web upload (maseQ) with its own UPLOAD_IMAGE captcha; see _cookie_upload_image.
         ext = "png" if "png" in mime_type else "jpg"
         upload_file_name = f"flow2api_upload_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.{ext}"
         new_url = f"{self.api_base_url}/flow/uploadImage"
@@ -1570,108 +901,7 @@ class FlowClient:
             "mimeType": mime_type
         }
 
-        # Compatibility fallback: old endpoint :uploadUserImage
-        legacy_url = f"{self.api_base_url}:uploadUserImage"
-        legacy_json_data = {
-            "imageInput": {
-                "rawImageBytes": image_base64,
-                "mimeType": mime_type,
-                "isUserUploaded": True,
-                "aspectRatio": aspect_ratio
-            },
-            "clientContext": {
-                "sessionId": self._generate_session_id(),
-                "tool": "ASSET_MANAGER"
-            }
-        }
-        max_retries = config.flow_max_retries
-        last_error: Optional[Exception] = None
-
-        if flow_ck.is_session_handle(at):
-            return await self._cookie_upload_image(at, new_url, new_json_data, normalized_project_id)
-
-        for retry_attempt in range(max_retries):
-            try:
-                new_result = await self._make_request(
-                    method="POST",
-                    url=new_url,
-                    json_data=new_json_data,
-                    use_at=True,
-                    at_token=at,
-                    use_media_proxy=True
-                )
-                media_id = (
-                    self._extract_media_name(new_result.get("media"))
-                    or new_result.get("mediaGenerationId", {}).get("mediaGenerationId")
-                )
-                if media_id:
-                    return media_id
-                raise Exception(f"Invalid upload response: missing media id, keys={list(new_result.keys())}")
-            except Exception as new_upload_error:
-                last_error = new_upload_error
-                refused = photo_refusal_reason(new_upload_error)
-                if refused:
-                    # Google refused the photo itself: the same bytes get the same answer on
-                    # every retry, every account and the legacy endpoint (2026-10-11).
-                    debug_logger.event(f"[UPLOAD] Google refused the photo: {refused} (not retried)")
-                    raise FlowPhotoRefusedError(refused, str(new_upload_error)) from new_upload_error
-                retry_reason = "network timeout" if self._is_timeout_error(new_upload_error) else self._get_retry_reason(str(new_upload_error))
-
-                # The old endpoint has no projectId, so a project-scoped upload that falls back may land in the wrong project.
-                if normalized_project_id:
-                    if retry_reason and retry_attempt < max_retries - 1:
-                        debug_logger.log_warning(
-                            f"[UPLOAD] Project-scoped upload hit {retry_reason}, retrying new endpoint "
-                            f"({retry_attempt + 2}/{max_retries}, project_id={normalized_project_id})..."
-                        )
-                        await asyncio.sleep(1)
-                        continue
-                    raise RuntimeError(
-                        "Project-scoped image upload failed via /flow/uploadImage; "
-                        "legacy :uploadUserImage fallback is disabled because it may attach media "
-                        f"to a different project (project_id={normalized_project_id}). "
-                        f"Last error: {str(new_upload_error)[:300]}"
-                    ) from new_upload_error
-
-                debug_logger.log_warning(
-                    f"[UPLOAD] New upload API failed, fallback to legacy endpoint: {new_upload_error}"
-                )
-
-            try:
-                legacy_result = await self._make_request(
-                    method="POST",
-                    url=legacy_url,
-                    json_data=legacy_json_data,
-                    use_at=True,
-                    at_token=at,
-                    use_media_proxy=True
-                )
-
-                media_id = (
-                    legacy_result.get("mediaGenerationId", {}).get("mediaGenerationId")
-                    or legacy_result.get("media", {}).get("name")
-                )
-                if media_id:
-                    return media_id
-                raise Exception(f"Legacy upload response missing media id: keys={list(legacy_result.keys())}")
-            except Exception as legacy_upload_error:
-                last_error = legacy_upload_error
-                refused = photo_refusal_reason(legacy_upload_error)
-                if refused:
-                    debug_logger.event(f"[UPLOAD] Google refused the photo (legacy endpoint): {refused} (not retried)")
-                    raise FlowPhotoRefusedError(refused, str(legacy_upload_error)) from legacy_upload_error
-                retry_reason = self._get_retry_reason(str(legacy_upload_error))
-                if retry_reason and retry_attempt < max_retries - 1:
-                    debug_logger.log_warning(
-                        f"[UPLOAD] Upload hit {retry_reason}, retrying ({retry_attempt + 2}/{max_retries})..."
-                    )
-                    await asyncio.sleep(1)
-                    continue
-                raise
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("Failed to upload image")
+        return await self._cookie_upload_image(at, new_url, new_json_data, normalized_project_id)
 
     # ========== Image generation (uses AT) - synchronous ==========
 
@@ -2317,40 +1547,6 @@ class FlowClient:
         # All retries failed
         raise last_error
 
-    def _build_browser_style_control_headers(
-        self,
-        referer: str,
-        origin: Optional[str] = None,
-        account_id: Optional[str] = None,
-        content_type: Optional[str] = None,
-        accept_language: Optional[str] = None,
-        api_key: Optional[str] = None,
-    ) -> Dict[str, str]:
-        headers: Dict[str, str] = {
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Referer": referer,
-            "User-Agent": self._get_effective_request_user_agent(account_id),
-            "Accept-Language": accept_language or self._get_primary_accept_language(fallback="en-US,en;q=0.9"),
-            "Priority": "u=1, i",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-        }
-        if origin:
-            headers["Origin"] = origin
-            if origin == "https://labs.google":
-                headers.setdefault("sec-fetch-storage-access", "active")
-        if content_type:
-            headers["Content-Type"] = content_type
-        if api_key:
-            headers["x-goog-api-key"] = api_key
-        headers.setdefault("x-browser-channel", self.FLOW_BROWSER_CHANNEL_HEADER)
-        headers.setdefault("x-browser-copyright", self.FLOW_BROWSER_COPYRIGHT_HEADER)
-        headers.setdefault("x-browser-validation", self.FLOW_BROWSER_VALIDATION_HEADER)
-        headers.setdefault("x-browser-year", self.FLOW_BROWSER_YEAR_HEADER)
-        return headers
-
     async def _aisandbox_request(
         self,
         method: str,
@@ -2359,32 +1555,21 @@ class FlowClient:
         *,
         json_data: Optional[Dict[str, Any]] = None,
         raw_body: Optional[Union[str, bytes]] = None,
-        content_type: Optional[str] = "text/plain;charset=UTF-8",
-        accept_language: Optional[str] = None,
-        api_key: Optional[str] = None,
         timeout: Optional[int] = None,
         account_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        headers = self._build_browser_style_control_headers(
-            referer="https://labs.google/",
-            origin="https://labs.google",
-            account_id=account_id,
-            content_type=content_type,
-            accept_language=accept_language,
-            api_key=api_key,
-        )
+        """Control-plane seam used by Flow Characters (create entity, attach a photo): `path` is the aisandbox
+        REST path the RPC adapter translates. `account_id` is kept for the callers' signatures."""
+        if not at:
+            raise ValueError("_aisandbox_request needs the account's cookie session handle")
         return await self._make_request(
             method=method,
             url=f"{self.api_base_url}{path}",
-            headers=headers,
             json_data=json_data,
             raw_body=raw_body,
-            use_at=bool(at),
+            use_at=True,
             at_token=at,
             timeout=timeout or self._get_control_plane_timeout(),
-            apply_default_client_headers=False,
-            allow_urllib_fallback=False,
-            impersonate=self._resolve_runtime_impersonate(),
         )
 
     async def create_character_entity(self, at: str, project_id: str, display_name: str, account_id: Optional[str] = None) -> str:
