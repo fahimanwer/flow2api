@@ -1287,7 +1287,7 @@ class GenerationHandler:
         token,
         operation: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Resolve video assets per current upstream logic: status comes from media, URL via a second redirect call."""
+        """Resolve video assets: status comes from media, the URL is the signed link (fifeUrl) from the status RPC."""
         metadata = (operation.get("operation") or {}).get("metadata", {}) or {}
         video_info = metadata.get("video", {}) if isinstance(metadata.get("video"), dict) else {}
         media_name = (
@@ -1298,16 +1298,8 @@ class GenerationHandler:
             or (operation.get("operation") or {}).get("name")
         )
 
-        # Cookie sessions (2026-10-23): the status RPC already carries the signed flow-content link; the
-        # Labs media redirect below needs the retired Labs session, so it is only the legacy fallback.
+        # Cookie sessions (2026-10-23): the status RPC carries the signed flow-content link (fifeUrl).
         video_url = str(video_info.get("fifeUrl") or "").strip()
-        cookie_session = str(getattr(token, "at", "") or "").startswith("FLOWCK.")
-        if not video_url and not cookie_session and media_name and getattr(token, "st", None):
-            video_url = await self.flow_client.get_media_url_redirect(
-                token.st,
-                media_name,
-                media_url_type="MEDIA_URL_TYPE_FULL_MEDIA",
-            ) or ""
 
         import re as _re
         uuid_match = _re.search(r"/video/([0-9a-f-]{36})", video_url or "")
@@ -2410,25 +2402,11 @@ class GenerationHandler:
                     yield self._create_error_response(error_msg, status_code=400)
                     return
 
-            if characters and str(getattr(token, "at", "") or "").startswith("FLOWCK."):
+            if characters:
                 self._mark_generation_failed(generation_result, CHARACTERS_UNAVAILABLE, caller_fault=True)
                 yield self._create_error_response(CHARACTERS_UNAVAILABLE, status_code=501)
                 return
-            if characters:
-                try:
-                    characters_started_at = time.time()
-                    if stream:
-                        yield self._create_stream_chunk(f"Preparing {len(characters)} character(s)...\n")
-                    character_entities = await CharacterService.get_instance().ensure(
-                        self.flow_client, self.db, token, project_id, characters
-                    )
-                    if video_trace is not None:
-                        video_trace["characters_ms"] = int((time.time() - characters_started_at) * 1000)
-                except CharacterSetupError as exc:
-                    self._mark_generation_failed(generation_result, str(exc), caller_fault=exc.status_code < 500)
-                    yield self._create_error_response(str(exc), status_code=exc.status_code, extra=exc.extra or None)
-                    return
-            prompt_parts, reference_entities = (build_prompt_parts(prompt, character_entities) if character_entities else (None, None))
+            prompt_parts, reference_entities = None, None  # video characters are refused above (501)
 
             # ========== Upload images ==========
             start_media_id = None
@@ -2761,9 +2739,8 @@ class GenerationHandler:
 
                 # Check status
                 if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
-                    # Upstream refactor: state comes from media; URL via two-step CDN
-                    # redirect (fifeUrl is gone from the new schema). _resolve_video_asset
-                    # also extracts the short /video/UUID id that extend + concat need.
+                    # State comes from media; the URL is the signed link the status RPC carries.
+                    # _resolve_video_asset also extracts the short /video/UUID id that extend needs.
                     try:
                         resolved_video = await self._resolve_video_asset(token, operation)
                     except Exception as redirect_error:
@@ -2798,39 +2775,6 @@ class GenerationHandler:
                     media_name = resolved_video["media_name"]
                     metadata = resolved_video["metadata"]
                     video_info = resolved_video["video_info"]
-
-                    if not video_url:
-                        media_name_for_fetch = (
-                            operation.get("mediaName")
-                            or operation["operation"].get("name", "")
-                        )
-                        if media_name_for_fetch:
-                            if stream:
-                                yield self._create_stream_chunk("Video generated, downloading video file...\n")
-                            try:
-                                media_result = await self.flow_client.get_media(
-                                    token.at, media_name_for_fetch
-                                )
-                                encoded_video = (
-                                    media_result.get("video", {}).get("encodedVideo", "")
-                                )
-                                if encoded_video:
-                                    cached_filename = await self.file_cache.cache_base64_video(
-                                        encoded_video
-                                    )
-                                    video_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
-                                    video_info["fifeUrl"] = video_url
-                                    debug_logger.log_info(
-                                        f"[VIDEO] Video fetched via get_media and cached: {cached_filename}"
-                                    )
-                                else:
-                                    debug_logger.log_error(
-                                        "[VIDEO] get_media returned empty encodedVideo"
-                                    )
-                            except Exception as fetch_err:
-                                debug_logger.log_error(
-                                    f"[VIDEO] Failed to fetch video via get_media: {fetch_err}"
-                                )
 
                     if not video_url:
                         error_msg = "Video generated but no media URL was returned"
@@ -2911,66 +2855,12 @@ class GenerationHandler:
                             )
 
                     # ========== Extend video concatenation ==========
-                    if extend_source_media_id and video_media_id and str(token.at or "").startswith("FLOWCK."):
-                        # Cookie sessions (2026-10-23): Flow's web app has no stitching RPC we know of
-                        # (upstream disables it too). Return the extension clip and say so.
+                    if extend_source_media_id and video_media_id:
+                        # Flow's web app has no stitching RPC we know of (upstream disables it too).
+                        # Return the extension clip and say so.
                         debug_logger.log_info("[CONCAT] stitching is not available on the new Flow API; returning the extension clip")
                         if stream:
                             yield self._create_stream_chunk("ℹ️ Stitching is not available since Google's Flow change; returning the extension clip\n")
-                    elif extend_source_media_id and video_media_id:
-                        try:
-                            if stream:
-                                yield self._create_stream_chunk("\nVideo extension complete, stitching full video...\n")
-                            debug_logger.log_info(f"[CONCAT] Starting concat: original={extend_source_media_id[:12]}..., extend={video_media_id[:12]}...")
-                            
-                            # Submit concat task
-                            concat_result = await self.flow_client.run_concatenation(
-                                at=token.at,
-                                original_media_id=extend_source_media_id,
-                                extend_media_id=video_media_id,
-                            )
-                            
-                            # Get operation name
-                            concat_op = concat_result.get("operation", {}).get("operation", {}).get("name", "")
-                            if concat_op:
-                                if stream:
-                                    yield self._create_stream_chunk("Stitching task submitted, waiting for completion...\n")
-                                
-                                # Poll concat status
-                                concat_status = await self.flow_client.poll_concatenation_status(
-                                    at=token.at,
-                                    operation_name=concat_op,
-                                    timeout=300,
-                                    poll_interval=3,
-                                )
-                                
-                                concat_url = concat_status.get("outputUri", "")
-                                if concat_url:
-                                    # If it is a local path (/tmp/xxx.mp4), build a full URL
-                                    if concat_url.startswith("/tmp/"):
-                                        server_host = config.server_host or "0.0.0.0"
-                                        server_port = config.server_port or 8000
-                                        # Use localhost externally
-                                        host = "localhost" if server_host == "0.0.0.0" else server_host
-                                        concat_url = f"http://{host}:{server_port}{concat_url}"
-                                    video_url = concat_url  # Replace with the full concatenated video URL
-                                    if stream:
-                                        yield self._create_stream_chunk("✅ Video stitching complete! Returning the full 16s video\n")
-                                    debug_logger.log_info(f"[CONCAT] Concat succeeded: {concat_url[:80]}...")
-                                else:
-                                    if stream:
-                                        yield self._create_stream_chunk("⚠️ Stitching completed but no URL returned, returning the extension clip\n")
-                            else:
-                                debug_logger.log_warning("[CONCAT] Concat task creation failed, returning the extend clip")
-                                if stream:
-                                    yield self._create_stream_chunk("⚠️ Failed to create stitching task, returning the extension clip\n")
-                        except Exception as e:
-                            import traceback
-                            debug_logger.log_error(f"[CONCAT] Concat failed: {str(e)}")
-                            debug_logger.log_error(f"[CONCAT] traceback: {traceback.format_exc()}")
-                            if stream:
-                                yield self._create_stream_chunk(f"⚠️ Stitching failed: {str(e)}, returning the extension clip\n")
-                            # Concat failure does not block the response; keep the extend clip URL
 
                     # Cache video (if enabled)
                     local_url = video_url

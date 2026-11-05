@@ -114,27 +114,21 @@ class VideoTests(_Base):
                 self.assertIn("ingredients model", str(chunks))
         self.ensure.assert_not_awaited()
 
-    async def test_veo_r2v_with_character_only_uses_the_reference_route(self):
-        await self._video("veo_3_1_r2v_fast", "@Maya walks on a beach", [_char()])
-        kwargs = self.handler.flow_client.generate_video_reference_images.await_args.kwargs
-        self.assertEqual(kwargs["reference_entities"], ["ent-maya"])
-        self.assertEqual(kwargs["reference_images"], [])
-        self.assertEqual(kwargs["prompt_parts"][0], {"reference": {"entity": {"entityId": "ent-maya", "handle": "Maya"}}})
-
-    async def test_omni_with_character_and_two_images_skips_the_frame_route(self):
-        await self._video("omni", "@Maya dances", [_char()], images=[b"a", b"b"])
+    async def test_ingredients_models_refuse_characters_with_501(self):
+        # The video RPC has no character slot, so a video with characters is refused for every account before any
+        # character setup, upload or submit; the Labs-era REST branch was deleted (stage 2, 2026-11). The token's
+        # at is not a FLOWCK handle, which is exactly the case that used to take the deleted branch.
+        for model, images in (("veo_3_1_r2v_fast", None), ("omni", [b"a", b"b"]), ("omni_4s", None)):
+            with self.subTest(model=model):
+                chunks, result = await self._video(model, "@Maya dances", [_char()], images=images)
+                self.assertFalse(result["success"])
+                self.assertIn('"status_code": 501', str(chunks))
+                self.assertIn("videos with characters are not available", str(chunks))
+        self.ensure.assert_not_awaited()
+        self.handler.flow_client.upload_image.assert_not_awaited()
+        self.handler.flow_client.generate_video_reference_images.assert_not_awaited()
         self.handler.flow_client.generate_video_start_end.assert_not_awaited()
-        kwargs = self.handler.flow_client.generate_video_reference_images.await_args.kwargs
-        self.assertEqual(kwargs["model_key"], "abra_r2v_8s")
-        self.assertEqual([r["mediaId"] for r in kwargs["reference_images"]], ["media-a", "media-b"])
-        self.assertEqual(kwargs["reference_entities"], ["ent-maya"])
         self.assertNotIn("reference_only", MODEL_CONFIG["omni"])  # the shared config was not mutated
-
-    async def test_omni_character_only_works(self):
-        await self._video("omni_4s", "@Maya dances", [_char()])
-        kwargs = self.handler.flow_client.generate_video_reference_images.await_args.kwargs
-        self.assertEqual(kwargs["model_key"], "abra_r2v_4s")
-        self.assertEqual(kwargs["reference_images"], [])
 
     async def test_video_character_limit_is_three(self):
         chunks, result = await self._video("veo_3_1_r2v_fast", "x", [_char(f"C{i}") for i in range(4)])

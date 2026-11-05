@@ -6,14 +6,13 @@ import contextvars
 import time
 from datetime import datetime, timedelta, timezone
 import uuid
-import urllib.parse
 import random
 import base64
 import gzip
 import ssl
 import re
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import urlparse
 import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
@@ -140,17 +139,10 @@ UPSAMPLE_NO_RETRY_KINDS = ("quota", "access", "traffic", "refused")
 class FlowClient:
     """VideoFX API client"""
 
-    FLOW_PUBLIC_API_KEY = "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY"
     FLOW_BROWSER_CHANNEL_HEADER = "stable"
     FLOW_BROWSER_COPYRIGHT_HEADER = "Copyright 2026 Google LLC. All Rights Reserved."
     FLOW_BROWSER_VALIDATION_HEADER = "MRCPrt/rS3JY47x2Yiz9h3ag4U8="
     FLOW_BROWSER_YEAR_HEADER = "2026"
-    FLOW_FRONTEND_EXPERIMENT_IDS = (
-        "106184493,106256669,105798603,106281924,106259075,106262194,"
-        "105993823,106104244,105484652,1714252,105928947,106238955,"
-        "106225453,106131447,1706538,119157484,106243706,105746691,"
-        "106151974,106125249,106001691,106077941"
-    )
 
     def __init__(self, proxy_manager, db=None):
         self.proxy_manager = proxy_manager
@@ -292,19 +284,6 @@ class FlowClient:
             if accept_language:
                 return self._normalize_accept_language_header(accept_language, fallback=fallback)
         return self._normalize_accept_language_header(fallback, fallback=fallback)
-
-    def _get_primary_locale_code(self, fallback: str = "en-US") -> str:
-        fingerprint = self.get_request_fingerprint()
-        if isinstance(fingerprint, dict):
-            language = str(fingerprint.get("language") or "").strip()
-            if language:
-                return language
-            accept_language = str(fingerprint.get("accept_language") or "").strip()
-            if accept_language:
-                primary = accept_language.split(",", 1)[0].strip()
-                if primary:
-                    return primary
-        return fallback
 
     def _infer_sec_ch_ua_from_user_agent(self, user_agent: Optional[str]) -> str:
         ua = str(user_agent or "").strip()
@@ -483,9 +462,6 @@ class FlowClient:
     def _compact_json_dumps(self, payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
-    def _encode_trpc_input(self, payload: Dict[str, Any]) -> str:
-        return quote(self._compact_json_dumps(payload), safe="")
-
     @staticmethod
     def _extract_project_id_from_request_payload(payload: Optional[Dict[str, Any]]) -> Optional[str]:
         if not isinstance(payload, dict):
@@ -507,17 +483,6 @@ class FlowClient:
                 if project_id:
                     return project_id
         return None
-
-    async def _get_token_st_by_id(self, token_id: Optional[int]) -> Optional[str]:
-        if not token_id or self.db is None or not hasattr(self.db, "get_token"):
-            return None
-        try:
-            token = await self.db.get_token(int(token_id))
-            st_value = str(getattr(token, "st", "") or "").strip() if token else ""
-            return st_value or None
-        except Exception as e:
-            debug_logger.log_warning(f"[VIDEO WARMUP] Failed to read ST for Token-{token_id}: {e}")
-            return None
 
     async def _make_request(
         self,
@@ -793,207 +758,6 @@ class FlowClient:
             if inherited is None and ("HTTP Error" in error_msg or "PUBLIC_ERROR" in error_msg):
                 inherited = self._classify_flow_fail(None, error_msg)  # urllib fallback path: same classifier
             wrapped.flow_fail_class = inherited
-            raise wrapped
-
-    async def _make_text_request(
-        self,
-        method: str,
-        url: str,
-        headers: Optional[Dict] = None,
-        json_data: Optional[Dict] = None,
-        raw_body: Optional[Union[str, bytes]] = None,
-        use_st: bool = False,
-        st_token: Optional[str] = None,
-        use_at: bool = False,
-        at_token: Optional[str] = None,
-        timeout: Optional[int] = None,
-        respect_fingerprint_proxy: bool = True,
-        force_no_proxy: bool = False,
-        apply_default_client_headers: bool = True,
-        impersonate: str = "chrome124",
-    ) -> str:
-        """Run a raw text request (e.g. SSE) and return the response text."""
-        fingerprint = self._request_fingerprint_ctx.get()
-
-        proxy_url = None
-        if not force_no_proxy:
-            if self.proxy_manager:
-                if hasattr(self.proxy_manager, "get_request_proxy_url"):
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                else:
-                    proxy_url = await self.proxy_manager.get_proxy_url()
-
-            if respect_fingerprint_proxy and isinstance(fingerprint, dict) and "proxy_url" in fingerprint:
-                proxy_url = fingerprint.get("proxy_url")
-                if proxy_url == "":
-                    proxy_url = None
-
-        request_timeout = timeout or self.timeout
-
-        if headers is None:
-            headers = {}
-        else:
-            headers = dict(headers)
-
-        if use_st and st_token:
-            headers["Cookie"] = f"__Secure-next-auth.session-token={st_token}"
-
-        if use_at and at_token:
-            headers["authorization"] = f"Bearer {at_token}"
-
-        account_id = None
-        if st_token:
-            account_id = st_token[:16]
-        elif at_token:
-            account_id = at_token[:16]
-
-        fingerprint_user_agent = None
-        if isinstance(fingerprint, dict):
-            fingerprint_user_agent = fingerprint.get("user_agent")
-
-        effective_user_agent = str(fingerprint_user_agent or self._generate_user_agent(account_id)).strip()
-        headers.setdefault("Content-Type", "application/json")
-        headers.setdefault("User-Agent", effective_user_agent)
-        headers.setdefault("Accept-Language", self._get_primary_accept_language(fallback="en-US,en;q=0.9"))
-
-        if isinstance(fingerprint, dict):
-            if fingerprint.get("accept_language"):
-                headers.setdefault("Accept-Language", fingerprint["accept_language"])
-            if fingerprint.get("sec_ch_ua"):
-                headers["sec-ch-ua"] = self._normalize_sec_ch_ua_header(
-                    fingerprint["sec_ch_ua"],
-                    user_agent=headers.get("User-Agent"),
-                )
-            if fingerprint.get("sec_ch_ua_mobile"):
-                headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
-            if fingerprint.get("sec_ch_ua_platform"):
-                headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
-            if self._should_attach_runtime_session_cookies(url):
-                origin = str(fingerprint.get("origin") or "").strip() or "https://labs.google"
-                referer = str(fingerprint.get("referer") or "").strip()
-                if not referer:
-                    fingerprint_project_id = str(fingerprint.get("project_id") or "").strip()
-                    if fingerprint_project_id:
-                        referer = self._build_flow_project_page_url(fingerprint_project_id)
-                if origin:
-                    headers.setdefault("Origin", origin)
-                if referer:
-                    headers.setdefault("Referer", referer)
-            if self._should_attach_runtime_session_cookies(url):
-                merged_cookie_header = self._merge_cookie_header(
-                    headers.get("Cookie"),
-                    fingerprint.get("session_cookies"),
-                )
-                if merged_cookie_header:
-                    headers["Cookie"] = merged_cookie_header
-
-        if apply_default_client_headers:
-            for key, value in self._default_client_headers.items():
-                headers.setdefault(key, value)
-
-        if self._should_attach_runtime_session_cookies(url):
-            derived_project_id = self._extract_project_id_from_request_payload(json_data)
-            headers.setdefault("Origin", "https://labs.google")
-            if derived_project_id:
-                headers.setdefault("Referer", self._build_flow_project_page_url(derived_project_id))
-
-        inferred_fingerprint = self._build_fingerprint_from_user_agent(
-            headers.get("User-Agent"),
-            accept_language=headers.get("Accept-Language"),
-            proxy_url=proxy_url,
-        )
-        if not headers.get("sec-ch-ua") and inferred_fingerprint.get("sec_ch_ua"):
-            headers["sec-ch-ua"] = inferred_fingerprint["sec_ch_ua"]
-        if not headers.get("sec-ch-ua-platform") and inferred_fingerprint.get("sec_ch_ua_platform"):
-            headers["sec-ch-ua-platform"] = inferred_fingerprint["sec_ch_ua_platform"]
-        if not headers.get("sec-ch-ua-mobile") and inferred_fingerprint.get("sec_ch_ua_mobile"):
-            headers["sec-ch-ua-mobile"] = inferred_fingerprint["sec_ch_ua_mobile"]
-
-        request_body_for_log = raw_body if raw_body is not None else json_data
-        if config.debug_enabled:
-            if isinstance(fingerprint, dict):
-                proxy_for_log = proxy_url if proxy_url else "direct"
-                debug_logger.log_info(
-                    f"[FINGERPRINT] Submitting text request with captcha browser fingerprint: UA={headers.get('User-Agent', '')[:120]}, proxy={proxy_for_log}"
-                )
-            debug_logger.log_request(
-                method=method,
-                url=url,
-                headers=headers,
-                body=request_body_for_log,
-                proxy=proxy_url
-            )
-
-        start_time = time.time()
-
-        try:
-            async with AsyncSession(trust_env=False) as session:
-                if method.upper() == "GET":
-                    response = await session.get(
-                        url,
-                        headers=headers,
-                        proxy=proxy_url,
-                        timeout=request_timeout,
-                        impersonate=impersonate,
-                    )
-                else:
-                    request_kwargs = {
-                        "headers": headers,
-                        "proxy": proxy_url,
-                        "timeout": request_timeout,
-                        "impersonate": impersonate,
-                    }
-                    if raw_body is not None:
-                        request_kwargs["data"] = raw_body
-                    else:
-                        request_kwargs["json"] = json_data
-                    response = await session.post(url, **request_kwargs)
-
-                duration_ms = (time.time() - start_time) * 1000
-                response_text = response.text
-
-                if config.debug_enabled:
-                    debug_logger.log_response(
-                        status_code=response.status_code,
-                        headers=dict(response.headers),
-                        body=response_text,
-                        duration_ms=duration_ms
-                    )
-
-                if response.status_code >= 400:
-                    error_reason = f"HTTP Error {response.status_code}: {response_text[:500]}"
-                    try:
-                        error_body = response.json()
-                        if "error" in error_body:
-                            error_info = error_body["error"]
-                            error_message = error_info.get("message", "")
-                            details = error_info.get("details", [])
-                            for detail in details:
-                                if detail.get("reason"):
-                                    error_reason = detail.get("reason")
-                                    break
-                            if error_message:
-                                error_reason = f"{error_reason}: {error_message}"
-                    except Exception:
-                        pass
-
-                    debug_logger.log_error(f"[API FAILED] URL: {url}")
-                    debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
-                    debug_logger.log_error(f"[API FAILED] Response: {response_text}")
-                    text_error = Exception(error_reason)
-                    text_error.flow_fail_class = self._classify_flow_fail(response.status_code, f"{error_reason} {response_text[:300]}")
-                    raise text_error
-
-                return response_text
-
-        except Exception as e:
-            error_msg = str(e)
-            if "HTTP Error" not in error_msg and not any(x in error_msg for x in ["PUBLIC_ERROR", "INVALID_ARGUMENT"]):
-                debug_logger.log_error(f"[API FAILED] URL: {url}")
-                debug_logger.log_error(f"[API FAILED] Request Body: {request_body_for_log}")
-                debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
-            wrapped = Exception(f"Flow API text request failed: {error_msg}")
-            wrapped.flow_fail_class = getattr(e, "flow_fail_class", None)
             raise wrapped
 
     def _should_fallback_to_urllib(self, error_message: str) -> bool:
@@ -1662,7 +1426,7 @@ class FlowClient:
         return response.content
 
     async def _cookie_session_for_st(self, st: str) -> "flow_ck.FlowCookieSession":
-        """Session for an ST-keyed call (project create/delete): the token's live session."""
+        """Session for an ST-keyed call (project create): the token's live session."""
         result = await self._cookie_st_to_at(st)
         return await self._cookie_session_for_handle(result["access_token"])
 
@@ -1768,62 +1532,6 @@ class FlowClient:
         if last_error is not None:
             raise last_error
         raise RuntimeError("Failed to create project")
-
-    async def delete_project(self, st: str, project_id: str):
-        """Delete a project
-
-        Args:
-            st: Session Token
-            project_id: project ID
-        """
-        url = f"{self.labs_base_url}/trpc/project.deleteProject"
-        json_data = {
-            "json": {
-                "projectToDeleteId": project_id
-            }
-        }
-
-        await self._make_request(
-            method="POST",
-            url=url,
-            json_data=json_data,
-            use_st=True,
-            st_token=st,
-            timeout=self._get_control_plane_timeout(),
-        )
-
-    # ========== Media fetch (uses AT) ==========
-
-    async def get_media(self, at: str, media_name: str) -> dict:
-        """Fetch media content (video comes back as base64)
-
-        Google's batchCheckAsyncVideoGenerationStatus does not return a download URL
-        after a video succeeds. Fetch the video via GET /v1/media/{name}.
-
-        Args:
-            at: Access Token
-            media_name: media name (UUID)
-
-        Returns:
-            {
-                "name": "uuid",
-                "video": {
-                    "encodedVideo": "base64...",
-                    "seed": 74602,
-                    "prompt": "...",
-                    "model": "veo_3_1_t2v_fast",
-                    "aspectRatio": "VIDEO_ASPECT_RATIO_LANDSCAPE"
-                }
-            }
-        """
-        url = f"{self.api_base_url}/media/{media_name}"
-        return await self._make_request(
-            method="GET",
-            url=url,
-            use_at=True,
-            at_token=at,
-            timeout=max(60, int(self.timeout or 120)),
-        )
 
     # ========== Credits (uses AT) ==========
 
@@ -2625,7 +2333,6 @@ class FlowClient:
         retry_attempt = 0
         session_id = self._generate_session_id()
         batch_id = str(uuid.uuid4())
-        video_context_warmed = False
         while retry_attempt < max_retries:
             # Get a fresh reCAPTCHA token on every retry - video uses VIDEO_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(
@@ -2646,18 +2353,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise last_error
-            if not video_context_warmed:
-                await self._warmup_flow_video_frontend_context(
-                    at=at,
-                    project_id=project_id,
-                    token_id=token_id,
-                    session_id=session_id,
-                    user_paygate_tier=user_paygate_tier,
-                    prompt=prompt,
-                    model_key=model_key,
-                    aspect_ratio=aspect_ratio,
-                )
-                video_context_warmed = True
             client_context = {
                 "recaptchaContext": {
                     "token": recaptcha_token,
@@ -2751,62 +2446,11 @@ class FlowClient:
         headers.setdefault("x-browser-year", self.FLOW_BROWSER_YEAR_HEADER)
         return headers
 
-    async def _labs_trpc_get_with_st(
-        self,
-        path_with_query: str,
-        st: str,
-        project_id: str,
-        timeout: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        page_url = self._build_flow_project_page_url(project_id)
-        return await self._make_request(
-            method="GET",
-            url=f"{self.labs_base_url}/trpc/{path_with_query}",
-            headers=self._build_browser_style_control_headers(
-                referer=page_url,
-                account_id=st[:16],
-                content_type="application/json",
-            ),
-            use_st=True,
-            st_token=st,
-            timeout=timeout or self._get_control_plane_timeout(),
-            apply_default_client_headers=False,
-            allow_urllib_fallback=False,
-            impersonate=self._resolve_runtime_impersonate(),
-        )
-
-    async def _labs_trpc_post_with_st(
-        self,
-        trpc_path: str,
-        payload: Dict[str, Any],
-        st: str,
-        project_id: str,
-        timeout: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        page_url = self._build_flow_project_page_url(project_id)
-        return await self._make_request(
-            method="POST",
-            url=f"{self.labs_base_url}/trpc/{trpc_path}",
-            headers=self._build_browser_style_control_headers(
-                referer=page_url,
-                origin="https://labs.google",
-                account_id=st[:16],
-                content_type="application/json",
-            ),
-            json_data=payload,
-            use_st=True,
-            st_token=st,
-            timeout=timeout or self._get_control_plane_timeout(),
-            apply_default_client_headers=False,
-            allow_urllib_fallback=False,
-            impersonate=self._resolve_runtime_impersonate(),
-        )
-
     async def _aisandbox_request(
         self,
         method: str,
         path: str,
-        at: Optional[str],
+        at: str,
         *,
         json_data: Optional[Dict[str, Any]] = None,
         raw_body: Optional[Union[str, bytes]] = None,
@@ -2838,266 +2482,6 @@ class FlowClient:
             impersonate=self._resolve_runtime_impersonate(),
         )
 
-    async def _warmup_flow_video_frontend_context(
-        self,
-        *,
-        at: str,
-        project_id: str,
-        token_id: Optional[int],
-        session_id: str,
-        user_paygate_tier: str,
-        prompt: str,
-        model_key: str,
-        aspect_ratio: str,
-    ) -> None:
-        """Run the minimal first-party init/telemetry calls the real page makes before a video submit, in the same order."""
-        if flow_ck.is_session_handle(at):
-            # Cookie sessions (2026-10-23): these are retired labs.google tRPC / Labs-era calls (they 401/404
-            # from every account's proxy). The flow.google.com app needs no warm-up before a video RPC.
-            return
-        account_id = at[:16] if at else None
-        page_url = self._build_flow_project_page_url(project_id)
-        session_create_time = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-
-        st = await self._get_token_st_by_id(token_id)
-        if st:
-            null_meta_input = self._encode_trpc_input({
-                "json": None,
-                "meta": {"values": ["undefined"]},
-            })
-            labs_get_paths = [
-                f"general.fetchUserPreferences?input={null_meta_input}",
-                f"videoFx.getFlowAppConfig?input={null_meta_input}",
-                f"videoFx.getUserSettings?input={null_meta_input}",
-            ]
-            for path_with_query in labs_get_paths:
-                try:
-                    await self._labs_trpc_get_with_st(path_with_query, st=st, project_id=project_id)
-                except Exception as e:
-                    debug_logger.log_warning(f"[VIDEO WARMUP] Labs GET failed ({path_with_query}): {e}")
-
-            labs_batch_log_payload = {
-                "json": {
-                    "appEvents": [{
-                        "event": "PAGE_VIEW",
-                        "eventProperties": [
-                            {"key": "URL", "stringValue": page_url},
-                            {"key": "USER_AGENT", "stringValue": self._get_effective_request_user_agent(st[:16])},
-                            {"key": "IS_DESKTOP"},
-                        ],
-                        "activeExperiments": [],
-                        "eventMetadata": {"sessionId": session_id},
-                        "eventTime": session_create_time,
-                    }]
-                }
-            }
-            try:
-                await self._labs_trpc_post_with_st(
-                    "general.submitBatchLog",
-                    payload=labs_batch_log_payload,
-                    st=st,
-                    project_id=project_id,
-                )
-            except Exception as e:
-                debug_logger.log_warning(f"[VIDEO WARMUP] Labs submitBatchLog failed: {e}")
-
-        try:
-            await self._aisandbox_request(
-                "POST",
-                ":checkAppAvailability",
-                at=None,
-                raw_body=self._compact_json_dumps({"clientContext": {"tool": "PINHOLE"}}),
-                api_key=self.FLOW_PUBLIC_API_KEY,
-                account_id=account_id,
-            )
-        except Exception as e:
-            debug_logger.log_warning(f"[VIDEO WARMUP] checkAppAvailability failed: {e}")
-
-        debug_logger.log_info(
-            f"[VIDEO WARMUP] Minimal video init calls done: project_id={project_id}, "
-            f"session_id={session_id}, model_key={model_key}, aspect_ratio={aspect_ratio}, "
-            f"user_paygate_tier={user_paygate_tier}, prompt_len={len(prompt or '')}"
-        )
-
-    def _video_aspect_ratio_to_agent_aspect_ratio(self, aspect_ratio: str) -> str:
-        mapping = {
-            "VIDEO_ASPECT_RATIO_LANDSCAPE": "16:9",
-            "VIDEO_ASPECT_RATIO_PORTRAIT": "9:16",
-            "VIDEO_ASPECT_RATIO_SQUARE": "1:1",
-        }
-        return mapping.get(str(aspect_ratio or "").strip(), "16:9")
-
-    def _parse_sse_json_events(self, raw_text: str) -> List[Dict[str, Any]]:
-        events: List[Dict[str, Any]] = []
-        if not raw_text:
-            return events
-
-        for block in raw_text.split("\n\n"):
-            block = block.strip()
-            if not block:
-                continue
-
-            data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
-            if not data_lines:
-                continue
-
-            payload_text = "\n".join(data_lines).strip()
-            if not payload_text or payload_text == "[DONE]":
-                continue
-
-            try:
-                payload = json.loads(payload_text)
-            except Exception:
-                continue
-
-            if isinstance(payload, dict):
-                events.append(payload)
-
-        return events
-
-    def _extract_agent_session_id(self, sessions_payload: Dict[str, Any]) -> Optional[str]:
-        if not isinstance(sessions_payload, dict):
-            return None
-
-        sessions = sessions_payload.get("sessions")
-        if isinstance(sessions, list):
-            for session in sessions:
-                if not isinstance(session, dict):
-                    continue
-                session_id = str(session.get("agentSessionId") or "").strip()
-                if session_id:
-                    return session_id
-
-        session_info = sessions_payload.get("sessionInfo")
-        if isinstance(session_info, dict):
-            session_id = str(session_info.get("agentSessionId") or "").strip()
-            if session_id:
-                return session_id
-
-        return None
-
-    def _extract_flow_entity_id(self, entity_payload: Dict[str, Any]) -> Optional[str]:
-        if not isinstance(entity_payload, dict):
-            return None
-
-        candidates = [entity_payload]
-        result = entity_payload.get("result")
-        if isinstance(result, dict):
-            candidates.append(result)
-            data = result.get("data")
-            if isinstance(data, dict):
-                candidates.append(data)
-                json_node = data.get("json")
-                if isinstance(json_node, dict):
-                    candidates.append(json_node)
-                    nested_result = json_node.get("result")
-                    if isinstance(nested_result, dict):
-                        candidates.append(nested_result)
-
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            for key in ("entityId", "id", "parentEntityId"):
-                entity_id = str(candidate.get(key) or "").strip()
-                if entity_id:
-                    return entity_id
-
-        return None
-
-    def _extract_turn_count(self, session_detail: Dict[str, Any]) -> int:
-        if not isinstance(session_detail, dict):
-            return 0
-        turns = session_detail.get("turns")
-        if isinstance(turns, list):
-            return len(turns)
-        return 0
-
-    def _extract_generate_video_with_references_result(
-        self,
-        events: List[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            agent_message = event.get("agentMessage")
-            if not isinstance(agent_message, dict):
-                continue
-            agent_events = agent_message.get("agentEvents")
-            if not isinstance(agent_events, list):
-                continue
-            for agent_event in agent_events:
-                if not isinstance(agent_event, dict):
-                    continue
-                tool_result_wrapper = agent_event.get("toolResult")
-                if not isinstance(tool_result_wrapper, dict):
-                    continue
-                if tool_result_wrapper.get("toolName") != "generate_video_with_references":
-                    continue
-                tool_result = tool_result_wrapper.get("toolResult")
-                if isinstance(tool_result, dict):
-                    return tool_result
-        return None
-
-    async def get_flow_creation_agent_session(
-        self,
-        at: str,
-        project_id: str,
-        *,
-        account_id: Optional[str] = None,
-        allow_global_fallback: bool = True,
-    ) -> Optional[str]:
-        sessions_result = await self._aisandbox_request(
-            "GET",
-            f"/flowCreationAgent/sessions?projectId={quote(project_id, safe='')}",
-            at=at,
-            content_type=None,
-            account_id=account_id,
-        )
-        session_id = self._extract_agent_session_id(sessions_result)
-        if session_id or not allow_global_fallback:
-            return session_id
-
-        global_sessions_result = await self._aisandbox_request(
-            "GET",
-            "/flowCreationAgent/sessions",
-            at=at,
-            content_type=None,
-            account_id=account_id,
-        )
-        return self._extract_agent_session_id(global_sessions_result)
-
-    async def get_flow_creation_agent_session_detail(
-        self,
-        at: str,
-        agent_session_id: str,
-        *,
-        account_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        return await self._aisandbox_request(
-            "GET",
-            f"/flowCreationAgent/sessions/{quote(agent_session_id, safe='')}",
-            at=at,
-            content_type=None,
-            account_id=account_id,
-        )
-
-    async def create_flow_entity(
-        self,
-        st: str,
-        project_id: str,
-    ) -> str:
-        payload = {"json": {"projectId": project_id}}
-        result = await self._labs_trpc_post_with_st(
-            "flow.createEntity",
-            payload=payload,
-            st=st,
-            project_id=project_id,
-        )
-        entity_id = self._extract_flow_entity_id(result)
-        if not entity_id:
-            raise RuntimeError(f"flow.createEntity response has no entityId: keys={list(result.keys())}")
-        return entity_id
-
     async def create_character_entity(self, at: str, project_id: str, display_name: str, account_id: Optional[str] = None) -> str:
         """Flow Characters (2026-09-23): create an empty CHARACTER entity in the project; photos are
         attached afterwards with copy_project_media_to_character_slot. Returns the entityId."""
@@ -3116,8 +2500,8 @@ class FlowClient:
         return str(entity_id)
 
     async def batch_get_entities(self, at: str, entity_ids: List[str], account_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """GET /flow/entities:batchGet -> the `results` list, one item per id
-        ({"entity": …} or {"error": {"code": 5, …}} for a missing one)."""
+        """The `results` list, one item per id ({"entity": …} or {"error": {"code": 5, …}} for a missing one).
+        Flow's web app has no batch read, so this reports the photos this process attached (handle only)."""
         if not entity_ids:
             return []
         if flow_ck.is_session_handle(at):
@@ -3129,12 +2513,7 @@ class FlowClient:
                 if str(e) in self._character_photos else {"error": {"code": 5, "message": "not known to this process"}}
                 for e in entity_ids
             ]
-        query = "&".join(f"entityIds={urllib.parse.quote(str(e), safe='')}" for e in entity_ids)
-        result = await self._aisandbox_request(
-            "GET", f"/flow/entities:batchGet?{query}", at=at, account_id=account_id,
-        )
-        results = (result or {}).get("results") if isinstance(result, dict) else None
-        return list(results) if isinstance(results, list) else []
+        raise FlowAPIError(401, "UNAUTHENTICATED: this account has no Flow cookie session yet", "UNAUTHENTICATED")
 
     async def copy_project_media_to_character_slot(
         self,
@@ -3168,251 +2547,6 @@ class FlowClient:
         self._character_photos[str(entity_id)] = max(self._character_photos.get(str(entity_id), 0),
                                                      int(image_reference_index) + 1)
         return result
-
-    async def stream_flow_creation_agent(
-        self,
-        at: str,
-        payload: Dict[str, Any],
-        *,
-        account_id: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        url = f"{self.api_base_url}/flowCreationAgent:streamChat?alt=sse"
-        headers = self._build_browser_style_control_headers(
-            referer="https://labs.google/",
-            origin="https://labs.google",
-            account_id=account_id,
-            content_type="application/json",
-            accept_language=self._get_primary_accept_language(),
-        )
-        headers["Accept"] = "text/event-stream, text/event-stream"
-
-        raw_text = await self._make_text_request(
-            method="POST",
-            url=url,
-            headers=headers,
-            json_data=payload,
-            use_at=True,
-            at_token=at,
-            timeout=self._get_video_submit_timeout(),
-            apply_default_client_headers=False,
-            impersonate=self._resolve_runtime_impersonate(),
-        )
-        return self._parse_sse_json_events(raw_text)
-
-    async def generate_omni_reference_video(
-        self,
-        at: str,
-        st: str,
-        project_id: str,
-        prompt: str,
-        aspect_ratio: str,
-        reference_media_ids: List[str],
-        model_usage_key: str = "abra_r2v_10s",
-        model_display_name: str = "Omni Flash",
-        duration: int = 10,
-        user_paygate_tier: str = "PAYGATE_TIER_ONE",
-        token_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        if not st:
-            raise RuntimeError("Omni reference video needs an ST token, but this account has no ST")
-        if not reference_media_ids:
-            raise RuntimeError("Omni reference video needs at least 1 reference image")
-
-        max_retries = self._resolve_generation_retry_budget(config.flow_max_retries)
-        last_error = None
-        retry_attempt = 0
-        session_id = self._generate_session_id()
-        entity_handle = "entity-0"
-        video_context_warmed = False
-        account_id = at[:16] if at else None
-        entity_id: Optional[str] = None
-        agent_aspect_ratio = self._video_aspect_ratio_to_agent_aspect_ratio(aspect_ratio)
-        agent_prompt = (
-            f"{prompt}\n\nUse a {agent_aspect_ratio} aspect ratio."
-            if prompt
-            else f"Use a {agent_aspect_ratio} aspect ratio."
-        )
-
-        while retry_attempt < max_retries:
-            recaptcha_token, browser_id = await self._get_recaptcha_token(
-                project_id,
-                action="VIDEO_GENERATION",
-                token_id=token_id,
-            )
-
-            if not recaptcha_token:
-                last_error = Exception("Failed to obtain reCAPTCHA token")
-                should_retry = await self._handle_missing_recaptcha_token(
-                    retry_attempt=retry_attempt,
-                    max_retries=max_retries,
-                    browser_id=browser_id,
-                    project_id=project_id,
-                    log_prefix="[VIDEO OMNI-R2V] Generation ",
-                )
-                if should_retry:
-                    retry_attempt += 1
-                    continue
-                raise last_error
-
-            try:
-                if not entity_id:
-                    entity_id = await self.create_flow_entity(st=st, project_id=project_id)
-                    for index, media_id in enumerate(reference_media_ids):
-                        await self.copy_project_media_to_character_slot(
-                            at=at,
-                            project_id=project_id,
-                            media_id=media_id,
-                            entity_id=entity_id,
-                            image_reference_index=index,
-                            account_id=account_id,
-                        )
-                    debug_logger.log_info(
-                        f"[VIDEO OMNI-R2V] Created character entity and attached reference images: project_id={project_id}, entity_id={entity_id}, refs={len(reference_media_ids)}"
-                    )
-
-                if not video_context_warmed:
-                    await self._warmup_flow_video_frontend_context(
-                        at=at,
-                        project_id=project_id,
-                        token_id=token_id,
-                        session_id=session_id,
-                        user_paygate_tier=user_paygate_tier,
-                        prompt=agent_prompt,
-                        model_key=model_usage_key,
-                        aspect_ratio=aspect_ratio,
-                    )
-                    video_context_warmed = True
-
-                agent_session_id = await self.get_flow_creation_agent_session(
-                    at=at,
-                    project_id=project_id,
-                    account_id=account_id,
-                    allow_global_fallback=True,
-                )
-                if not agent_session_id:
-                    raise RuntimeError(f"Flow Creation Agent Session not found: project_id={project_id}")
-
-                session_detail = await self.get_flow_creation_agent_session_detail(
-                    at=at,
-                    agent_session_id=agent_session_id,
-                    account_id=account_id,
-                )
-                current_turn_count = self._extract_turn_count(session_detail)
-                next_turn_number = current_turn_count + 1
-
-                prompt_payload = {
-                    "agentSessionId": agent_session_id,
-                    "agentClientContext": {
-                        "projectId": f"projects/{project_id}",
-                        "clientSessionId": session_id,
-                        "recaptchaContext": {
-                            "token": recaptcha_token,
-                            "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                        },
-                        "turnNumber": next_turn_number,
-                    },
-                    "userMessage": {
-                        "userPrompt": {
-                            "parts": [{"text": agent_prompt}],
-                        },
-                        "entityReferences": [
-                            {
-                                "entityId": entity_id,
-                                "handle": entity_handle,
-                            }
-                        ],
-                    },
-                }
-
-                prompt_events = await self.stream_flow_creation_agent(
-                    at=at,
-                    payload=prompt_payload,
-                    account_id=account_id,
-                )
-                tool_result = self._extract_generate_video_with_references_result(prompt_events)
-
-                if not tool_result:
-                    approve_recaptcha_token, _ = await self._get_recaptcha_token(
-                        project_id,
-                        action="VIDEO_GENERATION",
-                        token_id=token_id,
-                    )
-                    if not approve_recaptcha_token:
-                        # Same text as every other mint failure so the token manager
-                        # applies the flat mint pause, not a reputation strike.
-                        raise RuntimeError("Failed to obtain reCAPTCHA token (Omni approval stage)")
-                    approve_payload = {
-                        "agentSessionId": agent_session_id,
-                        "agentClientContext": {
-                            "projectId": f"projects/{project_id}",
-                            "clientSessionId": session_id,
-                            "recaptchaContext": {
-                                "token": approve_recaptcha_token,
-                                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                            },
-                            "turnNumber": next_turn_number + 1,
-                        },
-                        "userMessage": {
-                            "userPrompt": {
-                                "parts": [{"text": "Approve"}],
-                            }
-                        },
-                    }
-                    approve_events = await self.stream_flow_creation_agent(
-                        at=at,
-                        payload=approve_payload,
-                        account_id=account_id,
-                    )
-                    tool_result = self._extract_generate_video_with_references_result(approve_events)
-
-                if not tool_result:
-                    raise RuntimeError("Omni reference video did not return a generate_video_with_references toolResult")
-
-                media_id = str(tool_result.get("media_id") or "").strip()
-                resolved_project_id = str(tool_result.get("project_id") or project_id).strip() or project_id
-                if not media_id:
-                    raise RuntimeError(f"Omni reference video toolResult has no media_id: {tool_result}")
-
-                operation = {
-                    "operation": {"name": media_id},
-                    "name": media_id,
-                    "mediaName": media_id,
-                    "projectId": resolved_project_id,
-                    "workflowId": tool_result.get("workflow_id"),
-                    "batchId": tool_result.get("batch_id"),
-                    "status": "MEDIA_GENERATION_STATUS_ACTIVE",
-                }
-                return {
-                    "operations": [operation],
-                    "agentToolResult": tool_result,
-                    "projectId": resolved_project_id,
-                    "entityId": entity_id,
-                    "entityHandle": entity_handle,
-                    "modelUsageKey": model_usage_key,
-                    "aspectRatio": tool_result.get("aspect_ratio") or aspect_ratio,
-                    "duration": duration,
-                    "modelDisplayName": model_display_name,
-                }
-            except Exception as e:
-                last_error = e
-                should_retry = await self._handle_retryable_generation_error(
-                    error=e,
-                    retry_attempt=retry_attempt,
-                    max_retries=max_retries,
-                    browser_id=browser_id,
-                    project_id=project_id,
-                    log_prefix="[VIDEO OMNI-R2V] Generation ",
-                    defer_browser_error_notification=True,
-                )
-                if should_retry:
-                    max_retries = self._resolve_generation_retry_budget(max_retries, e)
-                    retry_attempt += 1
-                    continue
-                raise
-
-            retry_attempt += 1
-
-        raise last_error
 
     async def generate_video_reference_images(
         self,
@@ -3449,7 +2583,6 @@ class FlowClient:
         retry_attempt = 0
         session_id = self._generate_session_id()
         batch_id = str(uuid.uuid4())
-        video_context_warmed = False
         while retry_attempt < max_retries:
             # Get a fresh reCAPTCHA token on every retry - video uses VIDEO_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(
@@ -3470,18 +2603,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise last_error
-            if not video_context_warmed:
-                await self._warmup_flow_video_frontend_context(
-                    at=at,
-                    project_id=project_id,
-                    token_id=token_id,
-                    session_id=session_id,
-                    user_paygate_tier=user_paygate_tier,
-                    prompt=prompt,
-                    model_key=model_key,
-                    aspect_ratio=aspect_ratio,
-                )
-                video_context_warmed = True
             request_seed = random.randint(1, 99999)
             json_data = {
                 "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
@@ -3575,7 +2696,6 @@ class FlowClient:
         retry_attempt = 0
         session_id = self._generate_session_id()
         batch_id = str(uuid.uuid4())
-        video_context_warmed = False
         while retry_attempt < max_retries:
             # Get a fresh reCAPTCHA token on every retry - video uses VIDEO_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(
@@ -3596,18 +2716,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise last_error
-            if not video_context_warmed:
-                await self._warmup_flow_video_frontend_context(
-                    at=at,
-                    project_id=project_id,
-                    token_id=token_id,
-                    session_id=session_id,
-                    user_paygate_tier=user_paygate_tier,
-                    prompt=prompt,
-                    model_key=model_key,
-                    aspect_ratio=aspect_ratio,
-                )
-                video_context_warmed = True
             client_context = {
                 "recaptchaContext": {
                     "token": recaptcha_token,
@@ -3705,7 +2813,6 @@ class FlowClient:
         retry_attempt = 0
         session_id = self._generate_session_id()
         batch_id = str(uuid.uuid4())
-        video_context_warmed = False
         while retry_attempt < max_retries:
             # Get a fresh reCAPTCHA token on every retry - video uses VIDEO_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(
@@ -3726,18 +2833,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise last_error
-            if not video_context_warmed:
-                await self._warmup_flow_video_frontend_context(
-                    at=at,
-                    project_id=project_id,
-                    token_id=token_id,
-                    session_id=session_id,
-                    user_paygate_tier=user_paygate_tier,
-                    prompt=prompt,
-                    model_key=model_key,
-                    aspect_ratio=aspect_ratio,
-                )
-                video_context_warmed = True
             client_context = {
                 "recaptchaContext": {
                     "token": recaptcha_token,
@@ -3835,7 +2930,6 @@ class FlowClient:
         session_id = self._generate_session_id()
         workflow_id = str(uuid.uuid4())
         batch_id = str(uuid.uuid4())
-        video_context_warmed = False
         while retry_attempt < max_retries:
             recaptcha_token, browser_id = await self._get_recaptcha_token(
                 project_id,
@@ -3855,18 +2949,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise last_error
-            if not video_context_warmed:
-                await self._warmup_flow_video_frontend_context(
-                    at=at,
-                    project_id=project_id,
-                    token_id=token_id,
-                    session_id=session_id,
-                    user_paygate_tier=user_paygate_tier,
-                    prompt=prompt,
-                    model_key=model_key,
-                    aspect_ratio=aspect_ratio,
-                )
-                video_context_warmed = True
 
             request_seed = random.randint(1, 99999)
             json_data = {
@@ -3937,152 +3019,6 @@ class FlowClient:
         # All retries failed
         raise last_error
 
-    # ========== Video Concatenation ==========
-
-    async def run_concatenation(
-        self,
-        at: str,
-        original_media_id: str,
-        extend_media_id: str,
-    ) -> dict:
-        """
-        Join videos with the Google runVideoFxConcatenation API
-        
-        Args:
-            at: auth token
-            original_media_id: original video mediaGenerationId (UUID)
-            extend_media_id: extended video mediaGenerationId (UUID)
-        
-        Returns:
-            dict with the operation name
-        """
-        url = f"{self.api_base_url}:runVideoFxConcatenation"
-        
-        json_data = {
-            "inputVideos": [
-                {
-                    "mediaGenerationId": original_media_id,
-                    "lengthNanos": 8000,
-                    "startTimeOffset": "0s",
-                    "endTimeOffset": "8s"
-                },
-                {
-                    "mediaGenerationId": extend_media_id,
-                    "lengthNanos": 8000,
-                    "startTimeOffset": "1s",
-                    "endTimeOffset": "8s"
-                }
-            ]
-        }
-        
-        debug_logger.log_info(f"[CONCAT] Submitting concat job: original={original_media_id[:12]}..., extend={extend_media_id[:12]}...")
-        
-        result = await self._make_request(
-            method="POST",
-            url=url,
-            json_data=json_data,
-            use_at=True,
-            at_token=at
-        )
-        debug_logger.log_info(f"[CONCAT] Concat job submitted: {json.dumps(result, ensure_ascii=False)[:300]}")
-        return result
-
-    async def poll_concatenation_status(
-        self,
-        at: str,
-        operation_name: str,
-        timeout: int = 300,
-        poll_interval: int = 3,
-    ) -> dict:
-        """
-        Poll the concat job until it finishes or times out
-        
-        Args:
-            at: auth token
-            operation_name: concat job operation name
-            timeout: timeout in seconds
-            poll_interval: poll interval in seconds
-        
-        Returns:
-            dict with outputUri and mediaGenerationId
-        """
-        url = f"{self.api_base_url}:runVideoFxCheckConcatenationStatus"
-        json_data = {
-            "operation": {
-                "operation": {
-                    "name": operation_name
-                }
-            }
-        }
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout:
-            result = await self._make_request(
-                method="POST",
-                url=url,
-                json_data=json_data,
-                use_at=True,
-                at_token=at,
-                timeout=300,  # concat API returns base64 video (~14MB), needs longer timeout
-            )
-            
-            status = result.get("status", "")
-            output_uri = result.get("outputUri", "")
-            encoded_video = result.get("encodedVideo", "")
-            
-            ev_len = len(encoded_video) if encoded_video else 0
-            elapsed = int(time.time() - start_time)
-            all_keys = list(result.keys())
-            debug_logger.log_info(
-                f"[CONCAT] Status: {status}, outputUri={'yes' if output_uri else 'no'}, "
-                f"encodedVideo={ev_len} chars, elapsed={elapsed}s, keys={all_keys}"
-            )
-            
-            # Check outputUri first
-            if output_uri:
-                debug_logger.log_info(f"[CONCAT] Concat done (outputUri): {output_uri[:120]}")
-                return result
-            
-            # Google API returns encodedVideo (base64 MP4) instead of outputUri
-            if encoded_video and "SUCCESSFUL" in status:
-                try:
-                    import os
-                    video_bytes = base64.b64decode(encoded_video)
-                    video_filename = f"concat_{uuid.uuid4().hex[:12]}.mp4"
-                    
-                    # Save to tmp/ (FastAPI serves it as static files at /tmp)
-                    save_dir = "tmp"
-                    os.makedirs(save_dir, exist_ok=True)
-                    save_path = os.path.join(save_dir, video_filename)
-                    
-                    with open(save_path, "wb") as f:
-                        f.write(video_bytes)
-                    
-                    # Build URL: FastAPI mounts /tmp -> /app/tmp/
-                    serve_url = f"/tmp/{video_filename}"
-                    debug_logger.log_info(f"[CONCAT] Concat done (encodedVideo): saved {len(video_bytes)} bytes -> {serve_url}")
-                    
-                    result["outputUri"] = serve_url
-                    result["local_file"] = save_path
-                    return result
-                except Exception as e:
-                    debug_logger.log_error(f"[CONCAT] Failed to decode encodedVideo: {e}")
-                    raise Exception(f"Failed to decode stitched video: {e}")
-            
-            # SUCCESSFUL but neither outputUri nor encodedVideo
-            if "SUCCESSFUL" in status:
-                debug_logger.log_warning(f"[CONCAT] SUCCESSFUL but no outputUri/encodedVideo: {json.dumps(result, ensure_ascii=False)[:300]}")
-
-            if "FAILED" in status or "ERROR" in status:
-                debug_logger.log_error(f"[CONCAT] Failed: {status}, response: {json.dumps(result, ensure_ascii=False)[:300]}")
-                raise Exception(f"Video stitching failed: {status}")
-            
-            await asyncio.sleep(poll_interval)
-        
-        debug_logger.log_error(f"[CONCAT] Timed out ({timeout}s), giving up on concat")
-        raise Exception(f"Video stitching timed out ({timeout}s)")
-
     # ========== Video Upsampler ==========
 
     async def upsample_video(
@@ -4118,7 +3054,6 @@ class FlowClient:
         session_id = self._generate_session_id()
         batch_id = str(uuid.uuid4())
         scene_id = str(uuid.uuid4())
-        video_context_warmed = False
         while retry_attempt < max_retries:
             recaptcha_token, browser_id = await self._get_recaptcha_token(
                 project_id,
@@ -4138,18 +3073,6 @@ class FlowClient:
                     retry_attempt += 1
                     continue
                 raise last_error
-            if not video_context_warmed:
-                await self._warmup_flow_video_frontend_context(
-                    at=at,
-                    project_id=project_id,
-                    token_id=token_id,
-                    session_id=session_id,
-                    user_paygate_tier=user_paygate_tier,
-                    prompt="",
-                    model_key=model_key,
-                    aspect_ratio=aspect_ratio,
-                )
-                video_context_warmed = True
 
             request_seed = random.randint(1, 99999)
             json_data = {
@@ -4263,228 +3186,6 @@ class FlowClient:
         if last_error is not None:
             raise last_error
         raise RuntimeError("Video status query failed")
-
-    async def get_media_url_redirect(
-        self,
-        st: str,
-        media_name: str,
-    ) -> str:
-        """Get the real video CDN URL from the labs.google trpc endpoint (added 2026-05).
-
-        With the new schema, batchCheckAsyncVideoGenerationStatus no longer returns
-        fifeUrl even when SUCCESSFUL; use the labs.google
-        /fx/api/trpc/media.getMediaUrlRedirect endpoint (ST cookie auth) to get the
-        302 redirect Location.
-
-        Args:
-            st: Session Token (__Secure-next-auth.session-token cookie value)
-            media_name: media ID, i.e. media[].name from batchCheckAsync...
-
-        Returns:
-            The real video CDN URL (value of the 3xx Location header).
-
-        Raises:
-            ValueError: media_name or st is empty.
-            RuntimeError: network error, no 3xx, or no Location header.
-        """
-        if not media_name:
-            raise ValueError("get_media_url_redirect: media_name is empty")
-        if not st:
-            raise ValueError("get_media_url_redirect: missing ST token")
-
-        url = (
-            f"{self.labs_base_url}/trpc/media.getMediaUrlRedirect"
-            f"?name={media_name}"
-        )
-
-        # Accept / Range headers copied from a real browser capture
-        # (FINDINGS/T2V_04_FINDING_the_redirect_result.md); cannot use _make_request because it follows the 302.
-        headers = {
-            "accept": (
-                "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,"
-                "audio/*;q=0.6,*/*;q=0.5"
-            ),
-            "accept-language": "en-US,en;q=0.9",
-            "accept-encoding": "identity",
-            "Range": "bytes=0-",
-            "referer": f"{self.labs_base_url}/fx/tools/flow",
-            "Sec-Fetch-Dest": "video",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "Priority": "u=0",
-            "pragma": "no-cache",
-            "cache-control": "no-cache",
-            "cookie": f"__Secure-next-auth.session-token={st}",
-        }
-
-        # Send via proxy (if any), reusing the proxy logic of _make_request.
-        proxy_url = None
-        try:
-            if self.proxy_manager:
-                if hasattr(self.proxy_manager, "get_request_proxy_url"):
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                else:
-                    proxy_url = await self.proxy_manager.get_proxy_url()
-        except Exception:
-            proxy_url = None
-
-        # Debug: log request
-        if config.debug_enabled:
-            debug_logger.log_request(
-                method="GET",
-                url=url,
-                headers=headers,
-                proxy=proxy_url
-            )
-
-        start_time = time.time()
-
-        try:
-            async with AsyncSession(trust_env=False) as session:
-                response = await session.get(
-                    url,
-                    headers=headers,
-                    allow_redirects=False,
-                    timeout=30,
-                    proxy=proxy_url,
-                    impersonate="chrome124",
-                )
-        except Exception as e:
-            debug_logger.log_error(f"[MEDIA REDIRECT] Request failed: media={media_name}, error={e}")
-            raise RuntimeError(
-                f"getMediaUrlRedirect request failed (media={media_name}): {e}"
-            ) from e
-
-        duration_ms = (time.time() - start_time) * 1000
-        status_code = getattr(response, "status_code", 0)
-        resp_headers = getattr(response, "headers", {}) or {}
-
-        # Debug: log response
-        if config.debug_enabled:
-            debug_logger.log_response(
-                status_code=status_code,
-                headers=dict(resp_headers) if resp_headers else {},
-                body=f"Location: {resp_headers.get('Location') or resp_headers.get('location', 'N/A')}",
-                duration_ms=duration_ms
-            )
-
-        location = None
-        try:
-            location = resp_headers.get("Location") or resp_headers.get("location")
-        except Exception:
-            try:
-                location = dict(resp_headers).get("Location")
-            except Exception:
-                location = None
-
-        if status_code not in (301, 302, 303, 307, 308) or not location:
-            debug_logger.log_error(
-                f"[MEDIA REDIRECT] No redirect returned: status={status_code}, "
-                f"media={media_name}, location={location}"
-            )
-            raise RuntimeError(
-                f"getMediaUrlRedirect did not return a redirect "
-                f"(status={status_code}, media={media_name})"
-            )
-
-        debug_logger.log_info(f"[MEDIA REDIRECT] Success: media={media_name}, location={str(location)[:200]}")
-        return str(location)
-
-    # ========== Media delete (uses ST) ==========
-
-    async def delete_media(self, st: str, media_names: List[str]):
-        """Delete media
-
-        Args:
-            st: Session Token
-            media_names: list of media IDs
-        """
-        url = f"{self.labs_base_url}/trpc/media.deleteMedia"
-        json_data = {
-            "json": {
-                "names": media_names
-            }
-        }
-
-        await self._make_request(
-            method="POST",
-            url=url,
-            json_data=json_data,
-            use_st=True,
-            st_token=st
-        )
-
-    async def get_media_url_redirect(
-        self,
-        st: str,
-        media_name: str,
-        media_url_type: str = "MEDIA_URL_TYPE_FULL_MEDIA",
-    ) -> Optional[str]:
-        """Get the real media URL via trpc media.getMediaUrlRedirect."""
-        normalized_media_name = str(media_name or "").strip()
-        if not normalized_media_name:
-            return None
-
-        url = (
-            f"{self.labs_base_url}/trpc/media.getMediaUrlRedirect"
-            f"?name={quote(normalized_media_name, safe='')}"
-            f"&mediaUrlType={quote(str(media_url_type or 'MEDIA_URL_TYPE_FULL_MEDIA'), safe='')}"
-        )
-
-        proxy_url = None
-        if self.proxy_manager:
-            if hasattr(self.proxy_manager, "get_request_proxy_url"):
-                proxy_url = await self.proxy_manager.get_request_proxy_url()
-            else:
-                proxy_url = await self.proxy_manager.get_proxy_url()
-
-        headers = {
-            "Cookie": f"__Secure-next-auth.session-token={st}",
-            "User-Agent": self._generate_user_agent(st[:16] if st else None),
-            "Accept": "*/*",
-        }
-        for key, value in self._default_client_headers.items():
-            headers.setdefault(key, value)
-
-        request_timeout = self._get_control_plane_timeout()
-        start_time = time.time()
-        try:
-            async with AsyncSession(trust_env=False) as session:
-                response = await session.get(
-                    url,
-                    headers=headers,
-                    proxy=proxy_url,
-                    timeout=request_timeout,
-                    impersonate="chrome124",
-                    allow_redirects=False,
-                )
-
-            duration_ms = (time.time() - start_time) * 1000
-            if config.debug_enabled:
-                debug_logger.log_response(
-                    status_code=response.status_code,
-                    headers=dict(response.headers),
-                    body=response.text,
-                    duration_ms=duration_ms,
-                )
-
-            if 300 <= response.status_code < 400:
-                location = response.headers.get("Location") or response.headers.get("location")
-                if location:
-                    return urljoin(url, location)
-
-            final_url = str(getattr(response, "url", "") or "").strip()
-            if response.status_code == 200 and final_url and final_url != url:
-                return final_url
-
-            raise RuntimeError(
-                f"media.getMediaUrlRedirect returned unexpected status={response.status_code} "
-                f"for media={normalized_media_name}"
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to get media redirect URL: media={normalized_media_name}, type={media_url_type}, error={e}"
-            ) from e
 
     # ========== Helpers ==========
 
@@ -4624,10 +3325,6 @@ class FlowClient:
     def _generate_session_id(self) -> str:
         """Build sessionId: ;timestamp"""
         return f";{int(time.time() * 1000)}"
-
-    def _generate_scene_id(self) -> str:
-        """Build sceneId: UUID"""
-        return str(uuid.uuid4())
 
     async def _server_fallback_can_serve(self, token_id: Optional[int]) -> bool:
         """Flag on, this image has Chromium, and the account has its own proxy."""

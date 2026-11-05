@@ -215,7 +215,8 @@ class HandlerPhotoRefusalTests(unittest.IsolatedAsyncioTestCase):
         nia = LoadedCharacter(name="Nia", images=[b"bad", b"ok2"])
         with patch.object(CharacterService, "get_instance", return_value=CharacterService()):
             self.handler.db.get_flow_character = AsyncMock(return_value=None)
-            error = await self._run("omni_r2v_8s_portrait", characters=[nia])
+            # An image model: videos with characters are a 501 before any setup since stage 2 (2026-11).
+            error = await self._run("gemini-3.1-flash-image-portrait", characters=[nia])
         self.assertEqual(error["status_code"], 400)
         self.assertEqual(error["code"], "photo_refused_by_google")
         self.assertEqual(error["character"], "Nia")
