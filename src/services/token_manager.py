@@ -860,7 +860,7 @@ class TokenManager:
         access token never has an active window."""
         existing_token = await self.db.get_token_by_st(st)
         if existing_token:
-            raise ValueError(f"Token ??????: {existing_token.email}?")
+            raise ValueError(f"Token already exists: {existing_token.email}")
 
         debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
         try:
@@ -879,7 +879,7 @@ class TokenManager:
                 except Exception:
                     pass
         except Exception as e:
-            raise ValueError(f"ST?AT??: {str(e)}")
+            raise ValueError(f"Flow sign-in failed: {str(e)}")
 
         try:
             credits_result = await self.flow_client.get_credits(at)
@@ -914,12 +914,11 @@ class TokenManager:
                     tool_name="PINHOLE"
                 ))
             except Exception as e:
-                # Since Flow moved to flow.google.com (2026-09) the Labs endpoint answers 404 for a
-                # fresh account. The worker extension (3.5.2+) reports the project it sees open on
-                # flow.google.com instead (project_id above); tell staff exactly what to do.
+                # The worker extension (3.5.2+) reports the project it sees open on flow.google.com
+                # (project_id above); without one the server must create it, and when that fails tell
+                # staff exactly what to do.
                 raise ValueError(
-                    "Flow no longer lets the server create a project through Labs "
-                    f"(project.createProject: {e}). In this browser open flow.google.com, click New project "
+                    f"Flow did not return a project ({e}). In this browser open flow.google.com, click New project "
                     "once, keep that tab open, then press Reconnect — the worker reports that project."
                 )
 
