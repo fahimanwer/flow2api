@@ -18,18 +18,11 @@ unmanaged browser) and its options page tells laptop users "Installed from a fol
 it by itself; when a newer version is served, download it here." Its server browsers update by an image rebuild + host
 agent restart run by the operator (its `AGENTS.md`, release steps).
 
-## Plan to make laptops automatic (not started; needs the owner)
+## Laptops stay manual (owner decision 2026-11-05)
 
-1. **Chrome Enterprise Core** (Google: "cloud-based management and reporting for $0"). The owner signs up once with an
-   admin Google account (needs a domain we own) and creates an enrollment token.
-2. Each staff Chrome gets that token once (a `.reg` file on Windows, a profile on macOS) — after that Chrome counts as
-   managed.
-3. flow2api packs the extension as a signed CRX with a fixed key and serves `updates.xml` + the CRX (as pinterest-factory
-   does); the admin console force-installs that extension id from our update URL.
-4. From then on, publishing a version updates every staff Chrome within hours, with no clicks. Staff Chrome shows
-   "managed by your organization"; staff cannot remove the extension.
-5. One-time cost: the CRX has a new extension id, so each laptop's extension settings (route key) start fresh once; the
-   server re-binds accounts by email on the first push.
-
-Fallback if enrollment is unwanted: a small helper on each laptop (Windows scheduled task) that downloads the published
-zip into the unpacked folder, plus an extension check that reloads itself when its files change. Not tested yet.
+Owner: "keep it manual no chrome enterprise". Staff update the unpacked extension by hand when the banner shows; no Chrome
+Enterprise Core enrollment and no laptop helper. Options that were weighed (for the record; reopen only on a new owner order):
+Chrome Enterprise Core enrollment + a signed CRX force-installed from our `updates.xml` (no clicks, but Chrome shows
+"managed by your organization" and the extension id changes once), or a per-laptop helper that refreshes the unpacked folder
+(never tested). Note found 2026-11-05 by the pinterest-factory research: both extensions set Chrome's proxy, so one profile
+cannot run the flow2api worker and the Pinterest extension together.
