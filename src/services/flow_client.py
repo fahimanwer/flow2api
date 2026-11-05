@@ -1,7 +1,6 @@
 """Flow API Client for VideoFX (Veo)"""
 import asyncio
 import json
-import os
 import contextvars
 import time
 from datetime import datetime, timedelta, timezone
@@ -1114,11 +1113,6 @@ class FlowClient:
 
     # ========== Cookie sessions (2026-10-23) ==========
 
-    def cookie_rpc_enabled(self) -> bool:
-        """flow.google.com cookie sessions replace the retired Labs ST->AT API. Default ON;
-        FLOW_COOKIE_RPC=0 restores the old path (only useful if Google brings it back)."""
-        return os.environ.get("FLOW_COOKIE_RPC", "1").strip().lower() not in ("0", "false", "off", "no")
-
     def set_cookie_hint(self, google_cookies: Optional[str], proxy: Optional[str],
                         user_agent: Optional[str] = None):
         """Cookies a worker just pushed: used by st_to_at in this request before stored ones."""
@@ -1433,105 +1427,16 @@ class FlowClient:
     # ========== Auth (uses ST) ==========
 
     async def st_to_at(self, st: str) -> dict:
-        """Convert ST to AT
-
-        Args:
-            st: Session Token
-
-        Returns:
-            {
-                "access_token": "AT",
-                "expires": "2025-11-15T04:46:04.000Z",
-                "user": {...}
-            }
-        """
-        if self.cookie_rpc_enabled():
-            return await self._cookie_st_to_at(st)
-        url = f"{self.labs_base_url}/auth/session"
-        try:
-            return await self._make_request(
-                method="GET",
-                url=url,
-                use_st=True,
-                st_token=st,
-                timeout=self._get_control_plane_timeout(),
-            )
-        except Exception as e:
-            if not self._is_proxy_connection_error(e):
-                raise
-
-            debug_logger.log_warning(
-                f"[AUTH] ST->AT failed via configured proxy, retrying direct connection: {e}"
-            )
-            return await self._make_request(
-                method="GET",
-                url=url,
-                use_st=True,
-                st_token=st,
-                timeout=self._get_control_plane_timeout(),
-                force_no_proxy=True,
-            )
+        """Sign the account in to Flow with its stored (or just pushed) Google cookies and return
+        {"access_token": <FLOWCK handle>, "expires": ..., "user": {"email": ..., "name": ...}}.
+        `st` is the row key: it selects the row whose cookies are used (see _cookie_source_for_st)."""
+        return await self._cookie_st_to_at(st)
 
     # ========== Projects (uses ST) ==========
 
     async def create_project(self, st: str, title: str) -> str:
-        """Create a project and return project_id
-
-        Args:
-            st: Session Token
-            title: project title
-
-        Returns:
-            project_id (UUID)
-        """
-        if self.cookie_rpc_enabled():
-            return await self._cookie_create_project(st, title)
-        url = f"{self.labs_base_url}/trpc/project.createProject"
-        json_data = {
-            "json": {
-                "projectTitle": title,
-                "toolName": "PINHOLE"
-            }
-        }
-        max_retries = config.flow_max_retries
-        request_timeout = max(self._get_control_plane_timeout(), min(self.timeout, 15))
-        last_error: Optional[Exception] = None
-
-        for retry_attempt in range(max_retries):
-            try:
-                result = await self._make_request(
-                    method="POST",
-                    url=url,
-                    json_data=json_data,
-                    use_st=True,
-                    st_token=st,
-                    timeout=request_timeout,
-                )
-                project_result = (
-                    result.get("result", {})
-                    .get("data", {})
-                    .get("json", {})
-                    .get("result", {})
-                )
-                project_id = project_result.get("projectId")
-                if not project_id:
-                    raise Exception("Invalid project.createProject response: missing projectId")
-                return project_id
-            except Exception as e:
-                last_error = e
-                retry_reason = "network timeout" if self._is_timeout_error(e) else self._get_retry_reason(str(e))
-                if retry_reason and retry_attempt < max_retries - 1:
-                    debug_logger.log_warning(
-                        f"[PROJECT] Create project failed, retrying ({retry_attempt + 2}/{max_retries}) "
-                        f"title={title!r}, reason={retry_reason}: {e}"
-                    )
-                    await asyncio.sleep(1)
-                    continue
-                raise
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("Failed to create project")
+        """Create a Flow project for the row keyed by `st` and return its id (Flow web RPC jHPbke)."""
+        return await self._cookie_create_project(st, title)
 
     # ========== Credits (uses AT) ==========
 

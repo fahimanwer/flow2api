@@ -4,7 +4,6 @@ import hashlib
 import inspect
 import json
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -582,7 +581,7 @@ async def update_token(
         # Cookie sessions (2026-10-23): the ST is only the row's key now. A save that keeps it is a plain
         # field edit and must not need a working Google login (an account whose cookies went stale is
         # exactly the one you want to edit). A changed ST still goes through the login as before.
-        plain_edit = token_manager.flow_client.cookie_rpc_enabled() and (not st_in or st_in == (existing.st or ""))
+        plain_edit = (not st_in or st_in == (existing.st or ""))
         at = at_expires = None
         if not plain_edit:
             result = await token_manager.flow_client.st_to_at(st_in)
@@ -2210,23 +2209,16 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
     _pname = request.get("project_name")
     reported_project_name = str(_pname).strip()[:80] if isinstance(_pname, str) and _pname.strip() else None
 
-    # Cookie login helper: derive a fresh Labs session from the pushed Google cookies,
-    # through the worker's reported residential proxy (else the bound row's stored one).
+    # The pushed Google cookies are the credential; st_to_at in this request logs in with them (hint below).
     bound_row = await db.get_token(token_id_override) if token_id_override is not None else None
     if token_id_override is not None and not bound_row:
         raise HTTPException(status_code=404, detail=f"Token {token_id_override} not found")
     derived_from_cookies = False
-    # One budget for the whole recovery (the worker gives up on the POST after 25 s).
-    request_started = time.monotonic()
-
-    def _remaining() -> float:
-        return COOKIE_RECOVERY_BUDGET_SECONDS - (time.monotonic() - request_started)
-
     # Cookie sessions (2026-10-23): Google retired the Labs session API, so the pushed Google cookies
     # ARE the credential. st_to_at in this request logs in to flow.google.com with them (through the
     # worker's reported proxy), never through the retired Labs login. The context var lives in this
     # request's own task (uvicorn runs each request in a new task), so it cannot leak to another push.
-    cookie_mode = token_manager.flow_client.cookie_rpc_enabled() and bool(google_cookies)
+    cookie_mode = bool(google_cookies)
     if cookie_mode:
         token_manager.flow_client.set_cookie_hint(
             google_cookies,
@@ -2235,26 +2227,11 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
         )
 
     async def _derive_st_from_cookies() -> str:
+        """The pushed cookies are the credential (cookie sessions, 2026-10-23): the row keeps its stored key and a
+        cookie-only push validates as "" (st_to_at logs in with the hint set above). Every caller has google_cookies."""
         nonlocal derived_from_cookies
-        if cookie_mode:
-            # No Labs login any more: the row keeps its stored key; a cookie-only push validates as "".
-            derived_from_cookies = True
-            return (bound_row.st if bound_row else "") or ""
-        if _remaining() < 6.0:
-            raise HTTPException(status_code=503, detail="No time left for a Google login in this push; retry")
-        proxy = reported_proxy_url or (token_manager.cookie_login_proxy(bound_row) if bound_row else None)
-        login = await token_manager.cookie_login(
-            bound_row or SimpleNamespace(id="new", email=None, login_account=None),
-            google_cookies=google_cookies, proxy=proxy,
-            timeout=min(token_manager.COOKIE_LOGIN_TIMEOUT_SECONDS, _remaining() - 1.0),
-        )
-        if login.get("success") and login.get("session_token"):
-            derived_from_cookies = True
-            return str(login["session_token"]).strip()
-        reason = login.get("reason") or "rejected"
-        if reason in ("network", "timeout"):
-            raise HTTPException(status_code=503, detail=f"Google login via cookies failed ({reason}); retry")
-        raise HTTPException(status_code=400, detail=f"Google cookies could not log in ({reason}): {login.get('error')}")
+        derived_from_cookies = True
+        return (bound_row.st if bound_row else "") or ""
 
     # Step 1: Convert ST to AT to get user info (including email). A dead pushed ST is
     # replaced by one derived from the cookies when the worker sent them.
@@ -2631,7 +2608,6 @@ async def _plugin_update_token_impl(request: dict, authorization: Optional[str] 
 
 
 COOKIE_SYNC_MAX_BYTES = 256 * 1024
-COOKIE_RECOVERY_BUDGET_SECONDS = 23.0   # the worker abandons the push POST after 25 s
 _cookie_recovery_locks: Dict[int, asyncio.Lock] = {}
 
 

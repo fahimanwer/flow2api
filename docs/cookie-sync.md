@@ -44,8 +44,7 @@ push carries the rotated cookies. With the browser gone, the account stops withi
 `POST /api/plugin/cookie-sync {action: clear}` right away (no Google round-trip, so it works
 even when the Labs login is broken) and the server deletes its copy (`protocol_mode` back to
 `session`); the switch shows "Deletion pending" and retries every minute until the server
-confirms. OFF does not revoke the Labs session the server already holds; that one simply
-expires on its own and is not renewed. Turning it ON pushes the current login immediately.
+confirms. Turning it ON pushes the current login immediately.
 The status line shows what the last push proved: "Server copy updated N min ago (K cookies)"
 means the server stored the cookies, not that a future renewal is guaranteed (Google can
 still refuse the replay; then the account waits for the laptop as before).
@@ -88,7 +87,7 @@ Code: `src/services/flow_cookie_session.py` (login + transport), `src/services/f
    page. Server errors, a 403 or a changed page are retry-later errors and never disable an account.
 6. **Tier** is never guessed: the stored tier wins; a new row takes Flow's 2nd credits number
    (1 = Pro, 2 = Ultra, matching every account seen on 2026-10-23).
-7. `FLOW_COOKIE_RPC=0` restores the retired Labs path (useful only if Google brings it back).
+7. There is no switch back; the Labs path was deleted (2026-11, stage 2).
 
 Not on the new API yet (clear 501, never an account strike): Flow Characters, stitching an
 extended video.
