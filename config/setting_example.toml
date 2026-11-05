@@ -4,7 +4,6 @@ admin_username = "admin"
 admin_password = "admin"
 
 [flow]
-labs_base_url = "https://labs.google/fx/api"
 api_base_url = "https://aisandbox-pa.googleapis.com/v1"
 timeout = 120
 max_retries = 3

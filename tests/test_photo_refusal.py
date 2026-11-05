@@ -14,7 +14,6 @@ from src.services.flow_client import (
     FlowAPIError,
     FlowClient,
     FlowPhotoRefusedError,
-    flow_api_error_from_body,
     photo_refusal_reason,
 )
 from src.services.generation_handler import GenerationHandler
@@ -30,6 +29,11 @@ def _prominent():
 class UploadImageRefusalTests(unittest.IsolatedAsyncioTestCase):
     async def _upload(self, error, project_id="project-123"):
         client = FlowClient(proxy_manager=None)
+        # Cookie session (stage 2): with db=None, _cookie_upload_image needs only session.token_id.
+        client._cookie_session_for_handle = AsyncMock(
+            return_value=types.SimpleNamespace(token_id=1, email="a@x", proxy=None)
+        )
+        client._get_recaptcha_token = AsyncMock(return_value=("tok", None))
         calls = []
 
         async def fake_make_request(**kwargs):
@@ -40,7 +44,7 @@ class UploadImageRefusalTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.services.flow_client.config") as cfg, patch("asyncio.sleep", AsyncMock()):
             cfg.flow_max_retries = 3
             try:
-                await client.upload_image("at", JPEG_BYTES, "IMAGE_ASPECT_RATIO_PORTRAIT", project_id=project_id)
+                await client.upload_image("FLOWCK.t.1", JPEG_BYTES, "IMAGE_ASPECT_RATIO_PORTRAIT", project_id=project_id)
             except Exception as exc:  # the result under test
                 return exc, calls
         self.fail("upload_image should have raised")
@@ -53,36 +57,10 @@ class UploadImageRefusalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("real or famous person", str(exc))
         self.assertEqual(len(calls), 1)  # one attempt, not three
 
-    async def test_refusal_without_project_does_not_try_the_legacy_endpoint(self):
-        exc, calls = await self._upload(_prominent(), project_id=None)
-        self.assertIsInstance(exc, FlowPhotoRefusedError)
-        self.assertEqual(len(calls), 1)
-
     async def test_reason_is_read_from_the_text_when_the_structured_reason_is_missing(self):
         exc, calls = await self._upload(FlowAPIError(400, f"HTTP Error 400: {{\"reason\": \"PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD\"}}"))
         self.assertIsInstance(exc, FlowPhotoRefusedError)
         self.assertEqual(exc.reason, "PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD")
-
-    async def test_urllib_path_keeps_the_reason_from_a_full_google_envelope(self):
-        # The real envelope puts the reason after ~200 characters; cutting first lost it.
-        body = json.dumps({"error": {
-            "code": 400, "message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT",
-            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                         "reason": "PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD", "domain": "aisandbox-pa.googleapis.com"}],
-        }})
-        self.assertGreater(body.index("PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD"), 150)
-        error = flow_api_error_from_body(400, body)
-        self.assertEqual(error.reason, "PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD")
-        self.assertEqual(str(error), f"HTTP Error 400: {GOOGLE_TEXT}")
-        self.assertEqual(photo_refusal_reason(error), "PUBLIC_ERROR_PROMINENT_PEOPLE_UPLOAD")
-        self.assertEqual(str(flow_api_error_from_body(502, "<html>bad gateway</html>")), "HTTP Error 502: <html>bad gateway</html>")
-
-    async def test_urllib_path_keeps_retrying_structured_server_errors(self):
-        body = json.dumps({"error": {"code": 500, "message": "backend unavailable",
-                                     "details": [{"reason": "INTERNAL"}]}})
-        error = flow_api_error_from_body(500, body)
-        self.assertEqual(error.reason, "INTERNAL")
-        self.assertEqual(FlowClient(proxy_manager=None)._get_retry_reason(str(error)), "500/internal error")
 
     async def test_quota_and_traffic_refusals_are_not_photo_refusals(self):
         for reason in ("PUBLIC_ERROR_PER_MODEL_DAILY_QUOTA_REACHED", "PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC"):
@@ -93,7 +71,6 @@ class UploadImageRefusalTests(unittest.IsolatedAsyncioTestCase):
     async def test_other_project_scoped_failures_still_say_what_google_answered(self):
         exc, calls = await self._upload(FlowAPIError(500, "HTTP Error 500: backend exploded"))
         self.assertNotIsInstance(exc, FlowPhotoRefusedError)
-        self.assertIn("legacy :uploadUserImage fallback is disabled", str(exc))
         self.assertIn("HTTP Error 500: backend exploded", str(exc))
         self.assertEqual(len(calls), 3)  # a 500 is still worth retrying
 

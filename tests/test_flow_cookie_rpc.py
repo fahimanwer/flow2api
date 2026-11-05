@@ -483,3 +483,40 @@ def test_stale_handle_follows_the_rows_current_promoted_handle():
     client.db.get_token = AsyncMock(return_value=SimpleNamespace(id=17, at=old.handle, email="a@x.com"))  # not re-pushed yet
     with pytest.raises(FlowAPIError):
         asyncio.run(client._cookie_session_for_handle(old.handle))
+
+
+def _non_handle_401():
+    """Stage 2 (2026-11): the REST transport is gone, so an `at` that is not a FLOWCK handle is a local 401.
+    Both AsyncSession imports fail if entered: a real REST request would otherwise reach Google, and
+    Google's own 401 would pass the status check by accident (plan r2, A3)."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from src.services.flow_client import FlowAPIError, FlowClient
+
+    client = FlowClient(proxy_manager=None)
+    client._cookie_session_for_handle = AsyncMock(side_effect=AssertionError("session lookup"))
+    rest = MagicMock(side_effect=AssertionError("network"))
+    cookie = MagicMock(side_effect=AssertionError("network"))
+    with patch("src.services.flow_client.AsyncSession", rest), \
+            patch("src.services.flow_cookie_session.AsyncSession", cookie):
+        with pytest.raises(FlowAPIError) as err:
+            asyncio.run(client._make_request(method="GET", url=client.api_base_url + "/credits",
+                                             use_at=True, at_token="ya29.legacy"))
+    rest.assert_not_called()
+    cookie.assert_not_called()
+    client._cookie_session_for_handle.assert_not_called()
+    return client, err.value
+
+
+def test_non_handle_at_is_a_local_401_without_any_network_call():
+    _, error = _non_handle_401()
+    assert error.status_code == 401 and error.reason == "UNAUTHENTICATED"
+
+
+def test_the_local_401_starts_the_normal_refresh():
+    from src.services.token_manager import TokenManager
+
+    client, error = _non_handle_401()
+    tm = TokenManager.__new__(TokenManager)
+    tm.flow_client = client
+    assert tm._classify_refresh_error(error) == "st_expired"
