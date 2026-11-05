@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, List
 from ..core.database import Database
 from ..core.config import config
 from ..core.models import Token, Project
-from ..core.logger import debug_logger, mask_proxy_url
+from ..core.logger import debug_logger
 from ..core.monitoring import record_token_refresh
 from .flow_client import FlowClient, FlowAPIError
 from .proxy_manager import ProxyManager
@@ -1548,10 +1548,6 @@ class TokenManager:
             record_token_refresh("at", "failure")
             return RefreshOutcome(False, reason)
 
-    # One Google login replay must finish well inside the extension's 25 s push timeout
-    # and the request paths that wait on it.
-    COOKIE_LOGIN_TIMEOUT_SECONDS = 20.0
-
     @staticmethod
     def cookie_login_proxy(token) -> Optional[str]:
         """The proxy a cookie login for this account must use: the protocol-login proxy if
@@ -1566,100 +1562,30 @@ class TokenManager:
                 return normalized
         return None
 
-    async def cookie_login(self, token, google_cookies: Optional[str] = None, proxy: Optional[str] = None,
-                           timeout: Optional[float] = None) -> Dict[str, Any]:
-        """Replay the Labs "Sign in with Google" with the account's stored (or given) Google
-        cookies through its proxy. Returns the protocol_login result dict, always with
-        `reason` (no_cookies / no_proxy / timeout / network / rejected / …)."""
-        from .protocol_login import protocol_loginer
-
-        cookies = (google_cookies if google_cookies is not None else getattr(token, "google_cookies", "")) or ""
-        if not cookies.strip():
-            return {"success": False, "reason": "no_cookies", "error": "No Google cookies stored for this account"}
-        proxy_url = proxy or self.cookie_login_proxy(token)
-        if not proxy_url:
-            return {"success": False, "reason": "no_proxy", "error": "No proxy for this account; refusing to log in from the server IP"}
-        budget = float(timeout) if timeout else self.COOKIE_LOGIN_TIMEOUT_SECONDS
-        budget = max(1.0, min(budget, self.COOKIE_LOGIN_TIMEOUT_SECONDS))
-        try:
-            result = await asyncio.wait_for(
-                protocol_loginer.login(
-                    cookies,
-                    proxy=proxy_url,
-                    email=(getattr(token, "email", "") or getattr(token, "login_account", "") or None),
-                ),
-                timeout=budget,
-            )
-        except asyncio.TimeoutError:
-            result = {"success": False, "reason": "timeout", "error": f"Google login took longer than {budget:.0f}s"}
-        result.setdefault("reason", "ok" if result.get("success") else "rejected")
-        debug_logger.event(
-            f"[COOKIE_LOGIN] token={getattr(token, 'id', '?')} via proxy={mask_proxy_url(proxy_url)} -> "
-            f"{'ok' if result.get('success') else result.get('reason')}"
-            + ("" if result.get("success") else f" ({str(result.get('error') or '')[:120]})")
-        )
-        return result
-
     async def _try_protocol_refresh_st(self, token_id: int, token: Token) -> Optional[str]:
+        """Re-check the stored Google cookies of a protocol-mode row. Returns the row's st key when they still
+        sign in to Flow, else None so the caller asks the worker browser to push fresh cookies. (The Labs login
+        this used to replay was retired by Google on 2026-10-21 and deleted in stage 2.)"""
         if self._normalize_protocol_mode(getattr(token, "protocol_mode", "session")) != "protocol":
             return None
         if not (getattr(token, "google_cookies", "") or "").strip():
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: no Google cookies set, skipping protocol refresh")
             return None
-        if self.flow_client.cookie_rpc_enabled():
-            # 2026-10-23: the Labs login this replays is retired (CSRF 410). The stored cookies ARE the
-            # credential now. Check them HERE: if they no longer sign in (the browser rotated its login and
-            # has not pushed yet), return None so _try_refresh_st goes on to ask the worker browser to push
-            # now, instead of re-trying the same dead cookies and disabling the account (Fable audit #1).
-            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: cookie session mode, re-checking the stored Google cookies")
-            st = (token.st or "").strip()
-            if not st:
-                return None
-            try:
-                result = await self._st_to_at_for_token(token, st)
-            except Exception as e:
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: stored cookies no longer sign in ({str(e)[:100]}); asking the browser")
-                return None
-            if not isinstance(result, dict) or not result.get("access_token"):
-                return None
-            return st
-
+        # The stored cookies ARE the credential. Check them HERE: if they no longer sign in (the browser rotated its
+        # login and has not pushed yet), return None so _try_refresh_st goes on to ask the worker browser to push
+        # now, instead of re-trying the same dead cookies and disabling the account (Fable audit #1).
+        debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: re-checking the stored Google cookies")
+        st = (token.st or "").strip()
+        if not st:
+            return None
         try:
-            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: trying protocol ST refresh...")
-            login_result = await self.cookie_login(token)
-            if login_result.get("success") and login_result.get("session_token"):
-                new_st = str(login_result["session_token"]).strip()
-                # CANDIDATE only — never written here. The caller feeds it to
-                # validate-then-promote, which commits st+at TOGETHER under the lock
-                # only after the API accepts the AT. Writing st alone (and unlocked)
-                # could pair a dead ST with a valid AT a concurrent push just promoted.
-                await self.db.update_token(
-                    token_id,
-                    last_st_refresh_at=datetime.now(timezone.utc),
-                    last_st_refresh_result="minted (pending verification)",
-                )
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: protocol ST refresh succeeded (candidate)")
-                record_token_refresh("st", "success")
-                return new_st
-
-            error = str(login_result.get("error") or "Protocol refresh failed")
-            await self.db.update_token(
-                token_id,
-                last_st_refresh_at=datetime.now(timezone.utc),
-                last_st_refresh_result=error,
-            )
-            debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: protocol ST refresh failed - {error}")
-            record_token_refresh("st", "failure")
-            return None
+            result = await self._st_to_at_for_token(token, st)
         except Exception as e:
-            await self.db.update_token(
-                token_id,
-                last_st_refresh_at=datetime.now(timezone.utc),
-                last_st_refresh_result=str(e),
-            )
-            debug_logger.log_error(f"[ST_REFRESH] Token {token_id}: protocol ST refresh error - {e}")
-            record_token_refresh("st", "failure")
+            debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: stored cookies no longer sign in ({str(e)[:100]}); asking the browser")
             return None
+        if not isinstance(result, dict) or not result.get("access_token"):
+            return None
+        return st
 
     async def _try_refresh_st(self, token_id: int, token) -> Optional[str]:
         """Try to refresh the Session Token (protocol login, else the account's worker extension)
@@ -1719,18 +1645,14 @@ class TokenManager:
             if status == "refreshed":
                 updated = await self.db.get_token(token_id)
                 new_st = updated.st if updated else None
-                if new_st and self.flow_client.cookie_rpc_enabled():
+                if new_st:
                     # Cookie sessions: the push stored fresh Google cookies and promoted a verified session;
                     # the row keeps its st key, so an unchanged st is success here.
                     debug_logger.event(f"[ST_REFRESH] token={token_id} worker browser pushed fresh Google cookies")
                     record_token_refresh("st", "success")
                     return new_st
-                if new_st and new_st != token.st:
-                    debug_logger.event(f"[ST_REFRESH] token={token_id} ST refreshed via extension")
-                    record_token_refresh("st", "success")
-                    return new_st
                 debug_logger.op_warning(
-                    f"[ST_REFRESH] token={token_id} extension reported refreshed but ST unchanged"
+                    f"[ST_REFRESH] token={token_id} extension reported refreshed but the row has no st key"
                 )
                 record_token_refresh("st", "failure")
                 return None
