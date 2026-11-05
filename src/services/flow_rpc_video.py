@@ -392,7 +392,7 @@ def _translate_generation(body: Dict[str, Any], mode: str):
     if request.get("referenceEntities"):
         raise NotImplementedError(
             "Flow video RPC: referenceEntities (Flow characters) have no slot in the current frontend "
-            "video RPC (upstream create_flow_entity is retired too)"
+            "video RPC"
         )
 
     # Dropped everywhere (no slot in upstream's request): body.mediaGenerationContext (batchId,

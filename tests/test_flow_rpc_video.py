@@ -13,7 +13,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -500,35 +500,16 @@ async def test_handler_resolves_the_status_result_by_operation_id():
     operation = normalize([OPERATION, PROJECT, MEDIA, VIDEO_URL])["operations"][0]
     handler = GenerationHandler.__new__(GenerationHandler)
     handler.flow_client = MagicMock()
-    handler.flow_client.get_media_url_redirect = AsyncMock(return_value=VIDEO_URL)
 
     token = MagicMock()
     token.at = "FLOWCK.abc.def"
     resolved = await handler._resolve_video_asset(token, operation)
 
-    # Cookie session: the signed link from the status RPC is used as is; the retired Labs redirect is not called.
-    handler.flow_client.get_media_url_redirect.assert_not_awaited()
+    # Cookie session: the signed link from the status RPC is used as is; the Labs redirect was deleted (stage 2).
+    from src.services.flow_client import FlowClient
+    assert not hasattr(FlowClient, "get_media_url_redirect")
     assert resolved["video_url"] == VIDEO_URL
     assert resolved["video_media_id"] == OPERATION
-
-
-@pytest.mark.asyncio
-async def test_handler_without_a_link_keeps_the_labs_redirect_for_legacy_tokens():
-    from src.services.generation_handler import GenerationHandler
-
-    operation = {"name": OPERATION, "operation": {"name": OPERATION, "metadata": {"video": {}}}}
-    handler = GenerationHandler.__new__(GenerationHandler)
-    handler.flow_client = MagicMock()
-    handler.flow_client.get_media_url_redirect = AsyncMock(return_value=VIDEO_URL)
-    token = MagicMock()
-    token.at = "ya29.legacy"
-    token.st = "st"
-
-    resolved = await handler._resolve_video_asset(token, operation)
-
-    # The lookup key our handler sends is the operation id (as29s answers code=[5] for the media name).
-    assert handler.flow_client.get_media_url_redirect.await_args.args[1] == OPERATION
-    assert resolved["video_url"] == VIDEO_URL
 
 
 # --------------------------------------------------------------------------- as29s follow-ups
