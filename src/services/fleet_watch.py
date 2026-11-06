@@ -10,6 +10,14 @@ What it watches, every CHECK_EVERY_SECONDS, from the database only (no Google ca
   DEGRADED_WINDOW_MINUTES and fewer than DEGRADED_BELOW of them succeeded. Why: on 2026-11-04 the fleet
   ran at 13-56 % success for 9 hours and nothing paged, because some requests still succeeded.
   It counts as recovered only at RECOVERED_AT again, so a rate hovering near 50 % does not flap.
+"down" and "degraded" count only ATTEMPTS (2026-11-06, owner: "only when the code change breaks, not when staff goes
+home"): requests that reached an account, minus Google's answers that are not our fault (SHORTAGE_MARKERS: daily
+quota, refused content, high traffic). A request that found no free account (token_id NULL: all accounts on a break,
+quota used up, logins expired after the laptops closed) is a shortage, never a page. On 2026-11-05/06 content-factory
+had one account at night: 3,232 requests, 548 OK (17 %) but 85 % of the attempts OK, so it no longer pages.
+Known limits (Astra review 2026-11-06): a code bug that rejects every account BEFORE one is tried (token_id NULL) is not
+seen here, only by "no active account" and the server-browser alerts; login failures and captcha refusals on a selected
+account still count, on purpose (a broken login or captcha path is exactly what must page).
 A problem pages once when it starts, again every REMIND_SECONDS while it lasts, and once more when
 it ends. Delivery reuses the Ultra browsers Telegram outbox (`ultra_alerts`, sent by
 UltraService.send_pending_alerts; rows wait there when Telegram is not configured). The same rows
@@ -30,6 +38,8 @@ DEGRADED_WINDOW_MINUTES = 60
 DEGRADED_MIN_REQUESTS = 30
 DEGRADED_BELOW = 0.50
 RECOVERED_AT = 0.70
+# Google answers on a real attempt that mean "not now / not this content", not "flow2api is broken".
+SHORTAGE_MARKERS = ("DAILY_QUOTA", "UNSAFE_GENERATION", "HIGH_TRAFFIC", "photo_refused", "PROMINENT_PEOPLE")
 
 
 class FleetWatch:
@@ -42,7 +52,8 @@ class FleetWatch:
         self._task: Optional[asyncio.Task] = None
 
     async def _numbers(self) -> Tuple[int, int, int, int, int]:
-        """(finished, ok) in the last WINDOW_MINUTES, active accounts, (finished, ok) in the last DEGRADED_WINDOW_MINUTES."""
+        """(attempts, ok) in the last WINDOW_MINUTES, active accounts, (attempts, ok) in the last DEGRADED_WINDOW_MINUTES.
+        An attempt = a finished request that succeeded, or that failed on an account for a reason not in SHORTAGE_MARKERS."""
         async with self.db.connect() as conn:
             # FINISHED requests by completion time (102 = still running: a burst of fresh video jobs is
             # not an outage, and a job that started earlier but finished now is evidence).
@@ -51,8 +62,11 @@ class FleetWatch:
                 "COALESCE(SUM(CASE WHEN t > datetime('now', ?) AND status_code = 200 THEN 1 ELSE 0 END), 0), "
                 "COUNT(*), COALESCE(SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END), 0) "
                 "FROM (SELECT status_code, COALESCE(updated_at, created_at) AS t FROM request_logs "
-                "WHERE status_code != 102 AND COALESCE(updated_at, created_at) > datetime('now', ?))",
-                (f"-{WINDOW_MINUTES} minutes", f"-{WINDOW_MINUTES} minutes", f"-{DEGRADED_WINDOW_MINUTES} minutes"),
+                "WHERE status_code != 102 AND COALESCE(updated_at, created_at) > datetime('now', ?) "
+                "AND (status_code = 200 OR (token_id IS NOT NULL"
+                + "".join(" AND instr(COALESCE(response_body, ''), ?) = 0" for _ in SHORTAGE_MARKERS) + ")))",
+                (f"-{WINDOW_MINUTES} minutes", f"-{WINDOW_MINUTES} minutes", f"-{DEGRADED_WINDOW_MINUTES} minutes",
+                 *SHORTAGE_MARKERS),
             )).fetchone()
             active = (await (await conn.execute("SELECT COUNT(*) FROM tokens WHERE is_active = 1")).fetchone())[0]
         return int(total or 0), int(ok or 0), int(active or 0), int(hour_total or 0), int(hour_ok or 0)
@@ -66,12 +80,12 @@ class FleetWatch:
             return "fleet_down", (f"flow2api: NO active account (all disabled). {total} requests in the last {WINDOW_MINUTES} min, "
                                   f"{ok} succeeded. Check the admin page (Token Management) and the worker browsers.")
         if total >= MIN_REQUESTS and ok == 0:
-            return "fleet_down", (f"flow2api: 0 of {total} requests succeeded in the last {WINDOW_MINUTES} min "
+            return "fleet_down", (f"flow2api: 0 of {total} requests that reached an account succeeded in the last {WINDOW_MINUTES} min "
                                   f"({active} active accounts). Google may have changed Flow again; check the logs.")
         if hour_total >= DEGRADED_MIN_REQUESTS:
             rate = hour_ok / hour_total
             if rate < (RECOVERED_AT if degraded else DEGRADED_BELOW):
-                return "fleet_degraded", (f"flow2api degraded: only {hour_ok} of {hour_total} finished requests succeeded "
+                return "fleet_degraded", (f"flow2api degraded: only {hour_ok} of {hour_total} requests that reached an account succeeded "
                                           f"in the last {DEGRADED_WINDOW_MINUTES} min ({rate:.0%}; {active} active accounts). "
                                           "Check the logs for the main failure reason.")
         elif degraded:
@@ -108,10 +122,10 @@ class FleetWatch:
         elif self._problem is not None and active > 0 and (ok if self._kind == "fleet_down" else hour_ok) > 0:
             # Recovery needs evidence (a real success); quiet traffic keeps the outage open, silently.
             if self._kind == "fleet_down":
-                text = (f"flow2api recovered: {ok} of {total} finished requests OK in the last "
+                text = (f"flow2api recovered: {ok} of {total} requests that reached an account OK in the last "
                         f"{WINDOW_MINUTES} min, {active} active accounts.")
             else:
-                text = (f"flow2api recovered: {hour_ok} of {hour_total} finished requests OK in the last "
+                text = (f"flow2api recovered: {hour_ok} of {hour_total} requests that reached an account OK in the last "
                         f"{DEGRADED_WINDOW_MINUTES} min, {active} active accounts.")
             await self._page("fleet_ok", text)
             self._problem = self._kind = None
