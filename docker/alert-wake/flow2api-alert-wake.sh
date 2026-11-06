@@ -7,6 +7,8 @@
 # into the flow2api T3 thread on the owner's Mac through T3's own API (wakes it even when idle or settled).
 # If the Mac's T3 cannot be reached for FALLBACK_AFTER seconds, the message goes to the CC box's fleet-guard watch
 # thread instead. Recoveries never wake anyone. Telegram delivery is untouched (flow2api does that itself).
+# fleet_degraded wakes only when the running flow2api container was deployed less than DEPLOY_WINDOW before the alert
+# (owner 2026-11-06: "only when the code change breaks, not when staff goes home"); later ones go to Telegram only.
 #
 # Usage: flow2api-alert-wake            one pass (the timer)
 #        flow2api-alert-wake --dry-run  print what the next pass would post; changes nothing
@@ -21,6 +23,8 @@ DB=${DB:-/var/lib/docker/volumes/jc4044co4w8w0g8w0g4ks0ws-data/_data/flow.db}
 POST=${POST:-/usr/local/lib/flow2api-alert-wake/t3-post.mjs}
 WAKE_KINDS="'fleet_down','fleet_degraded','host_silent','logged_out','needs_you','error'"   # fleet_ok/host_ok/ok = recoveries
 FALLBACK_AFTER=${FALLBACK_AFTER:-900}
+APP=${APP:-jc4044co4w8w0g8w0g4ks0ws}          # Coolify app uuid: its containers are named <uuid>-<timestamp>
+DEPLOY_WINDOW=${DEPLOY_WINDOW:-21600}         # 6 h
 MAX_PER_HOUR=${MAX_PER_HOUR:-4}
 # shellcheck disable=SC1091
 . "$CONF_DIR/env"
@@ -31,6 +35,21 @@ post() {  # $1 = mac|box, message on stdin; prints the poster's last line
   if [ "$1" = mac ]; then origin=$MAC_ORIGIN thread=$MAC_THREAD token=$CONF_DIR/mac.token
   else origin=$BOX_ORIGIN thread=$BOX_THREAD token=$CONF_DIR/box.token; fi
   timeout 30 node "$POST" "$origin" "$token" "$thread" 2>&1 | tail -1
+}
+q() { sqlite3 -readonly -cmd ".timeout 5000" "$@"; }   # waits out flow2api's write locks instead of failing
+deployed_at() {  # epoch seconds of the newest running app container's creation; empty if unknown
+  local ids
+  ids=$(docker ps -q --filter "name=^${APP}-" 2>/dev/null) || return 0
+  [ -n "$ids" ] || return 0
+  # shellcheck disable=SC2086
+  docker inspect -f '{{.Created}}' $ids 2>/dev/null | while read -r c; do date -u -d "$c" +%s 2>/dev/null; done | sort -n | tail -1
+}
+after_deploy() {  # $1 = alert created_at. True when the alert came within DEPLOY_WINDOW after the current deploy, or
+  local t d       # when either time is unknown or the alert predates this container (fail open: wake)
+  t=$(date -u -d "$1" +%s 2>/dev/null) || return 0
+  [ -n "$deploy" ] || return 0
+  [ "$t" -lt "$deploy" ] && return 0
+  d=$((t - deploy)); [ "$d" -le "$DEPLOY_WINDOW" ]
 }
 record_post() { echo "$now" >> "$STATE/posts"; tail -n 50 "$STATE/posts" > "$STATE/posts.tmp" && mv "$STATE/posts.tmp" "$STATE/posts"; }
 FOOTER="Sent by flow2api-alert-wake on 78.46.131.169 (docker/alert-wake/ in the flow2api repo; stop: systemctl disable --now flow2api-alert-wake.timer)."
@@ -48,20 +67,31 @@ fi
 
 cursor=$(cat "$STATE/cursor" 2>/dev/null || true)
 if ! [[ "$cursor" =~ ^[0-9]+$ ]]; then  # first run: start after what is already there, never replay history
-  cursor=$(sqlite3 -readonly "$DB" "SELECT COALESCE(MAX(id), 0) FROM ultra_alerts") || { log "db read failed"; exit 1; }
+  cursor=$(q "$DB" "SELECT COALESCE(MAX(id), 0) FROM ultra_alerts") || { log "db read failed"; exit 1; }
   [ "${1:-}" = "--dry-run" ] && { echo "first run: would start after alert id $cursor"; exit 0; }
   echo "$cursor" > "$STATE/cursor"; log "started after alert id $cursor"; exit 0
 fi
 
-rows=$(sqlite3 -readonly -separator $'\t' "$DB" \
+rows=$(q -separator $'\t' "$DB" \
   "SELECT id, kind, created_at, replace(replace(replace(text, char(10), ' '), char(13), ' '), char(9), ' ')
    FROM ultra_alerts WHERE id > $cursor ORDER BY id LIMIT 50") || { log "db read failed"; exit 1; }
 [ -z "$rows" ] && { rm -f "$STATE/fail-since"; exit 0; }
 last=$(tail -1 <<<"$rows" | cut -f1)
-problems=$(awk -F'\t' -v kinds="$WAKE_KINDS" 'index(kinds, "'"'"'" $2 "'"'"'") { printf "- %s %s: %s\n", $3, $2, $4 }' <<<"$rows")
+deploy=$(deployed_at)
+problems=""
+while IFS=$'\t' read -r id kind created text; do
+  case ",$WAKE_KINDS," in *",'$kind',"*) ;; *) continue;; esac
+  if [ "$kind" = fleet_degraded ] && ! after_deploy "$created"; then
+    note="alert $id fleet_degraded at $created: deploy $(date -u -d "@$deploy" +%FT%TZ) is over $((DEPLOY_WINDOW / 3600)) h older, Telegram only (no wake)"
+    if [ "${1:-}" = "--dry-run" ]; then echo "$note"; else log "$note"; fi
+    continue
+  fi
+  problems+="- $created $kind: $text"$'\n'
+done <<<"$rows"
+problems=${problems%$'\n'}
 
-if [ -z "$problems" ]; then  # only recoveries: nothing to wake
-  [ "${1:-}" = "--dry-run" ] && { echo "only recoveries up to id $last: no wake"; exit 0; }
+if [ -z "$problems" ]; then  # only recoveries (or degraded long after a deploy): nothing to wake
+  [ "${1:-}" = "--dry-run" ] && { echo "nothing to wake up to id $last"; exit 0; }
   echo "$last" > "$STATE/cursor"; rm -f "$STATE/fail-since"; exit 0
 fi
 
