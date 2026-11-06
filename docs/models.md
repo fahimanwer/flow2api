@@ -14,6 +14,11 @@ entry has a readable `name`, `family`, `google_model`, `mode`, `orientation`, `d
 | **Nano Banana Pro** (images) | `gemini-3-pro-image` | `gemini-3.0-pro-image-{aspect}[-2k\|-4k]` | `nano-banana-pro-{aspect}[-2k\|-4k]` |
 | **Nano Banana 2 Lite** (images, 1K only) | `gemini-3.1-flash-lite-image` | `nano-banana-2-lite-{aspect}` | (the id is already readable) |
 | **Omni 1.1 Flash** (video; Google also calls it "Omni Flash") | `gemini-omni-1.1-flash` | `omni*`, `omni_r2v*` (+ `_1080p`) | `omni-1.1-flash-…` (below) |
+
+**Omni 1.2 (2026-11-06):** Google launched Omni 1.2 Flash in Flow (Flow keys `macaron_cookie_*`) and rolls it out account by
+account; Omni 1.1 stays ~30 days. flow2api reads each account's own Flow model list (cached 6 h) and sends Omni 1.2 for that
+account as soon as Google lists it there, else Omni 1.1; callers keep the same ids. Omni 1.2 costs about double: 4/6/8/10 s =
+12/18/24/30 credits (1.1: 7/10/12/15).
 | **Veo 3.1 Fast / Quality / Lite** (video) | Veo 3.1 | `veo_3_1_…` | none; read `name` in `/v1/models` |
 
 `{aspect}` = `landscape` (16:9), `portrait` (9:16), `square` (1:1), `four-three` (4:3), `three-four` (3:4).

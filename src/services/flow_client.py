@@ -141,6 +141,8 @@ class FlowClient:
         self._cookie_sessions = flow_ck.FlowCookieSessions()
         # character id -> photos attached by this process (Flow web has no batch read for characters)
         self._character_photos: Dict[str, int] = {}
+        # token id -> (monotonic time read, video model keys in that account's own Flow model list)
+        self._video_keys_cache: Dict[int, tuple] = {}
         self._cookie_hint_ctx: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
             "flow_cookie_hint", default=None
         )
@@ -558,6 +560,34 @@ class FlowClient:
                                "UNAUTHENTICATED")
         self._cookie_sessions.alias(handle, session)
         return session
+
+    VIDEO_KEYS_TTL_SECONDS = 6 * 3600
+    VIDEO_KEYS_RETRY_SECONDS = 600
+
+    async def account_video_model_keys(self, token) -> frozenset:
+        """Video model keys this account's own Flow model list offers (Flow web RPC HTrJv, argument [], read from
+        the real app 2026-11-06), cached per account. Google rolls new models out account by account (Omni 1.2:
+        the test account had it, our accounts did not yet), so this decides per account. An unreadable list
+        gives an empty set (callers keep the model they had) and is retried after VIDEO_KEYS_RETRY_SECONDS."""
+        token_id = getattr(token, "id", None)
+        cached = self._video_keys_cache.get(token_id)
+        now = time.monotonic()
+        if cached and now < cached[0]:
+            return cached[1]
+        keys: frozenset = frozenset()
+        ttl = self.VIDEO_KEYS_RETRY_SECONDS
+        try:
+            session = await self._cookie_session_for_handle(str(getattr(token, "at", "") or ""))
+            project = str(getattr(token, "current_project_id", "") or "")
+            payload = await self._cookie_rpc_call(session, "HTrJv", [], f"/project/{project}" if project else "/projects",
+                                                  timeout=20)
+            keys = frozenset(re.findall(r'"((?:abra|macaron_cookie|veo)_[a-z0-9_]+)"', json.dumps(payload)))
+            if keys:
+                ttl = self.VIDEO_KEYS_TTL_SECONDS
+        except Exception as e:
+            debug_logger.op_warning(f"[VIDEO_MODELS] token={token_id} model list unreadable: {type(e).__name__}: {str(e)[:120]}")
+        self._video_keys_cache[token_id] = (now + ttl, keys)
+        return keys
 
     async def _cookie_rpc_call(self, session, rpc_id: str, argument: Any, source_path: str,
                                timeout: int, proxy_url: Optional[str] = None,
