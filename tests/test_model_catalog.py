@@ -19,7 +19,7 @@ from src.services.model_catalog import describe_model, model_catalog, readable_a
 
 class ReadableAliasTests(unittest.TestCase):
     def test_aliases_point_at_real_ids_and_never_clash(self):
-        self.assertEqual(len(READABLE_MODEL_ALIASES), 62)
+        self.assertEqual(len(READABLE_MODEL_ALIASES), 94)
         taken = set(MODEL_CONFIG) | set(IMAGE_BASE_MODELS) | set(VIDEO_BASE_MODELS) | set(FRIENDLY_VIDEO_ALIASES)
         for alias, target in READABLE_MODEL_ALIASES.items():
             self.assertIn(target, MODEL_CONFIG, alias)
@@ -56,10 +56,10 @@ class DescribeTests(unittest.TestCase):
 
     def test_expected_values(self):
         omni = describe_model("omni_r2v_8s_portrait_1080p")
-        self.assertEqual(omni["name"], "Omni 1.1 Flash · Ingredients to video (reference images) · 8 s · Portrait 9:16 · 1080p (upscaled from 720p)")
-        self.assertEqual(omni["google_model"], "gemini-omni-1.1-flash")
+        self.assertEqual(omni["name"], "Omni 1.2 Flash · Ingredients to video (reference images) · 8 s · Portrait 9:16 · 1080p (upscaled from 720p)")
+        self.assertEqual(omni["google_model"], "Flow model macaron_cookie (Omni 1.2 Flash)")
         self.assertEqual(omni["accounts"], "Pro or Ultra")
-        self.assertEqual(omni["aliases"], ["omni-1.1-flash-ingredients-8s-portrait-1080p"])
+        self.assertEqual(omni["aliases"], ["omni-1.1-flash-ingredients-8s-portrait-1080p", "omni-1.2-flash-ingredients-8s-portrait-1080p"])
         self.assertEqual(omni["inputs"]["min_images"], 1)
         self.assertTrue(omni["inputs"]["images_or_characters"])
 
@@ -77,7 +77,7 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(describe_model("veo_3_1_r2v_fast_portrait_ultra")["accounts"], "Ultra only")
         self.assertEqual(describe_model("veo_3_1_i2v_lite_portrait")["inputs"]["max_images"], 1)
         self.assertEqual(describe_model("veo_3_1_interpolation_lite_portrait")["inputs"]["min_images"], 2)
-        self.assertEqual(describe_model("omni-flash_8s_portrait_1080p")["resolution"], "1080p (upscaled from pinned 720p)")
+        self.assertEqual(describe_model("omni-flash_8s_portrait_1080p")["resolution"], "1080p (upscaled from 720p)")  # Omni 1.2: no pin
         self.assertEqual(describe_model("veo_3_1_t2v_lite_4s_portrait")["duration_seconds"], 4)
         extend = describe_model("veo_3_1_extend")
         self.assertIsNone(extend["duration_seconds"])
@@ -115,7 +115,7 @@ class ApiTests(unittest.TestCase):
     def test_gemini_list_and_get_show_display_names_and_aliases(self):
         models = asyncio.run(routes.list_gemini_models(api_key="k"))["models"]
         names = {m["name"]: m for m in models}
-        self.assertTrue(names["models/omni_r2v_8s_portrait"]["displayName"].startswith("Omni 1.1 Flash · Ingredients"))
+        self.assertTrue(names["models/omni_r2v_8s_portrait"]["displayName"].startswith("Omni 1.2 Flash · Ingredients"))
         self.assertIn("models/omni-1.1-flash-ingredients-8s-portrait", names)
         got = asyncio.run(routes.get_gemini_model("nano-banana-2.1-portrait", api_key="k"))
         self.assertEqual(got["displayName"], "Nano Banana 2.1 · Portrait 9:16 · 1K")
