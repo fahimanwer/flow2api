@@ -26,7 +26,7 @@ from ..core.logger import debug_logger
 from .flow_client import FlowPhotoRefusedError
 
 MAX_CHARACTERS_IMAGE = 10   # Flow model list: inputSpec.maxCharacters for Nano Banana models
-MAX_CHARACTERS_VIDEO = 3    # Omni abra_r2v_* and Veo r2v
+MAX_CHARACTERS_VIDEO = 3    # Omni r2v (macaron_cookie_r2v_*) and Veo r2v
 # Flow refuses a third character slot (copyProjectMedia imageReferenceIndex 2 -> HTTP 400
 # INVALID_ARGUMENT, even on an empty entity; proven on Ultra 55 and 56, 2026-10-11).
 MAX_PHOTOS_PER_CHARACTER = 2
