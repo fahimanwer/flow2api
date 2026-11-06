@@ -421,6 +421,33 @@ def test_fleet_watch_degraded_pages_and_needs_70_percent_to_recover():
     assert pages == ["fleet_degraded", "fleet_down", "fleet_degraded", "fleet_ok"]
 
 
+def test_fleet_watch_restart_does_not_page_an_open_problem_again():
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from src.services.fleet_watch import FleetWatch
+
+    pages = []
+    watch = FleetWatch(db=None)
+    opened = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+
+    async def rows():
+        return [("fleet_degraded", "flow2api degraded: only 5 of 40", opened)]
+
+    numbers = iter([(10, 1, 5, 40, 5), (10, 6, 5, 40, 24), (10, 9, 5, 40, 30)])
+
+    async def fake_numbers():
+        return next(numbers)
+
+    async def fake_page(kind, text):
+        pages.append(kind)
+
+    watch._open_problem_rows, watch._numbers, watch._page = rows, fake_numbers, fake_page
+    asyncio.run(watch.restore_open_problem())
+    for _ in range(3):
+        asyncio.run(watch.check_once())   # still degraded: silent; 60 %: still below 70 %, silent; 75 %: recovered
+    assert pages == ["fleet_ok"]
+
+
 def test_signed_in_page_without_account_field_is_transient():
     import asyncio
     from unittest.mock import patch

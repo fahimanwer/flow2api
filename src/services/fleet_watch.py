@@ -17,6 +17,7 @@ wake the flow2api T3 thread through `docker/alert-wake/` on the host.
 """
 import asyncio
 import time
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from ..core.logger import debug_logger
@@ -117,9 +118,38 @@ class FleetWatch:
             self._degraded_open = False
         return self._problem
 
+    async def _open_problem_rows(self):
+        """Fleet problem rows newer than the last fleet_ok, newest first: (kind, text, created_at)."""
+        async with self.db.connect() as conn:
+            return await (await conn.execute(
+                "SELECT kind, text, created_at FROM ultra_alerts WHERE kind IN ('fleet_down', 'fleet_degraded') AND id > "
+                "COALESCE((SELECT MAX(id) FROM ultra_alerts WHERE kind = 'fleet_ok'), 0) ORDER BY id DESC"
+            )).fetchall()
+
+    async def restore_open_problem(self) -> None:
+        """A restart (every deploy) must not page an already-open problem again. 2026-11-06: a docs deploy during the
+        night outage re-paged Telegram and woke the flow2api T3 thread for nothing. Reminders keep their 2 h rhythm."""
+        rows = await self._open_problem_rows()
+        if not rows:
+            return
+        kind, text, created_at = rows[0]
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(created_at)).total_seconds()
+        except (TypeError, ValueError):
+            return
+        if age > 24 * 3600:  # too old to trust (e.g. a lost recovery row): start clean
+            return
+        self._problem, self._kind = text, kind
+        self._degraded_open = any(r[0] == "fleet_degraded" for r in rows)
+        self._last_page_at = time.monotonic() - age
+
     def start(self) -> None:
         async def _loop():
             await asyncio.sleep(CHECK_EVERY_SECONDS)  # let workers reconnect after a deploy first
+            try:
+                await self.restore_open_problem()
+            except Exception as e:
+                debug_logger.op_warning(f"[FLEET_WATCH] could not restore the open problem: {type(e).__name__}: {e}")
             while True:
                 try:
                     await self.check_once()
