@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -841,6 +842,38 @@ for _omni_key in [k for k, v in MODEL_CONFIG.items() if v.get("video_type") == "
     MODEL_CONFIG[f"{_omni_key}_1080p"] = {**MODEL_CONFIG[_omni_key], "upsample": dict(OMNI_UPSAMPLE_1080P)}
 
 
+_OMNI_11_KEY = re.compile(r"^abra_(t2v|i2v|r2v)_(\d+)s$")
+
+
+def omni_latest_config(model_config: Dict[str, Any], account_keys: frozenset) -> Dict[str, Any]:
+    """The Omni 1.2 Flash version of an Omni 1.1 config when this account's own Flow model list offers every
+    Omni 1.2 key it needs, else the config unchanged (2026-11-06: Google launched Omni 1.2, Flow key family
+    macaron_cookie, rolling out account by account; Omni 1.1 = abra, kept ~30 days). Keys from Flow's model
+    list (HTrJv) and the real app: t2v/i2v/r2v_{d}s, first+last frame its own i2v_fl_{d}s; 720p has no
+    resolution slot, so the 720p pin is dropped."""
+    def to_12(key: Any, first_last: bool = False) -> Optional[str]:
+        found = _OMNI_11_KEY.match(str(key or ""))
+        if not found:
+            return None
+        mode, seconds = found.groups()
+        return f"macaron_cookie_{'i2v_fl' if (mode == 'i2v' and first_last) else mode}_{seconds}s"
+
+    slots = {"model_key": False, "first_frame_model_key": False, "start_end_model_key": True, "reference_model_key": False}
+    new_keys = {}
+    for slot, first_last in slots.items():
+        if slot not in model_config:
+            continue
+        key = to_12(model_config[slot], first_last)
+        if key is None or key not in account_keys:
+            return model_config
+        new_keys[slot] = key
+    if "model_key" not in new_keys:
+        return model_config
+    cfg = {**model_config, **new_keys, "reference_model_display_name": "Omni 1.2 Flash", "omni_version": "1.2"}
+    cfg.pop("output_resolution", None)
+    return cfg
+
+
 def _estimate_video_credit_cost_for_log(model: str, model_config: Dict[str, Any]) -> int:
     """Flow credit cost of a video request, for the request log only."""
     if model_config.get("type") != "video":
@@ -848,8 +881,10 @@ def _estimate_video_credit_cost_for_log(model: str, model_config: Dict[str, Any]
     model_text = f"{model} {model_config.get('model_key', '')}".lower()
     if "veo_3_1" in model_text and "lite" in model_text:
         return 10
-    if model_config.get("video_type") == "omni" or "abra_" in model_text:
+    if model_config.get("video_type") == "omni" or "abra_" in model_text or "macaron_cookie" in model_text:
         duration = int(model_config.get("reference_duration") or 8)
+        if model_config.get("omni_version") == "1.2" or "macaron_cookie" in model_text:
+            return {4: 12, 6: 18, 8: 24, 10: 30}.get(duration, 24)  # Omni 1.2, Flow model list 2026-11-06
         return {4: 7, 6: 10, 8: 12, 10: 15}.get(duration, 12)
     return 0
 
@@ -1483,6 +1518,7 @@ class GenerationHandler:
         # non-streaming callers alike, so in-flight requests (status 102) are visible
         # in the admin log while they run. Previously only streaming requests were
         # logged at start; n8n/CLI callers appeared only once finished.
+        request_log_state["request_payload"] = request_payload  # same dict the final log writes use (Omni 1.2 cost update)
         request_log_state["id"] = await self._log_request(
             token_id=None,
             operation=request_operation,
@@ -2330,6 +2366,17 @@ class GenerationHandler:
             # Update model_key in model_config
             model_config = dict(model_config)  # Copy so the original config is not changed
             model_config["model_key"] = model_key
+
+            # Omni: the newest Omni this account has (1.2 once Google turned it on for the account, else 1.1).
+            account_keys = getattr(self.flow_client, "account_video_model_keys", None)
+            if video_type == "omni" and asyncio.iscoroutinefunction(account_keys):
+                latest = omni_latest_config(model_config, await account_keys(token))
+                if latest is not model_config:
+                    debug_logger.log_info(f"[VIDEO] Omni 1.2 for token {token.id}: {model_config['model_key']} -> {latest['model_key']}")
+                    model_config = latest
+                    logged = (request_log_state or {}).get("request_payload")
+                    if isinstance(logged, dict) and "video_credit_cost" in logged:
+                        logged["video_credit_cost"] = _estimate_video_credit_cost_for_log(latest["model_key"], latest)
 
             # Image count
             image_count = len(images) if images else 0
