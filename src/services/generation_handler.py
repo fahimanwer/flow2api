@@ -35,7 +35,7 @@ from .characters import (
 
 # Reference-image limits, from Flow's own model list (GET aisandbox-pa /v1/flow/models,
 # usages[].inputSpec.maxImageReferences, read 2026-09-22; 2026-10-07 for 2.1): Nano Banana Pro / 2.1 / 2 Lite = 10,
-# Omni 1.2 Flash macaron_cookie_r2v_* = 7 (1.1 abra_r2v_* was 7 too), Veo 3.1 Fast and Lite r2v = 3.
+# Omni 1.1 Flash abra_r2v_* = 7, Veo 3.1 Fast and Lite r2v = 3.
 FLOW_IMAGE_MAX_REFERENCES = 10
 FLOW_OMNI_MAX_REFERENCES = 7
 # Reference images upload this many at a time (one by one took ~6.6 s each).
@@ -722,83 +722,84 @@ MODEL_CONFIG = {
         "supports_images": False,
         "requires_video_id": True,
     },
-    # ========== Gemini Omni Flash (Omni 1.2 since 2026-11-06) ==========
-    # Every omni* id runs the newest Omni. 2026-11-06 Google launched Omni 1.2 Flash in Flow (Flow key family
-    # macaron_cookie; Omni 1.1 = abra, kept by Google ~30 days). Keys read from Flow's own model list (HTrJv,
-    # tmp/flow_models_2026-11-06_HTrJv.json) and two real Flow-app submits (YhhmEf with macaron_cookie_t2v_8s_360p
-    # and macaron_cookie_t2v_4s): text macaron_cookie_t2v_{d}s, first frame _i2v_{d}s, first+last _i2v_fl_{d}s,
-    # ingredients _r2v_{d}s (7 references), 3-15 s (11-15 s Pro/Ultra only), 720p without a resolution slot.
+    # ========== Gemini Omni Flash ==========
+    # 2026-05-26 real upstream requests observed:
+    # - text only -> video:batchAsyncGenerateVideoText, videoModelKey=abra_t2v_8s
+    # - reference images -> video:batchAsyncGenerateVideoReferenceImages, videoModelKey=abra_r2v_8s
     "omni": {
         "type": "video",
         "video_type": "omni",
-        "model_key": "macaron_cookie_t2v_8s",
+        "model_key": "abra_t2v_8s",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
         "supports_images": True,
         "min_images": 0,
         "max_images": FLOW_OMNI_MAX_REFERENCES,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
-        "reference_model_key": "macaron_cookie_r2v_8s",
+        "reference_model_key": "abra_r2v_8s",
         "reference_duration": 8,
-        "reference_model_display_name": "Omni 1.2 Flash",
+        "reference_model_display_name": "Omni Flash",
     },
     "omni_portrait": {
         "type": "video",
         "video_type": "omni",
-        "model_key": "macaron_cookie_t2v_8s",
+        "model_key": "abra_t2v_8s",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
         "supports_images": True,
         "min_images": 0,
         "max_images": FLOW_OMNI_MAX_REFERENCES,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
-        "reference_model_key": "macaron_cookie_r2v_8s",
+        "reference_model_key": "abra_r2v_8s",
         "reference_duration": 8,
-        "reference_model_display_name": "Omni 1.2 Flash",
+        "reference_model_display_name": "Omni Flash",
     },
-    # omni-flash*: kept as names (callers may use them); since Omni 1.2 the same as omni*, because 720p is the
-    # key's own resolution and the Flow app sends no resolution slot for it (2026-11-06 HAR). The old
-    # outputSpec 720p pin (Gurumigun/flow2api 4093385a) is gone.
+    # Omni Flash pinned to 720p output (outputSpec.resolution). Same upstream model
+    # key as "omni"; only the requested output resolution differs. Adapted from
+    # Gurumigun/flow2api 4093385a.
     "omni-flash": {
         "type": "video",
         "video_type": "omni",
-        "model_key": "macaron_cookie_t2v_8s",
+        "model_key": "abra_t2v_8s",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
         "supports_images": True,
         "min_images": 0,
         "max_images": FLOW_OMNI_MAX_REFERENCES,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
-        "reference_model_key": "macaron_cookie_r2v_8s",
+        "output_resolution": "VIDEO_RESOLUTION_720P",
+        "reference_model_key": "abra_r2v_8s",
         "reference_duration": 8,
-        "reference_model_display_name": "Omni 1.2 Flash",
+        "reference_model_display_name": "Omni Flash",
     },
     "omni-flash-portrait": {
         "type": "video",
         "video_type": "omni",
-        "model_key": "macaron_cookie_t2v_8s",
+        "model_key": "abra_t2v_8s",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
         "supports_images": True,
         "min_images": 0,
         "max_images": FLOW_OMNI_MAX_REFERENCES,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
-        "reference_model_key": "macaron_cookie_r2v_8s",
+        "output_resolution": "VIDEO_RESOLUTION_720P",
+        "reference_model_key": "abra_r2v_8s",
         "reference_duration": 8,
-        "reference_model_display_name": "Omni 1.2 Flash",
+        "reference_model_display_name": "Omni Flash",
     },
 }
 
 
-# ── Omni: first frame (1 image) = _i2v_{d}s, first+last frame (2 images) = _i2v_fl_{d}s (its own key in
-#    Omni 1.2; 1.1 sent abra_i2v for both), 3+ images = the reference-images route (_r2v_{d}s). Adapted from
+# ── Omni 1.1: first-frame (1 image) / first+last frame (2 images) use abra_i2v_*s;
+#    3+ images stay on the reference-images route (abra_r2v_*s). Adapted from
 #    Danborad/flow2api 7059fe14 + f9b8e8e2.
 for _omni_key in ("omni", "omni_portrait", "omni-flash", "omni-flash-portrait"):
-    MODEL_CONFIG[_omni_key].setdefault("first_frame_model_key", "macaron_cookie_i2v_8s")
-    MODEL_CONFIG[_omni_key].setdefault("start_end_model_key", "macaron_cookie_i2v_fl_8s")
+    MODEL_CONFIG[_omni_key].setdefault("first_frame_model_key", "abra_i2v_8s")
+    MODEL_CONFIG[_omni_key].setdefault("start_end_model_key", "abra_i2v_8s")
+    MODEL_CONFIG[_omni_key]["reference_model_display_name"] = "Omni 1.1 Flash"
 
 # ── Duration families: omni_4s / omni_6s / omni_8s / omni_10s (+ _portrait), and the
-#    omni-flash_{d}s twins. Each duration is its own upstream model key.
+#    720p omni-flash_{d}s twins. Each duration is its own upstream model key.
 for _duration in (4, 6, 8, 10):
     for _base_key, _new_key in (
         ("omni", f"omni_{_duration}s"),
@@ -807,10 +808,10 @@ for _duration in (4, 6, 8, 10):
         ("omni-flash-portrait", f"omni-flash_{_duration}s_portrait"),
     ):
         _cfg = dict(MODEL_CONFIG[_base_key])
-        _cfg["model_key"] = f"macaron_cookie_t2v_{_duration}s"
-        _cfg["first_frame_model_key"] = f"macaron_cookie_i2v_{_duration}s"
-        _cfg["start_end_model_key"] = f"macaron_cookie_i2v_fl_{_duration}s"
-        _cfg["reference_model_key"] = f"macaron_cookie_r2v_{_duration}s"
+        _cfg["model_key"] = f"abra_t2v_{_duration}s"
+        _cfg["first_frame_model_key"] = f"abra_i2v_{_duration}s"
+        _cfg["start_end_model_key"] = f"abra_i2v_{_duration}s"
+        _cfg["reference_model_key"] = f"abra_r2v_{_duration}s"
         _cfg["reference_duration"] = _duration
         MODEL_CONFIG[_new_key] = _cfg
 
@@ -847,9 +848,9 @@ def _estimate_video_credit_cost_for_log(model: str, model_config: Dict[str, Any]
     model_text = f"{model} {model_config.get('model_key', '')}".lower()
     if "veo_3_1" in model_text and "lite" in model_text:
         return 10
-    if model_config.get("video_type") == "omni" or "macaron_cookie" in model_text:
+    if model_config.get("video_type") == "omni" or "abra_" in model_text:
         duration = int(model_config.get("reference_duration") or 8)
-        return {4: 12, 6: 18, 8: 24, 10: 30}.get(duration, 24)  # Omni 1.2, Flow model list 2026-11-06
+        return {4: 7, 6: 10, 8: 12, 10: 15}.get(duration, 12)
     return 0
 
 
@@ -2339,8 +2340,8 @@ class GenerationHandler:
             if characters:
                 if video_type not in ("r2v", "omni"):
                     error_msg = (
-                        "Characters need an Omni Flash or Veo 3.1 ingredients model, e.g. "
-                        "omni-1.2-flash-ingredients-8s-portrait (= omni_r2v_8s_portrait) or veo_3_1_r2v_fast_portrait"
+                        "Characters need an Omni 1.1 Flash or Veo 3.1 ingredients model, e.g. "
+                        "omni-1.1-flash-ingredients-8s-portrait (= omni_r2v_8s_portrait) or veo_3_1_r2v_fast_portrait"
                     )
                     self._mark_generation_failed(generation_result, error_msg, caller_fault=True)
                     yield self._create_error_response(error_msg, status_code=400)
@@ -2449,11 +2450,11 @@ class GenerationHandler:
                 ]
                 debug_logger.log_info(f"[R2V] Uploaded {len(reference_images)} reference image(s)")
 
-            # Omni: 1 image = first frame (_i2v_), 2 images = first + last frame (_i2v_fl_);
-            # 3+ images, or any count on the omni_r2v models = reference-images route (_r2v_).
+            # Omni 1.1: 1 image = first frame, 2 images = first + last frame (abra_i2v_*s);
+            # 3+ images, or any count on the omni_r2v models = reference-images route (abra_r2v_*s).
             elif video_type == "omni" and images:
                 if stream:
-                    yield self._create_stream_chunk(f"Uploading {image_count} Omni 1.2 image(s)...\n")
+                    yield self._create_stream_chunk(f"Uploading {image_count} Omni 1.1 image(s)...\n")
 
                 use_frames = image_count <= 2 and not model_config.get("reference_only")
                 uploaded_ids = await self._upload_reference_images(
@@ -2529,19 +2530,19 @@ class GenerationHandler:
                 )
 
             # Omni: with images -> Reference Images path; no images -> text-only path
-            # Omni: single image = first frame, two images = first + last frame.
+            # Omni 1.1: single image = first frame, two images = first + last frame.
             elif video_type == "omni" and start_media_id:
                 if stream:
                     yield self._create_stream_chunk(
-                        "Submitting Omni 1.2 first+last-frame video task...\n" if end_media_id
-                        else "Submitting Omni 1.2 first-frame video task...\n"
+                        "Submitting Omni 1.1 first+last-frame video task...\n" if end_media_id
+                        else "Submitting Omni 1.1 first-frame video task...\n"
                     )
                 if end_media_id:
                     result = await self.flow_client.generate_video_start_end(
                         at=token.at,
                         project_id=project_id,
                         prompt=prompt,
-                        model_key=model_config.get("start_end_model_key", "macaron_cookie_i2v_fl_8s"),
+                        model_key=model_config.get("start_end_model_key", "abra_i2v_8s"),
                         aspect_ratio=model_config["aspect_ratio"],
                         start_media_id=start_media_id,
                         end_media_id=end_media_id,
@@ -2554,7 +2555,7 @@ class GenerationHandler:
                         at=token.at,
                         project_id=project_id,
                         prompt=prompt,
-                        model_key=model_config.get("first_frame_model_key", "macaron_cookie_i2v_8s"),
+                        model_key=model_config.get("first_frame_model_key", "abra_i2v_8s"),
                         aspect_ratio=model_config["aspect_ratio"],
                         start_media_id=start_media_id,
                         use_v2_model_config=True,
@@ -2562,7 +2563,7 @@ class GenerationHandler:
                         token_id=token.id,
                     )
 
-            # Omni: three or more images → reference-images route.
+            # Omni 1.1: three or more images → reference-images route.
             elif video_type == "omni" and (reference_images or character_entities):
                 if stream:
                     yield self._create_stream_chunk("Submitting Omni reference-image video task...\n")
@@ -2570,7 +2571,7 @@ class GenerationHandler:
                     at=token.at,
                     project_id=project_id,
                     prompt=prompt,
-                    model_key=model_config.get("reference_model_key", "macaron_cookie_r2v_8s"),
+                    model_key=model_config.get("reference_model_key", "abra_r2v_8s"),
                     aspect_ratio=model_config["aspect_ratio"],
                     reference_images=reference_images,
                     user_paygate_tier=normalized_tier,

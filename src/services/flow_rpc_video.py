@@ -11,7 +11,7 @@ src/services/flow_current.py `_current_generate_video`, `check_video_status`, `g
 
     REST path (after the host)                         RPC
     /v1/video:batchAsyncGenerateVideoText              YhhmEf
-    /v1/video:batchAsyncGenerateVideoReferenceImages   MZZa6b   (Veo r2v and Omni *_r2v_*)
+    /v1/video:batchAsyncGenerateVideoReferenceImages   MZZa6b   (Veo r2v and Omni abra_r2v_*)
     /v1/video:batchAsyncGenerateVideoStartAndEndImage  nprQif
     /v1/video:batchAsyncGenerateVideoStartImage        eb1hJf
     /v1/video:batchAsyncGenerateVideoExtendVideo       fZytfe

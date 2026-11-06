@@ -13,7 +13,7 @@ entry has a readable `name`, `family`, `google_model`, `mode`, `orientation`, `d
 | **Nano Banana 2.1** (images, Flow's default on every tier, GA 2026-10-06) | `gemini-nano-banana-2.1` | `gemini-3.1-flash-image-{aspect}[-2k\|-4k]` | `nano-banana-2.1-{aspect}[-2k\|-4k]` |
 | **Nano Banana Pro** (images) | `gemini-3-pro-image` | `gemini-3.0-pro-image-{aspect}[-2k\|-4k]` | `nano-banana-pro-{aspect}[-2k\|-4k]` |
 | **Nano Banana 2 Lite** (images, 1K only) | `gemini-3.1-flash-lite-image` | `nano-banana-2-lite-{aspect}` | (the id is already readable) |
-| **Omni 1.2 Flash** (video, since 2026-11-06; Flow key family `macaron_cookie`) | Flow: Omni 1.2 Flash | `omni*`, `omni_r2v*` (+ `_1080p`) | `omni-1.2-flash-…` (below; `omni-1.1-flash-…` still works) |
+| **Omni 1.1 Flash** (video; Google also calls it "Omni Flash") | `gemini-omni-1.1-flash` | `omni*`, `omni_r2v*` (+ `_1080p`) | `omni-1.1-flash-…` (below) |
 | **Veo 3.1 Fast / Quality / Lite** (video) | Veo 3.1 | `veo_3_1_…` | none; read `name` in `/v1/models` |
 
 `{aspect}` = `landscape` (16:9), `portrait` (9:16), `square` (1:1), `four-three` (4:3), `three-four` (3:4).
@@ -22,27 +22,20 @@ entry has a readable `name`, `family`, `google_model`, `mode`, `orientation`, `d
 Banana 2, which Flow retired on 2026-10-06 (its Flow key NARWHAL answers 404). Flow's replacement is Nano
 Banana 2.1 (Flow key BELUGA), and Flow lists "Nano Banana 2" as an alias of 2.1. We kept the old id so
 no caller breaks; `nano-banana-2.1-*` is the honest name for the same thing. There is no "Gemini 3.2" image
-model.
+model. Omni 1.1 Flash is the newest (and only) Omni model.
 
-**Omni 1.2 (2026-11-06):** Google launched Omni 1.2 Flash in Flow (rolling out over a few days) and keeps
-Omni 1.1, Veo Fast and Veo Quality for only ~30 more days. Every `omni*` id now runs Omni 1.2, so callers keep
-their ids and get the newest model. The `omni-1.1-flash-…` and "Omni 1.1 Flash" names keep working and run 1.2
-too. Omni 1.2 costs about twice the credits of 1.1 (table below). Keys come from Flow's own model list
-(`HTrJv`) and two real Flow-app submits (`tmp/flow_models_2026-11-06_HTrJv.json`).
-
-## Omni Flash (1.2): which id to use
+## Omni 1.1 Flash: which id to use
 
 | You want | Readable name | Old id (same model) |
 |---|---|---|
-| Text only, or 1-2 frames, or 3+ reference images (the model decides) | `omni-1.2-flash-8s-portrait` | `omni_8s_portrait` |
-| Every image (or @character) is a reference ("Ingredients" in Flow) | `omni-1.2-flash-ingredients-8s-portrait` | `omni_r2v_8s_portrait` |
-| Same, upscaled to 1080p (Pro or Ultra) | `omni-1.2-flash-ingredients-8s-portrait-1080p` | `omni_r2v_8s_portrait_1080p` |
+| Text only, or 1-2 frames, or 3+ reference images (the model decides) | `omni-1.1-flash-8s-portrait` | `omni_8s_portrait` |
+| Every image (or @character) is a reference ("Ingredients" in Flow) | `omni-1.1-flash-ingredients-8s-portrait` | `omni_r2v_8s_portrait` |
+| Same, upscaled to 1080p (Pro or Ultra; 0 extra credits on Ultra) | `omni-1.1-flash-ingredients-8s-portrait-1080p` | `omni_r2v_8s_portrait_1080p` |
 
 Durations `4s`, `6s`, `8s`, `10s`; orientation `landscape` or `portrait`. "r2v" in the old ids means
 "reference images to video", which Flow's UI calls **Ingredients**. `omni-flash*` ids are a legacy
-duplicate of the same model (since Omni 1.2 there is no separate 720p pin: 720p is the key itself); prefer the
-names above. Ids without a duration (`omni`, `omni_r2v`) are the 8 s ones. Omni 1.2 also offers 3-15 s
-(11-15 s Pro/Ultra only), extend and edit; we expose 4/6/8/10 s for now.
+duplicate of the same model with the output pinned to 720p (Omni output is 720p anyway); prefer the
+names above. Ids without a duration (`omni`, `omni_r2v`) are the 8 s ones.
 
 ## Modes (the `mode` field)
 
@@ -78,8 +71,7 @@ Omni and the other video modes are mapped but not yet proven live.
 | What | Credits on Ultra |
 |---|---|
 | Nano Banana 2.1 / Pro / 2 Lite image, 2K and 4K enlarge | 0 |
-| Omni 1.2 Flash 4 / 6 / 8 / 10 s (720p, every tier) | 12 / 18 / 24 / 30 (Google's list 2026-11-06; 12 / 15 s = 42 / 60, Pro/Ultra) |
-| Omni 1.1 Flash 4 / 6 / 8 / 10 s (until Google drops it) | 7 / 10 / 12 / 15 |
+| Omni 1.1 Flash 4 / 6 / 8 / 10 s | 7 / 10 / 12 / 15 (8 s confirmed) |
 | Veo 3.1 Fast clip (Ultra keys) | 10 (confirmed) |
 | Veo 3.1 Lite clip | 5 |
 | Veo 3.1 Quality clip | 100 |
@@ -98,10 +90,10 @@ still listed so callers get a clear answer, marked `retired_by_google: true` and
 
 ## Not exposed yet (exist in Google's list)
 
-Omni 1.2 360p variants (`macaron_cookie_*_360p`), Omni 1.2 lengths other than 4/6/8/10 s (3-15 s), Omni 1.2
-extend (`macaron_cookie_extend_{3-10}s`) and edit (`macaron_cookie_edit`), Veo 3.1 Lite low-priority queue,
-Gemini TTS. Omni 1.2 has its own first+last-frame key (`macaron_cookie_i2v_fl_{d}s`), which we now send for
-2 frames (1.1 sent `abra_i2v_*` for both).
+Omni 360p variants (`abra_*_360p`, 4-7 credits), Omni video edit (`abra_edit`, 20 credits), Veo 3.1 Lite
+low-priority queue, Gemini TTS. Google also lists a separate Omni first+last-frame key
+(`omni_flash_i2v_{d}s_first_last`) while we send `abra_i2v_*` for 2 frames: unverified, check live before
+changing.
 
 ## Where the names come from (for maintainers)
 

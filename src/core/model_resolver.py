@@ -276,7 +276,7 @@ VIDEO_BASE_MODELS = {
         "landscape": "omni",
         "portrait": "omni_portrait",
     },
-    # Since Omni 1.2 (2026-11-06) the same model as "omni" (720p is the key's own resolution).
+    # Same abra_t2v_8s model with the output pinned to 720p (faster/cheaper).
     "omni-flash": {
         "landscape": "omni-flash",
         "portrait": "omni-flash-portrait",
@@ -451,10 +451,8 @@ for _omni_base in [k for k in VIDEO_BASE_MODELS if k.startswith("omni")]:
 #   nano-banana-2.1-*  = gemini-3.1-flash-image-*  (that id now runs Nano Banana 2.1 / BELUGA;
 #                        Google's own "gemini-3.1-flash-image" is Nano Banana 2, retired in Flow)
 #   nano-banana-pro-*  = gemini-3.0-pro-image-*    (Google: gemini-3-pro-image)
-#   omni-1.2-flash-{d}s-{orientation}[-1080p]              = omni_{d}s[_portrait][_1080p]
-#   omni-1.2-flash-ingredients-{d}s-{orientation}[-1080p]  = omni_r2v_{d}s[_portrait][_1080p]
-#   omni-1.1-flash-*: the same targets, kept so existing callers keep working; every omni* id runs the newest
-#   Omni (1.2 since 2026-11-06; Google keeps 1.1 itself for ~30 days only).
+#   omni-1.1-flash-{d}s-{orientation}[-1080p]              = omni_{d}s[_portrait][_1080p]
+#   omni-1.1-flash-ingredients-{d}s-{orientation}[-1080p]  = omni_r2v_{d}s[_portrait][_1080p]
 READABLE_IMAGE_ASPECTS = ("landscape", "portrait", "square", "four-three", "three-four")
 READABLE_MODEL_ALIASES: Dict[str, str] = {}
 for _aspect in READABLE_IMAGE_ASPECTS:
@@ -464,13 +462,12 @@ for _aspect in READABLE_IMAGE_ASPECTS:
 for _duration in (4, 6, 8, 10):
     for _orientation, _orientation_suffix in (("landscape", ""), ("portrait", "_portrait")):
         for _res, _res_suffix in (("", ""), ("-1080p", "_1080p")):
-            for _version in ("1.2", "1.1"):
-                READABLE_MODEL_ALIASES[f"omni-{_version}-flash-{_duration}s-{_orientation}{_res}"] = (
-                    f"omni_{_duration}s{_orientation_suffix}{_res_suffix}"
-                )
-                READABLE_MODEL_ALIASES[f"omni-{_version}-flash-ingredients-{_duration}s-{_orientation}{_res}"] = (
-                    f"omni_r2v_{_duration}s{_orientation_suffix}{_res_suffix}"
-                )
+            READABLE_MODEL_ALIASES[f"omni-1.1-flash-{_duration}s-{_orientation}{_res}"] = (
+                f"omni_{_duration}s{_orientation_suffix}{_res_suffix}"
+            )
+            READABLE_MODEL_ALIASES[f"omni-1.1-flash-ingredients-{_duration}s-{_orientation}{_res}"] = (
+                f"omni_r2v_{_duration}s{_orientation_suffix}{_res_suffix}"
+            )
 
 
 def readable_aliases_for(model_id: str) -> List[str]:
@@ -487,8 +484,7 @@ FRIENDLY_VIDEO_ALIASES = {
     "veo-fast": "veo_3_1_t2v_fast",
     "veo-lite": "veo_3_1_t2v_lite",
     "Omni Flash": "omni",
-    "Omni 1.2 Flash": "omni",
-    "Omni 1.1 Flash": "omni",   # kept for old callers; runs the newest Omni (1.2 since 2026-11-06)
+    "Omni 1.1 Flash": "omni",
     "Veo 3.1 - Quality": "veo_3_1_t2v",
     "Veo 3.1 - Fast": "veo_3_1_t2v_fast",
     "Veo 3.1 - Lite": "veo_3_1_t2v_lite",
@@ -512,9 +508,8 @@ VIDEO_ALIAS_DISPLAY_NAMES = {
     "veo": "Veo 3.1 Quality T2V",
     "veo-fast": "Veo 3.1 Fast T2V",
     "veo-lite": "Veo 3.1 Lite T2V",
-    "Omni Flash": "Omni Flash (Omni 1.2)",
-    "Omni 1.2 Flash": "Omni 1.2 Flash",
-    "Omni 1.1 Flash": "Omni 1.1 Flash (now runs Omni 1.2)",
+    "Omni Flash": "Omni Flash",
+    "Omni 1.1 Flash": "Omni 1.1 Flash",
     "Veo 3.1 - Quality": "Veo 3.1 - Quality",
     "Veo 3.1 - Fast": "Veo 3.1 - Fast",
     "Veo 3.1 - Lite": "Veo 3.1 - Lite",
@@ -530,12 +525,12 @@ VIDEO_ALIAS_DISPLAY_NAMES = {
     "veo-r2v-ultra": "Veo 3.1 Fast Ingredients (reference images), Ultra",
     "veo-r2v-relaxed": "Veo 3.1 Fast Ingredients, Ultra relaxed queue (retired by Google)",
     "veo-r2v-lite": "Veo 3.1 Lite Ingredients (reference images)",
-    "omni-r2v": "Omni 1.2 Flash Ingredients (reference images)",
+    "omni-r2v": "Omni 1.1 Flash Ingredients (reference images)",
     "veo-extend": "Veo 3.1 Extend",
 }
 
 # Aliases/families whose durationSeconds (4/6/8/10) selects a *_{d}s model.
-VIDEO_ALIASES_ALLOW_DURATION = {"Omni Flash", "Omni 1.2 Flash", "Omni 1.1 Flash", "omni", "omni-flash", "omni-r2v", "omni_r2v"}
+VIDEO_ALIASES_ALLOW_DURATION = {"Omni Flash", "Omni 1.1 Flash", "omni", "omni-flash", "omni-r2v", "omni_r2v"}
 VIDEO_DURATIONS = (4, 6, 8, 10)
 
 

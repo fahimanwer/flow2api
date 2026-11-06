@@ -1,4 +1,4 @@
-"""Video aliases / Omni (1.2) durations and the per-browser reCAPTCHA mint throttle
+"""Video aliases / Omni 1.1 durations and the per-browser reCAPTCHA mint throttle
 (adapted from Danborad/flow2api and Gurumigun/flow2api, 2026-09-03)."""
 import asyncio
 import json
@@ -30,13 +30,13 @@ class OmniDurationsAndAliases(unittest.TestCase):
         for d in (4, 6, 8, 10):
             for k in (f"omni_{d}s", f"omni_{d}s_portrait", f"omni-flash_{d}s", f"omni-flash_{d}s_portrait"):
                 cfg = MODEL_CONFIG[k]
-                self.assertEqual(cfg["model_key"], f"macaron_cookie_t2v_{d}s")
-                self.assertEqual(cfg["first_frame_model_key"], f"macaron_cookie_i2v_{d}s")
-                self.assertEqual(cfg["start_end_model_key"], f"macaron_cookie_i2v_fl_{d}s")
-                self.assertEqual(cfg["reference_model_key"], f"macaron_cookie_r2v_{d}s")
+                self.assertEqual(cfg["model_key"], f"abra_t2v_{d}s")
+                self.assertEqual(cfg["first_frame_model_key"], f"abra_i2v_{d}s")
+                self.assertEqual(cfg["start_end_model_key"], f"abra_i2v_{d}s")
+                self.assertEqual(cfg["reference_model_key"], f"abra_r2v_{d}s")
                 self.assertEqual(cfg["reference_duration"], d)
-        self.assertNotIn("output_resolution", MODEL_CONFIG["omni-flash_6s"])  # Omni 1.2: 720p = the key itself
-        self.assertEqual(MODEL_CONFIG["omni"]["first_frame_model_key"], "macaron_cookie_i2v_8s")
+        self.assertEqual(MODEL_CONFIG["omni-flash_6s"]["output_resolution"], "VIDEO_RESOLUTION_720P")
+        self.assertEqual(MODEL_CONFIG["omni"]["first_frame_model_key"], "abra_i2v_8s")
 
     def test_omni_flash_alias_with_duration(self):
         self.assertEqual(mr.resolve_model_name("Omni Flash", _req(duration=6), MODEL_CONFIG), "omni_6s")
@@ -59,14 +59,13 @@ class OmniDurationsAndAliases(unittest.TestCase):
         self.assertIsNone(mr._normalize_duration(True))
 
     def test_credit_estimate(self):
-        self.assertEqual(_estimate_video_credit_cost_for_log("omni_4s", MODEL_CONFIG["omni_4s"]), 12)
-        self.assertEqual(_estimate_video_credit_cost_for_log("omni", MODEL_CONFIG["omni"]), 24)  # Omni 1.2 8 s = 24 (Flow list)
+        self.assertEqual(_estimate_video_credit_cost_for_log("omni_4s", MODEL_CONFIG["omni_4s"]), 7)
+        self.assertEqual(_estimate_video_credit_cost_for_log("omni", MODEL_CONFIG["omni"]), 12)
         self.assertEqual(_estimate_video_credit_cost_for_log("gemini-3.0-pro-image-square", MODEL_CONFIG["gemini-3.0-pro-image-square"]), 0)
 
     def test_friendly_aliases_listed(self):
         aliases = mr.get_base_model_aliases()
         self.assertIn("Omni 1.1 Flash", aliases)
-        self.assertIn("Omni 1.2 Flash", aliases)
         self.assertIn("Veo 3.1 - Fast", aliases)
 
 
