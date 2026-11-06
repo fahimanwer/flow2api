@@ -8,8 +8,7 @@ the readable aliases from model_resolver.READABLE_MODEL_ALIASES.
 Names come from Google's live Flow model list (GET aisandbox-pa /v1/flow/models, read
 2026-10-11) and Google's model docs: Nano Banana 2.1 = gemini-nano-banana-2.1 (GA 2026-10-06),
 Nano Banana Pro = gemini-3-pro-image, Nano Banana 2 Lite = gemini-3.1-flash-lite-image,
-Gemini Omni 1.1 Flash = gemini-omni-1.1-flash, Veo 3.1 Quality / Fast / Lite. Omni 1.2 Flash (2026-11-06,
-Flow key family macaron_cookie, Flow model list HTrJv): every omni* id runs it.
+Gemini Omni 1.1 Flash = gemini-omni-1.1-flash, Veo 3.1 Quality / Fast / Lite.
 """
 from __future__ import annotations
 
@@ -41,8 +40,6 @@ ACCOUNT_LABELS = {PAYGATE_TIER_TWO: "Ultra only", PAYGATE_TIER_ONE: "Pro or Ultr
 
 
 def _video_family(model_key: str) -> tuple:
-    if model_key.startswith("macaron_cookie"):
-        return "Omni 1.2 Flash", "Flow model macaron_cookie (Omni 1.2 Flash)"
     if model_key.startswith("abra"):
         return "Omni 1.1 Flash", "gemini-omni-1.1-flash"
     if "lite" in model_key:

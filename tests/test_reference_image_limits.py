@@ -61,7 +61,7 @@ class ModelConfigTests(unittest.TestCase):
         cfg = MODEL_CONFIG["omni_r2v_6s_portrait"]
         self.assertTrue(cfg["reference_only"])
         self.assertEqual(cfg["min_images"], 1)
-        self.assertEqual(cfg["reference_model_key"], "macaron_cookie_r2v_6s")
+        self.assertEqual(cfg["reference_model_key"], "abra_r2v_6s")
         self.assertEqual(cfg["aspect_ratio"], "VIDEO_ASPECT_RATIO_PORTRAIT")
         self.assertNotIn("reference_only", MODEL_CONFIG["omni"])
 
@@ -183,7 +183,7 @@ class OmniRoutingTests(_HandlerTestBase):
     async def test_seven_images_go_to_omni_ingredients(self):
         await self._run("omni", 7)
         model_key, refs = self._refs()
-        self.assertEqual(model_key, "macaron_cookie_r2v_8s")
+        self.assertEqual(model_key, "abra_r2v_8s")
         self.assertEqual(refs, [f"media-{i}" for i in range(7)])
 
     async def test_eight_images_are_refused(self):
@@ -203,7 +203,7 @@ class OmniRoutingTests(_HandlerTestBase):
                 self.handler.flow_client.generate_video_reference_images.reset_mock()
                 await self._run("omni_r2v_6s", count)
                 model_key, refs = self._refs()
-                self.assertEqual(model_key, "macaron_cookie_r2v_6s")
+                self.assertEqual(model_key, "abra_r2v_6s")
                 self.assertEqual(len(refs), count)
         self.handler.flow_client.generate_video_start_end.assert_not_awaited()
         self.handler.flow_client.generate_video_start_image.assert_not_awaited()
