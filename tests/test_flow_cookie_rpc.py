@@ -448,6 +448,49 @@ def test_fleet_watch_restart_does_not_page_an_open_problem_again():
     assert pages == ["fleet_ok"]
 
 
+def test_fleet_watch_counts_only_attempts_not_shortage():
+    """2026-11-06: staff going home (no free account, quota used up) must not page; failures on accounts do."""
+    import asyncio
+    import contextlib
+    import aiosqlite
+    from src.services.fleet_watch import FleetWatch
+
+    class DB:
+        def __init__(self, path):
+            self.path = path
+
+        @contextlib.asynccontextmanager
+        async def connect(self, write=False):
+            async with aiosqlite.connect(self.path) as conn:
+                yield conn
+
+    async def run(tmp):
+        db = DB(tmp)
+        async with db.connect() as c:
+            await c.execute("CREATE TABLE request_logs (token_id INTEGER, status_code INTEGER, response_body TEXT, "
+                            "created_at TEXT, updated_at TEXT)")
+            await c.execute("CREATE TABLE tokens (id INTEGER, is_active INTEGER)")
+            await c.execute("INSERT INTO tokens VALUES (40, 1)")
+            rows = ([(40, 200, "{}")] * 6
+                    + [(None, 503, "All accounts are briefly cooling down")] * 50          # no free account
+                    + [(None, 503, "has reached today's quota (cooling down)")] * 20      # local quota
+                    + [(40, 500, "HTTP Error 429: PUBLIC_ERROR_PER_MODEL_DAILY_QUOTA_REACHED")] * 3
+                    + [(40, 500, "HTTP Error 400: PUBLIC_ERROR_UNSAFE_GENERATION")] * 2
+                    + [(40, 500, "HTTP Error 403: PUBLIC_ERROR_UNUSUAL_ACTIVITY")] * 2   # a real attempt
+                    + [(40, 102, "{}")] * 4)                                               # still running
+            for tid, code, body in rows:
+                await c.execute("INSERT INTO request_logs VALUES (?, ?, ?, datetime('now', '-5 minutes'), NULL)",
+                                (tid, code, body))
+            await c.commit()
+        return await FleetWatch(db)._numbers()
+
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        total, ok, active, hour_total, hour_ok = asyncio.run(run(os.path.join(d, "t.db")))
+    assert (total, ok, active, hour_total, hour_ok) == (8, 6, 1, 8, 6)
+    assert FleetWatch.diagnose(total, ok, active, hour_total, hour_ok) is None
+
+
 def test_signed_in_page_without_account_field_is_transient():
     import asyncio
     from unittest.mock import patch
