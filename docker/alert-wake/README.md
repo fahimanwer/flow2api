@@ -16,6 +16,11 @@ wake you up so that you can fix it automatically".
    goes to the CC box's fleet-guard watch thread instead (`3e5c92d2-…`, "Set Up Safe Site Monitoring"), which handles
    app bugs per `/home/cc/fleet-guard/README.md`.
 4. Recoveries never wake anyone. At most 4 wakes per hour (storm guard); Telegram still gets every row.
+5. `fleet_degraded` wakes only when the running flow2api container (`docker ps --filter name=^<app uuid>-`) was created
+   at most 6 h (`DEPLOY_WINDOW`) before the alert; a later one goes to Telegram only and is logged (owner 2026-11-06:
+   "only when the code change breaks, not when staff goes home"). A degraded fleet long after a deploy is Google
+   refusing captchas or a staff/account shortage, not our code. `fleet_down` and the server-browser alerts always wake.
+   Unknown times fail open (wake).
 
 ## The box watcher can wake this thread too
 `wake-flow2api "<the facts>"` (installed at `/usr/local/bin/wake-flow2api`, runs as `cc`) posts a message into the flow2api
