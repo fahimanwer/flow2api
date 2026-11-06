@@ -4,7 +4,10 @@ Why: on 2026-10-21 Google retired the Labs login and every account died; nothing
 service sat at 0 successful requests for ~40 hours until the owner noticed. /health stayed 200.
 
 What it watches, every CHECK_EVERY_SECONDS, from the database only (no Google calls):
-- "down": at least MIN_REQUESTS requests in the last WINDOW_MINUTES and not one succeeded;
+- "down": at least MIN_REQUESTS requests in the last WINDOW_MINUTES, and not one succeeded in the last
+  DOWN_NO_SUCCESS_MINUTES (2026-11-06: Pinterest's healthy Ultra finished a batch, the next 15 min held only quick
+  captcha refusals on accounts without a browser, and "0 of 9" paged while Flow worked; batches arrive up to ~23 min
+  apart, a real break shows hours of zero);
 - "no accounts": not a single active account;
 - "degraded" (2026-11-05): at least DEGRADED_MIN_REQUESTS finished requests in the last
   DEGRADED_WINDOW_MINUTES and fewer than DEGRADED_BELOW of them succeeded. Why: on 2026-11-04 the fleet
@@ -34,6 +37,7 @@ CHECK_EVERY_SECONDS = 60
 WINDOW_MINUTES = 15
 MIN_REQUESTS = 5
 REMIND_SECONDS = 2 * 3600
+DOWN_NO_SUCCESS_MINUTES = 30   # <= DEGRADED_WINDOW_MINUTES (the query reads only that far back)
 DEGRADED_WINDOW_MINUTES = 60
 DEGRADED_MIN_REQUESTS = 30
 DEGRADED_BELOW = 0.50
@@ -51,37 +55,42 @@ class FleetWatch:
         self._last_page_at = 0.0
         self._task: Optional[asyncio.Task] = None
 
-    async def _numbers(self) -> Tuple[int, int, int, int, int]:
-        """(attempts, ok) in the last WINDOW_MINUTES, active accounts, (attempts, ok) in the last DEGRADED_WINDOW_MINUTES.
+    async def _numbers(self) -> Tuple[int, int, int, int, int, int]:
+        """(attempts, ok) in the last WINDOW_MINUTES, active accounts, (attempts, ok) in the last DEGRADED_WINDOW_MINUTES,
+        ok in the last DOWN_NO_SUCCESS_MINUTES.
         An attempt = a finished request that succeeded, or that failed on an account for a reason not in SHORTAGE_MARKERS."""
         async with self.db.connect() as conn:
             # FINISHED requests by completion time (102 = still running: a burst of fresh video jobs is
             # not an outage, and a job that started earlier but finished now is evidence).
-            total, ok, hour_total, hour_ok = await (await conn.execute(
+            total, ok, hour_total, hour_ok, recent_ok = await (await conn.execute(
                 "SELECT COALESCE(SUM(CASE WHEN t > datetime('now', ?) THEN 1 ELSE 0 END), 0), "
                 "COALESCE(SUM(CASE WHEN t > datetime('now', ?) AND status_code = 200 THEN 1 ELSE 0 END), 0), "
-                "COUNT(*), COALESCE(SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END), 0) "
+                "COUNT(*), COALESCE(SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END), 0), "
+                "COALESCE(SUM(CASE WHEN t > datetime('now', ?) AND status_code = 200 THEN 1 ELSE 0 END), 0) "
                 "FROM (SELECT status_code, COALESCE(updated_at, created_at) AS t FROM request_logs "
                 "WHERE status_code != 102 AND COALESCE(updated_at, created_at) > datetime('now', ?) "
                 "AND (status_code = 200 OR (token_id IS NOT NULL"
                 + "".join(" AND instr(COALESCE(response_body, ''), ?) = 0" for _ in SHORTAGE_MARKERS) + ")))",
-                (f"-{WINDOW_MINUTES} minutes", f"-{WINDOW_MINUTES} minutes", f"-{DEGRADED_WINDOW_MINUTES} minutes",
-                 *SHORTAGE_MARKERS),
+                (f"-{WINDOW_MINUTES} minutes", f"-{WINDOW_MINUTES} minutes", f"-{DOWN_NO_SUCCESS_MINUTES} minutes",
+                 f"-{DEGRADED_WINDOW_MINUTES} minutes", *SHORTAGE_MARKERS),
             )).fetchone()
             active = (await (await conn.execute("SELECT COUNT(*) FROM tokens WHERE is_active = 1")).fetchone())[0]
-        return int(total or 0), int(ok or 0), int(active or 0), int(hour_total or 0), int(hour_ok or 0)
+        return (int(total or 0), int(ok or 0), int(active or 0), int(hour_total or 0), int(hour_ok or 0),
+                int(recent_ok or 0))
 
     @staticmethod
     def diagnose(total: int, ok: int, active: int, hour_total: int = 0, hour_ok: int = 0,
-                 degraded: bool = False) -> Optional[Tuple[str, Optional[str]]]:
-        """(kind, text) of the current problem, or None. `degraded` = a degraded page is open (recovery needs
-        RECOVERED_AT). Text None = stay degraded without paging: too few requests this hour to judge."""
+                 recent_ok: Optional[int] = None, degraded: bool = False) -> Optional[Tuple[str, Optional[str]]]:
+        """(kind, text) of the current problem, or None. `recent_ok` = successes in the last DOWN_NO_SUCCESS_MINUTES
+        (None: same as ok). `degraded` = a degraded page is open (recovery needs RECOVERED_AT). Text None = stay
+        degraded without paging: too few requests this hour to judge."""
         if active == 0:
             return "fleet_down", (f"flow2api: NO active account (all disabled). {total} requests in the last {WINDOW_MINUTES} min, "
                                   f"{ok} succeeded. Check the admin page (Token Management) and the worker browsers.")
-        if total >= MIN_REQUESTS and ok == 0:
-            return "fleet_down", (f"flow2api: 0 of {total} requests that reached an account succeeded in the last {WINDOW_MINUTES} min "
-                                  f"({active} active accounts). Google may have changed Flow again; check the logs.")
+        if total >= MIN_REQUESTS and ok == 0 and (ok if recent_ok is None else recent_ok) == 0:
+            return "fleet_down", (f"flow2api: 0 of {total} requests that reached an account succeeded in the last {WINDOW_MINUTES} min, "
+                                  f"none in the last {DOWN_NO_SUCCESS_MINUTES} min ({active} active accounts). Google may have "
+                                  "changed Flow again; check the logs.")
         if hour_total >= DEGRADED_MIN_REQUESTS:
             rate = hour_ok / hour_total
             if rate < (RECOVERED_AT if degraded else DEGRADED_BELOW):
@@ -105,8 +114,8 @@ class FleetWatch:
         debug_logger.op_warning(f"[FLEET_WATCH] {kind}: {text}")
 
     async def check_once(self) -> Optional[str]:
-        total, ok, active, hour_total, hour_ok = await self._numbers()
-        found = self.diagnose(total, ok, active, hour_total, hour_ok, degraded=self._degraded_open)
+        total, ok, active, hour_total, hour_ok, recent_ok = await self._numbers()
+        found = self.diagnose(total, ok, active, hour_total, hour_ok, recent_ok, degraded=self._degraded_open)
         now = time.monotonic()
         if found:
             kind, problem = found

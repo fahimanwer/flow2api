@@ -375,7 +375,7 @@ def test_fleet_watch_needs_a_success_to_report_recovery():
 
     pages = []
     watch = FleetWatch(db=None)
-    numbers = iter([(20, 0, 5, 20, 0), (0, 0, 5, 20, 0), (3, 1, 5, 23, 1)])
+    numbers = iter([(20, 0, 5, 20, 0, 0), (0, 0, 5, 20, 0, 0), (3, 1, 5, 23, 1, 1)])
 
     async def fake_numbers():
         return next(numbers)
@@ -401,12 +401,12 @@ def test_fleet_watch_degraded_pages_and_needs_70_percent_to_recover():
     pages = []
     watch = FleetWatch(db=None)
     numbers = iter([
-        (10, 3, 5, 40, 10),   # 25 % of the hour -> degraded page
-        (10, 6, 5, 40, 24),   # 60 %: below 70 %, stays degraded, no new page
-        (2, 1, 5, 12, 6),     # too quiet to judge: stays degraded, silently
-        (10, 0, 5, 40, 20),   # 0 of 10 in 15 min -> down page right away
-        (10, 6, 5, 40, 24),   # some success again; 60 % is still below 70 % after a degraded spell -> degraded page
-        (10, 9, 5, 40, 30),   # 75 % -> recovered
+        (10, 3, 5, 40, 10, 3),   # 25 % of the hour -> degraded page
+        (10, 6, 5, 40, 24, 6),   # 60 %: below 70 %, stays degraded, no new page
+        (2, 1, 5, 12, 6, 1),     # too quiet to judge: stays degraded, silently
+        (10, 0, 5, 40, 20, 0),   # 0 of 10 in 15 min, none in 30 -> down page right away
+        (10, 6, 5, 40, 24, 6),   # some success again; 60 % is still below 70 % after a degraded spell -> degraded page
+        (10, 9, 5, 40, 30, 9),   # 75 % -> recovered
     ])
 
     async def fake_numbers():
@@ -433,7 +433,7 @@ def test_fleet_watch_restart_does_not_page_an_open_problem_again():
     async def rows():
         return [("fleet_degraded", "flow2api degraded: only 5 of 40", opened)]
 
-    numbers = iter([(10, 1, 5, 40, 5), (10, 6, 5, 40, 24), (10, 9, 5, 40, 30)])
+    numbers = iter([(10, 1, 5, 40, 5, 1), (10, 6, 5, 40, 24, 6), (10, 9, 5, 40, 30, 9)])
 
     async def fake_numbers():
         return next(numbers)
@@ -486,9 +486,54 @@ def test_fleet_watch_counts_only_attempts_not_shortage():
 
     import tempfile, os
     with tempfile.TemporaryDirectory() as d:
-        total, ok, active, hour_total, hour_ok = asyncio.run(run(os.path.join(d, "t.db")))
-    assert (total, ok, active, hour_total, hour_ok) == (8, 6, 1, 8, 6)
-    assert FleetWatch.diagnose(total, ok, active, hour_total, hour_ok) is None
+        total, ok, active, hour_total, hour_ok, recent_ok = asyncio.run(run(os.path.join(d, "t.db")))
+    assert (total, ok, active, hour_total, hour_ok, recent_ok) == (8, 6, 1, 8, 6, 6)
+    assert FleetWatch.diagnose(total, ok, active, hour_total, hour_ok, recent_ok) is None
+
+
+def test_fleet_watch_down_needs_no_success_for_30_min():
+    """2026-11-06 19:23Z: Pinterest's healthy Ultra 93 finished a batch at 19:06; in the 15 min after, only 9 quick
+    captcha refusals on accounts without a browser finished, and 93's next batch was still running. That paged "down"
+    (0 of 9) and recovered one minute later. Flow worked; "down" now also needs no success in the last 30 min."""
+    import asyncio
+    import contextlib
+    import os
+    import tempfile
+    import aiosqlite
+    from src.services.fleet_watch import FleetWatch
+
+    class DB:
+        def __init__(self, path):
+            self.path = path
+
+        @contextlib.asynccontextmanager
+        async def connect(self, write=False):
+            async with aiosqlite.connect(self.path) as conn:
+                yield conn
+
+    async def run(path, ok_minutes_ago):
+        db = DB(path)
+        async with db.connect() as c:
+            await c.execute("CREATE TABLE request_logs (token_id INTEGER, status_code INTEGER, response_body TEXT, "
+                            "created_at TEXT, updated_at TEXT)")
+            await c.execute("CREATE TABLE tokens (id INTEGER, is_active INTEGER)")
+            await c.execute("INSERT INTO tokens VALUES (93, 1)")
+            for _ in range(3):
+                await c.execute("INSERT INTO request_logs VALUES (93, 200, '{}', datetime('now', ?), NULL)",
+                                (f"-{ok_minutes_ago} minutes",))
+            for _ in range(9):
+                await c.execute("INSERT INTO request_logs VALUES (76, 500, 'HTTP Error 403: PUBLIC_ERROR_UNUSUAL_ACTIVITY', "
+                                "datetime('now', '-5 minutes'), NULL)")
+            await c.execute("INSERT INTO request_logs VALUES (93, 102, '{}', datetime('now', '-1 minutes'), NULL)")
+            await c.commit()
+            return await FleetWatch(db)._numbers()
+
+    with tempfile.TemporaryDirectory() as d:
+        recent = asyncio.run(run(os.path.join(d, "a.db"), 20))
+        old = asyncio.run(run(os.path.join(d, "b.db"), 40))
+    assert recent[:2] == (9, 0)                      # 0 of 9 in the last 15 min, as on 2026-11-06
+    assert FleetWatch.diagnose(*recent) is None      # but 93 succeeded 20 min ago: Flow works, no page
+    assert FleetWatch.diagnose(*old)[0] == "fleet_down"   # nothing for 40 min: down
 
 
 def test_signed_in_page_without_account_field_is_transient():
